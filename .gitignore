@@ -1,0 +1,63 @@
+# 视频文件
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.flv
+*.wmv
+
+# 输出目录
+clips/
+athlete_clips/
+subtitle_frames/
+sampled_frames/
+detected_subtitles/
+verify_frames/
+check_frames/
+
+# JSON结果文件（保留示例）
+*_subtitles.json
+all_athlete_timestamps.json
+all_athletes_recognized.json
+athlete_timestamps.json
+
+# API密钥配置文件
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.ruff_cache/
+env/
+venv/
+.ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# 日志
+*.log
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+coverage/
