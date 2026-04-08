@@ -1,0 +1,43 @@
+name: Bug Report
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题描述
+      description: 简要说明问题现象
+      placeholder: 导入视频后点击开始检测，任务状态一直停留在“准备开始检测”
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写清楚复现路径
+      placeholder: |
+        1. 启动 Electron 客户端
+        2. 导入视频
+        3. 点击开始检测
+        4. 观察左侧任务状态
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      placeholder: 应该显示检测进度，并在完成后生成候选片段
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      placeholder: 实际一直停留在准备开始检测
+    validations:
+      required: true

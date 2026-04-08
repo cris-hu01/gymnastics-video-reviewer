@@ -12,6 +12,9 @@
 - 视频导入
 - 视频元数据读取
 - 候选片段持久化结构
+- DetectionService
+- ExportService
+- FastAPI 本地 API
 
 检测引擎与导出引擎后续再逐步接入。
 
@@ -29,7 +32,7 @@ project_state.json
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "1.0.0",
   "name": "Untitled Project",
   "created_at": "2026-03-10T13:00:00+00:00",
   "updated_at": "2026-03-10T13:05:00+00:00",
@@ -81,21 +84,23 @@ project_state.json
 已实现：
 
 - 导入视频并过滤不支持格式
+- 浏览器模式下支持通过 multipart 上传视频到本地 workspace
+- 未来桌面壳模式下保留 `paths` 导入能力
 - 读取视频时长和分辨率
 - 保存和恢复项目状态
-
-未实现：
-
-- 调用 AI 检测
-- 生成检测块
-- 从检测块推导候选片段
-- 导出保留片段
+- 调用 AI 检测并生成 DetectionBlock
+- 从 DetectionBlock 推导 CandidateClip
+- 将检测结果直接写回 ProjectState
+- 仅导出 `kept` 状态片段
+- 导出成功后写回 `exported_path` 和 `exported` 状态
+- 导出失败后写回错误信息
+- 提供视频流接口给前端 `<video>` 直接预览
 
 ## 8. 下一步建议
 
 下一阶段优先接入两个服务：
 
-1. `DetectionService`
-2. `ExportService`
+1. 检测任务队列与进度管理
+2. 审核操作服务（保留 / 删除 / 微调）
 
-其中 `DetectionService` 应首先从现有 [ocr_ai_detector.py](/Users/hu/Desktop/gymnasticvedio/ocr_ai_detector.py) 抽离。
+其中 `DetectionService` 和 `ExportService` 已完成第一版抽离，后续重点是补任务调度和 UI 联调。

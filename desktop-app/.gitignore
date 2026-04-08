@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Backend runtime
+backend/workspace/
+backend/build/
+backend/dist/
+
+# Frontend / Electron
+gymclip-reviewer/node_modules/
+gymclip-reviewer/dist/
+gymclip-reviewer/electron-dist/
+gymclip-reviewer/.env.local
+
+# Editors
+.vscode/
+.idea/

@@ -4,11 +4,13 @@ import json
 import subprocess
 from pathlib import Path
 
+from .media_binaries import resolve_ffprobe_path
+
 
 def probe_video_metadata(video_path: str) -> dict[str, object]:
     path = Path(video_path)
     cmd = [
-        "ffprobe",
+        resolve_ffprobe_path(),
         "-v",
         "error",
         "-print_format",

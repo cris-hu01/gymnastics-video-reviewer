@@ -4,11 +4,13 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from threading import RLock
 
 from .models import ProjectState
 
 
 DEFAULT_PROJECT_FILE = "project_state.json"
+_PROJECT_STATE_LOCK = RLock()
 
 
 def resolve_project_file(project_dir: str | os.PathLike[str], file_name: str = DEFAULT_PROJECT_FILE) -> Path:
@@ -19,6 +21,10 @@ def ensure_project_dir(project_dir: str | os.PathLike[str]) -> Path:
     path = Path(project_dir)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def project_state_lock() -> RLock:
+    return _PROJECT_STATE_LOCK
 
 
 def load_project_state(project_file: str | os.PathLike[str]) -> ProjectState:
