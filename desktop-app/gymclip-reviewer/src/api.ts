@@ -386,8 +386,8 @@ export async function retryClipStage(
     oss_access_key_id?: string;
     oss_access_key_secret?: string;
   },
-): Promise<ProjectResponse> {
-  return request<ProjectResponse>(`/api/clips/${clipId}/retry-stage`, {
+): Promise<UpdateClipResponse> {
+  return request<UpdateClipResponse>(`/api/clips/${clipId}/retry-stage`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({stage, ...options}),
