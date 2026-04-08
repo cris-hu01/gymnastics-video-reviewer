@@ -1,0 +1,23 @@
+name: Feature Request
+description: 提出一个功能或产品改进
+title: "[Feature] "
+labels:
+  - feature
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 先说明问题，不要只写方案
+      placeholder: 当前导出路径只能手填，桌面客户端里不够自然
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 说明你想要的交互或实现方向
+      placeholder: 在 Electron 客户端里改成系统文件夹选择器
+    validations:
+      required: true

@@ -1,4 +1,10 @@
-numpy
-opencv-python
-zhipuai
-anthropic
+numpy>=2.2,<2.3
+opencv-python>=4.13,<4.14
+zhipuai>=2.1,<2.2
+anthropic>=0.84,<0.85
+fastapi>=0.135,<0.136
+uvicorn>=0.41,<0.42
+python-multipart>=0.0.22,<0.0.23
+certifi>=2026.1,<2027
+requests>=2.32,<2.33
+oss2>=2.19,<2.20

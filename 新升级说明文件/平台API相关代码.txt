@@ -1,0 +1,138 @@
+import requests
+import json
+
+# ================= 配置区域 =================
+# 服务基础地址 (请根据实际情况修改 IP 和端口)
+BASE_URL = "https://www.sciensports.com/yd-match" # 或者
+# 接口路径前缀 (根据你的网关配置调整，例如 /blade-match)
+API_PREFIX = "/matchGymnasticsScore"
+
+# 通用请求头
+HEADERS = {
+    "Content-Type": "application/json"
+    # 白名单模式下无需 Token
+}
+
+# ================= 业务逻辑函数 =================
+
+def get_data_list(match_name, venue, sport_item_id):
+    """
+    第一步：调用 singleItemList 接口获取数据
+    参数:
+      matchName: 赛事名称 (模糊匹配)
+      venue: 场次 (如: 资格赛, 决赛)
+      sportItemId: 项目ID (如: 1=自由体操, 3=跳马, 具体参考字典表)
+    """
+    url = f"{BASE_URL}{API_PREFIX}/singleItemList"
+    
+    # 构建查询参数
+    params = {
+        "matchName": match_name,
+        "venue": venue,
+        "sportItemId": sport_item_id
+    }
+    
+    try:
+        print(f"正在查询: {params}")
+        response = requests.get(url, params=params, headers=HEADERS)
+        response.raise_for_status() 
+        
+        result = response.json()
+        if result.get("code") == 200:
+            data = result.get("data", [])
+            print(f"查询成功，获取到 {len(data)} 条记录")
+            return data
+        else:
+            print(f"查询失败: {result.get('msg')}")
+            return []
+    except Exception as e:
+        print(f"请求异常: {e}")
+        return []
+
+def process_and_match_url(item):
+    """
+    第二步：本地处理逻辑
+    根据 item 中的信息 (如 athleteName, matchName 等) 匹配 URL
+    """
+    # 获取关键信息
+    record_id = item.get("id")
+    user_name = item.get("userName") # 运动员姓名
+    match_name = item.get("matchName")
+    
+    # --- 自定义逻辑开始 ---
+    # 示例：假设我们有一个本地映射或者规则
+    # 这里你需要替换为你真实的 URL 生成或查找逻辑
+    
+    # 比如：如果名字是 "张三"，就给他分配一个 URL
+    if user_name:
+        # 模拟生成 URL
+        video_url = f"http://video-server.com/2024/{match_name}/{user_name}.mp4"
+        
+        # 返回构建好的更新对象 (只包含 id 和 videoUrl)
+        return {
+            "id": record_id,
+            "videoUrl": video_url
+        }
+    # --- 自定义逻辑结束 ---
+    
+    return None
+
+def batch_update_url(update_list):
+    """
+    第三步：调用 updateUrl 接口批量更新
+    """
+    if not update_list:
+        print("没有匹配到需要更新的数据")
+        return
+
+    url = f"{BASE_URL}{API_PREFIX}/updateUrl"
+    
+    try:
+        # 发送 POST 请求，body 为 JSON 列表
+        # 注意：后端接收 List<MatchGymnasticsScore>
+        response = requests.post(url, json=update_list, headers=HEADERS)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("code") == 200:
+                print(f"批量更新成功！后端返回: {result}")
+            else:
+                print(f"业务处理失败: {result.get('msg')}")
+        else:
+            print(f"HTTP 请求失败: {response.status_code}, {response.text}")
+            
+    except Exception as e:
+        print(f"更新异常: {e}")
+
+# ================= 主程序入口 =================
+
+if __name__ == "__main__":
+    # 1. 设置查询条件
+    target_match = "2024年全国体操锦标赛"
+    target_venue = "资格赛"
+    target_item_id = 1  # 假设 1 代表自由体操
+    
+    # 2. 获取原始数据
+    data_list = get_data_list(target_match, target_venue, target_item_id)
+    
+    # 3. 本地逻辑处理：构建更新列表
+    batch_list = []
+    
+    for record in data_list:
+        # 对每一条记录进行处理，看是否能匹配到 URL
+        update_item = process_and_match_url(record)
+        
+        if update_item:
+            batch_list.append(update_item)
+            
+    print(f"准备更新 {len(batch_list)} 条数据的 URL...")
+    
+    # 4. 执行批量更新
+    # 建议分批次提交，防止单次请求包体过大 (例如每 500 条一次)
+    BATCH_SIZE = 500
+    for i in range(0, len(batch_list), BATCH_SIZE):
+        chunk = batch_list[i:i + BATCH_SIZE]
+        print(f"正在提交第 {i//BATCH_SIZE + 1} 批数据 (数量: {len(chunk)})...")
+        batch_update_url(chunk)
+        
+    print("所有操作完成")

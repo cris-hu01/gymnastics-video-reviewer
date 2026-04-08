@@ -61,3 +61,10 @@ dist/
 build/
 .next/
 coverage/
+electron-dist/
+
+# GymClip Reviewer runtime
+desktop-app/backend/workspace/
+desktop-app/gymclip-reviewer/.env.local
+desktop-app/backend/dist/standalone/
+desktop-app/backend/dist/media-tools/
