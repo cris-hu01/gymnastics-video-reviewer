@@ -156,9 +156,26 @@ export type PlatformRecord = {
   vault_attempt: number | null;
   raw_record: Record<string, unknown>;
   linked_clip_ids: string[];
+  is_local?: boolean;
   created_at: string;
   updated_at: string;
 };
+
+export type LocalCardCreatePayload = {
+  user_name: string;
+  english_name?: string;
+  country?: string;
+  sport_item_id: number;
+  sport_item_label?: string;
+  sex?: number | null;
+  difficulty_score?: string;
+  execution_score?: string;
+  bonus_score?: string;
+  penalty_score?: string;
+  total_score?: string;
+};
+
+export type LocalCardUpdatePayload = Partial<LocalCardCreatePayload>;
 
 export type ProjectSettings = {
   ai_backend: string;

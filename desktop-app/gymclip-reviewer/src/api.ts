@@ -6,17 +6,26 @@ import type {
   ImportProjectResponse,
   JobListResponse,
   JobResponse,
+  LocalCardCreatePayload,
+  LocalCardUpdatePayload,
   PlatformFrequenciesResponse,
   PlatformMatchesResponse,
+  PlatformRecord,
   PlatformRecordsResponse,
   PlatformScopeQuery,
   PlatformTeamCountriesResponse,
   ProjectResponse,
+  ProjectState,
   RestoreCandidateClipsResponse,
   SplitClipResponse,
   ThumbnailResponse,
   UpdateClipResponse,
 } from './types';
+
+export type LocalCardResponse = {
+  record: PlatformRecord;
+  project: ProjectState;
+};
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
 
@@ -344,6 +353,42 @@ export async function bindClipPlatformRecord(
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({platform_record_id: platformRecordId}),
   });
+}
+
+export async function createLocalCard(
+  videoId: string,
+  payload: LocalCardCreatePayload,
+): Promise<LocalCardResponse> {
+  return request<LocalCardResponse>(`/api/videos/${videoId}/local-cards`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateLocalCard(
+  videoId: string,
+  recordId: string,
+  payload: LocalCardUpdatePayload,
+): Promise<LocalCardResponse> {
+  return request<LocalCardResponse>(
+    `/api/videos/${videoId}/local-cards/${recordId}`,
+    {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deleteLocalCard(
+  videoId: string,
+  recordId: string,
+): Promise<UpdateClipResponse> {
+  return request<UpdateClipResponse>(
+    `/api/videos/${videoId}/local-cards/${recordId}`,
+    {method: 'DELETE'},
+  );
 }
 
 export async function exportProject(payload: {
