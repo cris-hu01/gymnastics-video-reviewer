@@ -70,10 +70,6 @@ class ReviewService:
         clip.status = next_status
         clip.segments = next_segments
         self._sync_clip_summary(clip)
-        if clip.review_start < clip.candidate_start:
-            clip.candidate_start = clip.review_start
-        if clip.review_end > clip.candidate_end:
-            clip.candidate_end = clip.review_end
         clip.gap_start = None
         clip.gap_end = None
         if notes is not None:
@@ -177,7 +173,7 @@ class ReviewService:
             (index for index, candidate in enumerate(state.candidate_clips) if candidate.id == clip.id),
             len(state.candidate_clips),
         )
-        state.candidate_clips.insert(insert_at + 1, new_clip)
+        state.candidate_clips.insert(insert_at, new_clip)
         self._recalculate_video_progress(state, clip.video_id)
         state.touch()
         return clip, new_clip

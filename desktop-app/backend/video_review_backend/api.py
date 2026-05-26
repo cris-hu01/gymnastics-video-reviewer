@@ -37,7 +37,12 @@ from .storage import (
     save_project_state,
 )
 from .thumbnail_service import ThumbnailService
-from .video_import import import_direct_clips_into_project, import_videos_into_project, summarize_scope_queries
+from .video_import import (
+    build_full_video_clip,
+    import_direct_clips_into_project,
+    import_videos_into_project,
+    summarize_scope_queries,
+)
 
 
 BACKEND_ROOT = Path(
@@ -68,8 +73,6 @@ _platform_client = None
 _preview_scope_cache_lock = RLock()
 _preview_scope_cache: dict[str, dict[str, Any]] = {}
 PREVIEW_SCOPE_CACHE_TTL_SECONDS = 600
-EXPORT_LOCKED_CLIP_DETAIL = "该片段在当前导出批次中，导出完成前不可编辑"
-EXPORT_LOCKED_RESTORE_DETAIL = "当前有导出任务进行中，暂不支持撤销结构编辑"
 
 app = FastAPI(title="GymClip Reviewer API", version="1.2.1")
 app.add_middleware(
@@ -129,37 +132,6 @@ def has_active_job(kind: str | None = None, video_id: str | None = None) -> bool
     else:
         managers = [detect_job_manager, export_job_manager]
     return any(manager.has_active_job(kind=kind, video_id=video_id) for manager in managers)
-
-
-def get_active_export_job() -> AppJob | None:
-    for job in export_job_manager.list_jobs():
-        if job.kind == "export" and job.status in {"queued", "running"}:
-            return job
-    return None
-
-
-def get_active_export_target_clip_ids() -> set[str]:
-    active_job = get_active_export_job()
-    if active_job is None:
-        return set()
-    raw_target_clip_ids = active_job.progress.get("target_clip_ids")
-    if not isinstance(raw_target_clip_ids, list):
-        return set()
-    return {
-        clip_id
-        for item in raw_target_clip_ids
-        if (clip_id := str(item or "").strip())
-    }
-
-
-def ensure_clip_editable(clip_id: str) -> None:
-    if clip_id in get_active_export_target_clip_ids():
-        raise HTTPException(status_code=409, detail=EXPORT_LOCKED_CLIP_DETAIL)
-
-
-def ensure_candidate_clip_restore_allowed() -> None:
-    if get_active_export_job() is not None:
-        raise HTTPException(status_code=409, detail=EXPORT_LOCKED_RESTORE_DETAIL)
 
 
 def get_detection_service():
@@ -1115,6 +1087,19 @@ async def detect_video(request: Request):
                             "total": 0,
                         },
                     )
+                elif current_stage == "extracting":
+                    completed = int(progress.get("completed", 0))
+                    total = int(progress.get("total", 0))
+                    update_video_progress(
+                        current_state,
+                        video_id,
+                        {
+                            "stage": "extracting",
+                            "message": "正在采样视频帧",
+                            "completed": completed,
+                            "total": total,
+                        },
+                    )
                 elif current_stage == "precheck_complete":
                     update_video_progress(
                         current_state,
@@ -1298,7 +1283,6 @@ def cancel_detect(video_id: str):
 async def update_clip(clip_id: str, request: Request):
     payload = parse_json_body(await request.body())
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1329,7 +1313,6 @@ async def split_clip_legacy(clip_id: str, request: Request):
         raise HTTPException(status_code=400, detail="缺少拆分点")
 
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1365,7 +1348,6 @@ async def split_clip_segment(clip_id: str, request: Request):
         raise HTTPException(status_code=400, detail="缺少选区ID")
 
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1394,7 +1376,6 @@ async def extract_clip_segment(clip_id: str, request: Request):
         raise HTTPException(status_code=400, detail="缺少选区ID")
 
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1423,7 +1404,6 @@ async def delete_clip_segment(clip_id: str, request: Request):
         raise HTTPException(status_code=400, detail="缺少选区ID")
 
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1453,7 +1433,6 @@ async def restore_candidate_clips(request: Request):
         raise HTTPException(status_code=400, detail="缺少候选片段快照")
 
     with project_state_lock():
-        ensure_candidate_clip_restore_allowed()
         state = load_state()
         reconcile_runtime_state(state)
 
@@ -1499,7 +1478,6 @@ async def bind_clip_platform_record(clip_id: str, request: Request):
         platform_record_id = None
 
     with project_state_lock():
-        ensure_clip_editable(clip_id)
         state = load_state()
         reconcile_runtime_state(state)
         state.rebuild_platform_record_links()
@@ -1522,47 +1500,6 @@ async def bind_clip_platform_record(clip_id: str, request: Request):
         state.rebuild_platform_record_links()
         persist_state(state)
         return {"project": project_payload(state)}
-
-
-@app.post("/api/clips/{clip_id}/retry-stage")
-async def retry_clip_stage(clip_id: str, request: Request):
-    payload = parse_json_body(await request.body())
-    stage = str(payload.get("stage", "")).strip()
-    if stage not in ("export", "oss", "platform"):
-        raise HTTPException(status_code=400, detail=f"不支持的重试阶段: {stage}")
-
-    output_dir = str(payload.get("output_dir", "")).strip() or None
-    oss_access_key_id = str(payload.get("oss_access_key_id", "")).strip() or None
-    oss_access_key_secret = str(payload.get("oss_access_key_secret", "")).strip() or None
-
-    with project_state_lock():
-        state = load_state()
-        reconcile_runtime_state(state)
-        try:
-            result = get_export_service().retry_single_clip_stage(
-                state=state,
-                clip_id=clip_id,
-                stage=stage,
-                output_dir=output_dir,
-                oss_access_key_id=oss_access_key_id,
-                oss_access_key_secret=oss_access_key_secret,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error))
-        except Exception as error:
-            raise HTTPException(status_code=500, detail=f"重试失败: {error}")
-        persist_state(state)
-        return {
-            "project": project_payload(state),
-            "result": {
-                "clip_id": result.clip_id,
-                "success": result.success,
-                "output_file": result.output_file,
-                "uploaded_url": result.uploaded_url,
-                "platform_synced": result.platform_synced,
-                "error_message": result.error_message,
-            },
-        }
 
 
 @app.delete("/api/videos/{video_id}")
@@ -1598,6 +1535,20 @@ def delete_video(video_id: str):
                 raise HTTPException(status_code=500, detail=f"删除源视频失败: {error}")
 
         state.remove_video(video_id)
+        persist_state(state)
+        return project_payload(state)
+
+
+@app.post("/api/videos/{video_id}/add-as-candidate")
+def add_video_as_candidate(video_id: str):
+    with project_state_lock():
+        state = load_state()
+        video = state.get_video(video_id)
+        if video is None:
+            raise HTTPException(status_code=404, detail="Video not found")
+        clip = build_full_video_clip(video, source_label="manual_full_video")
+        state.candidate_clips.append(clip)
+        state.touch()
         persist_state(state)
         return project_payload(state)
 
@@ -1710,7 +1661,6 @@ async def export_project(request: Request):
             "message": "等待任务开始",
             "completed": 0,
             "total": len(selected_clips),
-            "target_clip_ids": [clip.id for clip in selected_clips],
             "output_directory": output_dir,
             "operation": operation,
             "steps_per_clip": 1 if operation == "export_only" else 2 if operation == "upload_only" else 3,
@@ -1778,60 +1728,9 @@ def get_video_thumbnails(
     }
 
 
-@app.get("/api/videos/{video_id}/scrub-thumbnails")
-def get_video_scrub_thumbnails(
-    video_id: str,
-    start: float,
-    end: float,
-    fps: float = 2.0,
-):
-    state = load_state()
-    reconcile_runtime_state(state)
-    video = find_video_or_404(state, video_id)
-    path = Path(video.file_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
-
-    try:
-        frames = get_thumbnail_service().build_scrub_strip(
-            video_id=video_id,
-            video_path=str(path),
-            start=start,
-            end=end,
-            fps=fps,
-        )
-    except Exception as error:
-        raise HTTPException(status_code=400, detail=str(error))
-
-    return {
-        "video_id": video_id,
-        "start": start,
-        "end": end,
-        "fps": fps,
-        "thumbnails": [
-            {
-                "time_seconds": item.time_seconds,
-                "url": item.url,
-            }
-            for item in frames
-        ],
-    }
-
-
 @app.get("/api/thumbnails/{video_id}/{file_name}")
 def get_thumbnail_file(video_id: str, file_name: str):
     path = get_thumbnail_service().resolve_file(video_id, file_name)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail not found")
     return FileResponse(path)
-
-
-@app.get("/api/thumbnails/{video_id}/scrub/{file_name}")
-def get_scrub_thumbnail_file(video_id: str, file_name: str):
-    service = get_thumbnail_service()
-    scrub_path = (service.cache_root / video_id / "scrub" / file_name).resolve()
-    if not scrub_path.is_relative_to(service.cache_root.resolve()):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if not scrub_path.exists():
-        raise HTTPException(status_code=404, detail="Scrub thumbnail not found")
-    return FileResponse(scrub_path)

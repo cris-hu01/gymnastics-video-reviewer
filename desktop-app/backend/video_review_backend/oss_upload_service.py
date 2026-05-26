@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
+import socket
+import ssl
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote, urlparse
+
+import requests
 
 from .media_binaries import resolve_ossutil_path
 
@@ -17,11 +22,15 @@ except ImportError:  # pragma: no cover - optional fallback
     oss2 = None
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_BUCKET = "team-gymnastics"
 DEFAULT_REGION = "cn-beijing"
 DEFAULT_ENDPOINT = "https://oss-cn-beijing.aliyuncs.com"
-DEFAULT_OSS_CONNECT_TIMEOUT_SECONDS = 180
+DEFAULT_OSS_CONNECT_TIMEOUT_SECONDS = 30
 DEFAULT_OSS_RETRY_ATTEMPTS = 3
+DEFAULT_OSS_PART_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 DEFAULT_MULTIPART_THRESHOLD = 8 * 1024 * 1024
 DEFAULT_PART_SIZE = 8 * 1024 * 1024
 DEFAULT_UPLOAD_NUM_THREADS = 4
@@ -61,18 +70,33 @@ class OSSUploadService:
     ) -> UploadedObject:
         source_path = Path(local_file).resolve()
         if not source_path.exists():
+            logger.error("OSS upload aborted: source file missing: %s", source_path)
             raise OSSUploadError(f"待上传文件不存在: {source_path}")
         resolved_access_key_id = (access_key_id or self.access_key_id).strip()
         resolved_access_key_secret = (access_key_secret or self.access_key_secret).strip()
         if not resolved_access_key_id or not resolved_access_key_secret:
+            logger.error("OSS upload aborted: credentials missing (bucket=%s region=%s)", self.bucket, self.region)
             raise OSSUploadError("缺少 OSS 凭证，请配置 GYMCLIP_OSS_ACCESS_KEY_ID 和 GYMCLIP_OSS_ACCESS_KEY_SECRET")
 
         normalized_key = object_key.strip().lstrip("/")
         if not normalized_key:
+            logger.error("OSS upload aborted: empty object_key for %s", source_path)
             raise OSSUploadError("OSS 对象路径不能为空")
 
         object_uri = f"oss://{self.bucket}/{normalized_key}"
         resolved_threads = max(1, int(num_threads or DEFAULT_UPLOAD_NUM_THREADS))
+        file_size = source_path.stat().st_size
+        logger.info(
+            "OSS upload start: path=%s size=%d bucket=%s region=%s endpoint=%s key=%s threads=%d backend=%s",
+            source_path,
+            file_size,
+            self.bucket,
+            self.region,
+            self.endpoint,
+            normalized_key,
+            resolved_threads,
+            "oss2" if oss2 is not None else "ossutil",
+        )
 
         if oss2 is not None:
             return self._upload_with_oss2(
@@ -108,9 +132,17 @@ class OSSUploadService:
         try:
             result = subprocess.run(command, capture_output=True, text=True, env=env)
         except FileNotFoundError:
+            logger.exception("ossutil binary not found at %s", ossutil_path)
             raise OSSUploadError("ossutil 不可用，且未安装 oss2，无法上传 OSS")
         if result.returncode != 0:
+            logger.error(
+                "ossutil upload failed: rc=%s stderr=%s stdout=%s",
+                result.returncode,
+                result.stderr.strip(),
+                result.stdout.strip(),
+            )
             raise OSSUploadError(result.stderr.strip() or result.stdout.strip() or "ossutil 上传失败")
+        logger.info("ossutil upload ok: %s", object_uri)
 
         public_url = self._public_url(normalized_key)
         return UploadedObject(
@@ -148,10 +180,15 @@ class OSSUploadService:
             total_bytes=source_path.stat().st_size,
             callback=progress_callback,
         )
-        for attempt in range(1, DEFAULT_OSS_RETRY_ATTEMPTS + 1):
+        file_size = source_path.stat().st_size
+        outer_retry_attempts = DEFAULT_OSS_RETRY_ATTEMPTS
+        for attempt in range(1, outer_retry_attempts + 1):
             try:
-                file_size = source_path.stat().st_size
                 if file_size < DEFAULT_MULTIPART_THRESHOLD:
+                    logger.info(
+                        "oss2 put_object attempt=%d key=%s size=%d",
+                        attempt, object_key, file_size,
+                    )
                     with source_path.open("rb") as file_handle:
                         bucket.put_object(
                             object_key,
@@ -159,6 +196,10 @@ class OSSUploadService:
                             progress_callback=tracker,
                         )
                 else:
+                    logger.info(
+                        "oss2 multipart attempt=%d key=%s size=%d threads=%d part_size=%d",
+                        attempt, object_key, file_size, num_threads, DEFAULT_PART_SIZE,
+                    )
                     self._multipart_upload_with_progress(
                         bucket=bucket,
                         object_key=object_key,
@@ -166,9 +207,14 @@ class OSSUploadService:
                         num_threads=max(1, int(num_threads)),
                         progress_callback=tracker,
                     )
+                logger.info("oss2 upload ok: key=%s attempt=%d", object_key, attempt)
                 break
             except Exception as error:  # pragma: no cover - network-dependent
-                if attempt >= DEFAULT_OSS_RETRY_ATTEMPTS:
+                logger.exception(
+                    "oss2 upload attempt=%d/%d failed for key=%s: %s",
+                    attempt, outer_retry_attempts, object_key, error,
+                )
+                if attempt >= outer_retry_attempts:
                     raise OSSUploadError(str(error)) from error
                 time.sleep(min(2 * attempt, 5))
         if tracker is not None:
@@ -211,27 +257,46 @@ class OSSUploadService:
             progress_callback(sum(part_progress.values()), total_bytes)
 
         def upload_one_part(target_part_number: int, start: int, size: int):
-            with source_path.open("rb") as file_handle:
-                file_handle.seek(start, os.SEEK_SET)
-                sized_reader = oss2.utils.SizedFileAdapter(file_handle, size)
-                progress_reader = oss2.utils.make_progress_adapter(
-                    sized_reader,
-                    lambda consumed_bytes, _total: emit_part_progress(target_part_number, int(consumed_bytes or 0)),
-                    size=size,
-                )
-                result = bucket.upload_part(
-                    object_key,
-                    upload_id,
-                    target_part_number,
-                    progress_reader,
-                )
-                emit_part_progress(target_part_number, size)
-                return oss2.models.PartInfo(
-                    target_part_number,
-                    result.etag,
-                    size=size,
-                    part_crc=result.crc,
-                )
+            max_attempts = len(DEFAULT_OSS_PART_RETRY_BACKOFF_SECONDS) + 1
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    with source_path.open("rb") as file_handle:
+                        file_handle.seek(start, os.SEEK_SET)
+                        sized_reader = oss2.utils.SizedFileAdapter(file_handle, size)
+                        progress_reader = oss2.utils.make_progress_adapter(
+                            sized_reader,
+                            lambda consumed_bytes, _total: emit_part_progress(target_part_number, int(consumed_bytes or 0)),
+                            size=size,
+                        )
+                        result = bucket.upload_part(
+                            object_key,
+                            upload_id,
+                            target_part_number,
+                            progress_reader,
+                        )
+                    emit_part_progress(target_part_number, size)
+                    return oss2.models.PartInfo(
+                        target_part_number,
+                        result.etag,
+                        size=size,
+                        part_crc=result.crc,
+                    )
+                except (
+                    ssl.SSLError,
+                    requests.exceptions.SSLError,
+                    oss2.exceptions.RequestError,
+                    socket.timeout,
+                    OSError,
+                ) as part_error:
+                    logger.warning(
+                        "oss2 part upload failed part=%d attempt=%d/%d key=%s size=%d: %s: %s",
+                        target_part_number, attempt, max_attempts, object_key, size,
+                        type(part_error).__name__, part_error,
+                    )
+                    if attempt >= max_attempts:
+                        raise
+                    emit_part_progress(target_part_number, 0)
+                    time.sleep(DEFAULT_OSS_PART_RETRY_BACKOFF_SECONDS[attempt - 1])
 
         try:
             if num_threads <= 1 or len(part_ranges) <= 1:

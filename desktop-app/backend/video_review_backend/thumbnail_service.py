@@ -56,53 +56,8 @@ class ThumbnailService:
 
         return frames
 
-    def build_scrub_strip(
-        self,
-        *,
-        video_id: str,
-        video_path: str,
-        start: float,
-        end: float,
-        fps: float = 2.0,
-        width: int = 320,
-    ) -> list[ThumbnailFrame]:
-        safe_start = max(0.0, float(start))
-        safe_end = max(safe_start + 0.1, float(end))
-        safe_fps = max(0.5, min(float(fps), 5.0))
-        duration = safe_end - safe_start
-        count = max(1, int(duration * safe_fps))
-
-        target_dir = self.cache_root / video_id / "scrub"
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        interval = duration / count if count > 1 else duration
-        times = [safe_start + i * interval for i in range(count)]
-
-        missing = []
-        frames: list[ThumbnailFrame] = []
-        for timestamp in times:
-            file_name = self._thumbnail_name(timestamp, width)
-            file_path = target_dir / file_name
-            if not file_path.exists():
-                missing.append((timestamp, file_path))
-            frames.append(
-                ThumbnailFrame(
-                    time_seconds=timestamp,
-                    file_name=file_name,
-                    url=f"{self.url_prefix}/{video_id}/scrub/{file_name}",
-                )
-            )
-
-        if missing:
-            self._generate_missing(video_path=video_path, width=width, targets=missing)
-
-        return frames
-
     def resolve_file(self, video_id: str, file_name: str) -> Path:
-        resolved = (self.cache_root / video_id / file_name).resolve()
-        if not resolved.is_relative_to(self.cache_root.resolve()):
-            raise ValueError("Invalid path")
-        return resolved
+        return self.cache_root / video_id / file_name
 
     def _sample_times(self, *, start: float, end: float, count: int) -> list[float]:
         duration = max(0.1, end - start)

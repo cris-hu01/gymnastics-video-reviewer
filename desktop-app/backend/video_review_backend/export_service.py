@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +19,14 @@ from .oss_upload_service import OSSUploadService
 from .platform_client import PlatformClient, SPORT_ITEM_LABELS
 
 
+logger = logging.getLogger(__name__)
+
+
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS = 3
+DEFAULT_PLATFORM_SYNC_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
 
 def _clean_path_component(value: str) -> str:
@@ -591,6 +600,10 @@ class ExportService:
                 )
                 return result
             except Exception as error:
+                logger.exception(
+                    "clip upload/platform-callback failed: clip_id=%s file=%s: %s",
+                    clip.id, source_file, error,
+                )
                 with runtime_lock:
                     upload_items[clip.id] = {
                         **upload_items.get(clip.id, {}),
@@ -768,18 +781,37 @@ class ExportService:
         source_file: Path,
         uploaded_url: str,
     ) -> None:
-        self.platform_client.update_video_urls(
-            [platform_record],
-            {
-                platform_record.id: {
-                    "link": uploaded_url,
-                    "originalName": source_file.name,
-                }
-            },
-        )
-        clip.platform_sync_status = "synced"
-        clip.platform_sync_error_message = None
-        clip.updated_at = utc_now_iso()
+        last_error: Exception | None = None
+        for attempt in range(1, DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS + 1):
+            try:
+                self.platform_client.update_video_urls(
+                    [platform_record],
+                    {
+                        platform_record.id: {
+                            "link": uploaded_url,
+                            "originalName": source_file.name,
+                        }
+                    },
+                )
+                clip.platform_sync_status = "synced"
+                clip.platform_sync_error_message = None
+                clip.updated_at = utc_now_iso()
+                if attempt > 1:
+                    logger.info(
+                        "platform writeback recovered on attempt %d for clip=%s",
+                        attempt, clip.id,
+                    )
+                return
+            except Exception as error:
+                last_error = error
+                logger.warning(
+                    "platform writeback attempt %d/%d failed for clip=%s: %s",
+                    attempt, DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS, clip.id, error,
+                )
+                if attempt < DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS:
+                    time.sleep(DEFAULT_PLATFORM_SYNC_RETRY_BACKOFF_SECONDS[attempt - 1])
+        assert last_error is not None
+        raise last_error
 
     def _select_exportable_clips(
         self,
@@ -861,13 +893,6 @@ class ExportService:
         if explicit_sex is not None:
             return explicit_sex
 
-        derived_from_selection = _derive_sex_from_selection_keys(
-            video.sport_selection_keys,
-            record.sport_item_id,
-        )
-        if derived_from_selection is not None:
-            return derived_from_selection
-
         derived_from_text = _derive_sex_from_text(
             record.venue,
             (record.raw_record or {}).get("venue"),
@@ -876,6 +901,13 @@ class ExportService:
         )
         if derived_from_text is not None:
             return derived_from_text
+
+        derived_from_selection = _derive_sex_from_selection_keys(
+            video.sport_selection_keys,
+            record.sport_item_id,
+        )
+        if derived_from_selection is not None:
+            return derived_from_selection
 
         derived_from_sport_item = _derive_sex_from_sport_item(record.sport_item_id)
         if derived_from_sport_item is not None:
@@ -1113,101 +1145,6 @@ class ExportService:
         minutes = int((total % 3600) // 60)
         seconds = total % 60
         return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
-
-    def retry_single_clip_stage(
-        self,
-        state: ProjectState,
-        clip_id: str,
-        stage: str,
-        output_dir: str | None = None,
-        oss_access_key_id: str | None = None,
-        oss_access_key_secret: str | None = None,
-    ) -> ExportedClipResult:
-        clip = next((c for c in state.candidate_clips if c.id == clip_id), None)
-        if clip is None:
-            raise ValueError(f"片段不存在: {clip_id}")
-        video = state.get_video(clip.video_id)
-        if video is None:
-            raise ValueError(f"视频不存在: {clip.video_id}")
-
-        platform_record = (
-            state.get_platform_record(clip.linked_platform_record_id)
-            if clip.linked_platform_record_id
-            else None
-        )
-
-        if stage == "export":
-            if not output_dir:
-                raise ValueError("重试导出需要提供输出目录")
-            self._ensure_ffmpeg()
-            output_path = Path(output_dir).resolve()
-            output_path.mkdir(parents=True, exist_ok=True)
-            out_file = self._build_output_file(output_path, video, clip, 1, state)
-            self._export_clip_media(video.file_path, clip, out_file, "standard")
-            clip.exported_path = str(out_file)
-            clip.export_error_message = None
-            clip.status = "exported"
-            clip.updated_at = utc_now_iso()
-            state.touch()
-            return ExportedClipResult(
-                clip_id=clip.id,
-                video_id=clip.video_id,
-                output_file=str(out_file),
-                success=True,
-            )
-
-        if stage == "oss":
-            if not clip.exported_path:
-                raise ValueError("本地导出文件不存在，请先重试导出阶段")
-            source_file = Path(clip.exported_path)
-            if not source_file.is_file():
-                raise ValueError(f"导出文件已丢失: {clip.exported_path}")
-            if not platform_record:
-                raise ValueError("片段未绑定平台记录，无法上传 OSS")
-            object_key, uploaded_url = self._upload_clip_output(
-                source_file=source_file,
-                video=video,
-                clip=clip,
-                platform_record=platform_record,
-                access_key_id=oss_access_key_id,
-                access_key_secret=oss_access_key_secret,
-                num_threads=4,
-            )
-            state.touch()
-            return ExportedClipResult(
-                clip_id=clip.id,
-                video_id=clip.video_id,
-                output_file=clip.exported_path,
-                success=True,
-                uploaded_object_key=object_key,
-                uploaded_url=uploaded_url,
-            )
-
-        if stage == "platform":
-            if not clip.uploaded_url:
-                raise ValueError("OSS 上传未完成，请先重试上传阶段")
-            if not clip.exported_path:
-                raise ValueError("本地导出文件不存在")
-            if not platform_record:
-                raise ValueError("片段未绑定平台记录，无法回写平台")
-            self._sync_platform_video_url(
-                clip=clip,
-                platform_record=platform_record,
-                source_file=Path(clip.exported_path),
-                uploaded_url=clip.uploaded_url,
-            )
-            state.touch()
-            return ExportedClipResult(
-                clip_id=clip.id,
-                video_id=clip.video_id,
-                output_file=clip.exported_path,
-                success=True,
-                uploaded_object_key=clip.uploaded_object_key,
-                uploaded_url=clip.uploaded_url,
-                platform_synced=True,
-            )
-
-        raise ValueError(f"不支持的重试阶段: {stage}")
 
     def _emit(self, callback: ProgressCallback | None, **payload: Any) -> None:
         if callback is None:
