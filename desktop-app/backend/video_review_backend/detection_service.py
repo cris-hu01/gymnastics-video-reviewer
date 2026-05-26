@@ -3,10 +3,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
+import re
+import subprocess
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 from typing import Any, Callable
 
 import cv2
@@ -35,6 +40,7 @@ except ImportError as e:
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+ExtractProgressCallback = Callable[[int, int], None]
 CancelRequestedCallback = Callable[[], bool]
 
 
@@ -51,12 +57,36 @@ class DetectionRunResult:
 
 
 class DetectionService:
-    AI_MAX_CONCURRENCY = 4
+    # Default is the benchmarked-winning V11 config: short prompt, crop ROI,
+    # pHash dedup, 429 retry, concurrency=6. Set DET_* env vars to override.
+    AI_MAX_CONCURRENCY = 6
     AI_REQUEST_TIMEOUT_SECONDS = 30.0
+
+    _SHORT_PROMPT = (
+        "分析这张体育赛事视频截图的底部字幕条区域。"
+        "任务：确认底部是否有当前运动员信息字幕条（必须有明确的运动员姓名），"
+        "通常是一条下三分之一横条，含国旗/国家代码 + 人名。"
+        "如果是运动员字幕条，仅输出字幕中读到的运动员姓名（通常是 大写姓氏 + 名字 的格式）。"
+        "如果不是（如广告、比分、排名榜、起跳顺序表、解说文字、地板横幅），输出 NO。"
+        "只返回姓名或 NO，不要返回 JSON 或其他文字。"
+    )
+    _NO_VARIANTS = ("NO", "N/A", "NONE")
+    _NO_PREFIXES_CN = ("无", "没有", "不是", "非", "否")
+    # Matches "LASTNAME Firstname" (surname in caps first) OR
+    # "Firstname LASTNAME" (surname in caps second). Captures whole name.
+    _NAME_REGEX = re.compile(
+        r"([A-Za-z][A-Za-z\-']+(?:\s+[A-Za-z][A-Za-z\-']+)+)"
+    )
+    _HAS_UPPERCASE_TOKEN = re.compile(r"\b[A-Z]{2,}[A-Z\-']*\b")
 
     def __init__(self, config_file: str | None = None) -> None:
         self.config_file = config_file
-        self._ai_request_semaphore = BoundedSemaphore(self.AI_MAX_CONCURRENCY)
+        concurrency = int(os.environ.get("DET_AI_CONCURRENCY", self.AI_MAX_CONCURRENCY))
+        self._ai_request_semaphore = BoundedSemaphore(max(1, concurrency))
+        # pHash L1 cache (populated only when DET_PHASH_DEDUP=1)
+        self._phash_cache: "OrderedDict[int, dict[str, Any]]" = OrderedDict()
+        self._phash_cache_lock = Lock()
+        self._phash_cache_max = 256
 
     def detect_video(
         self,
@@ -91,6 +121,13 @@ class DetectionService:
                 video.file_path,
                 settings.sampling_interval,
                 cancel_requested=cancel_requested,
+                progress_callback=lambda completed, total: self._emit(
+                    progress_callback,
+                    stage="extracting",
+                    video_id=video.id,
+                    completed=completed,
+                    total=total,
+                ),
             )
             if not frames:
                 raise RuntimeError("无法读取视频帧")
@@ -161,6 +198,7 @@ class DetectionService:
                 "raw_detections": len(detections),
                 "after_merge": len(merged),
                 "final_count": len(filtered),
+                "phash_hits": getattr(self, "_last_phash_hits", 0),
             }
             video.detection_progress = {
                 "stage": "completed",
@@ -306,7 +344,19 @@ class DetectionService:
         video_path: str,
         sample_interval: float,
         cancel_requested: CancelRequestedCallback | None = None,
+        progress_callback: ExtractProgressCallback | None = None,
     ) -> tuple[list[np.ndarray], list[float]]:
+        if os.environ.get("DET_FFMPEG_EXTRACT") == "1":
+            try:
+                return self._extract_all_frames_ffmpeg(
+                    video_path,
+                    sample_interval,
+                    cancel_requested=cancel_requested,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[detection] ffmpeg extraction failed, falling back to cv2: {exc}", flush=True)
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return [], []
@@ -315,12 +365,16 @@ class DetectionService:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps
         sample_times = np.arange(0, duration, sample_interval)
+        total_samples = int(len(sample_times))
 
         frames: list[np.ndarray] = []
         frame_times: list[float] = []
 
+        if progress_callback is not None and total_samples > 0:
+            progress_callback(0, total_samples)
+
         try:
-            for time_sec in sample_times:
+            for index, time_sec in enumerate(sample_times, start=1):
                 self._ensure_not_cancelled(cancel_requested)
                 frame_number = int(time_sec * fps)
                 if frame_number >= total_frames:
@@ -330,8 +384,86 @@ class DetectionService:
                 if ret:
                     frames.append(frame)
                     frame_times.append(float(time_sec))
+                if progress_callback is not None and (index % 30 == 0 or index == total_samples):
+                    progress_callback(index, total_samples)
         finally:
             cap.release()
+
+        return frames, frame_times
+
+    def _extract_all_frames_ffmpeg(
+        self,
+        video_path: str,
+        sample_interval: float,
+        cancel_requested: CancelRequestedCallback | None = None,
+        progress_callback: ExtractProgressCallback | None = None,
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """Use ffmpeg (hardware-accelerated when available) to decode frames
+        sequentially at ``1/sample_interval`` fps, scaled so the short edge is
+        540 px. Much faster than OpenCV's seek-per-sample approach on long
+        H.264/H.265 videos. Produces BGR24 raw frames on stdout.
+        """
+        info = self._get_video_info(video_path)
+        src_w = int(info["resolution"].split("x")[0])
+        src_h = int(info["resolution"].split("x")[1])
+        target_h = 540 if src_h > 540 else src_h
+        target_w = int(round(src_w * target_h / src_h))
+        if target_w % 2:
+            target_w -= 1
+        frame_bytes = target_w * target_h * 3
+
+        duration = info["duration"]
+        total_samples = int(max(0, duration // sample_interval))
+        if progress_callback is not None and total_samples > 0:
+            progress_callback(0, total_samples)
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-hwaccel",
+            "videotoolbox",
+            "-i",
+            video_path,
+            "-an",
+            "-sn",
+            "-vf",
+            f"fps=1/{sample_interval},scale={target_w}:{target_h}",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+
+        frames: list[np.ndarray] = []
+        frame_times: list[float] = []
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdout is not None
+        try:
+            index = 0
+            while True:
+                self._ensure_not_cancelled(cancel_requested)
+                buf = proc.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                frame = np.frombuffer(buf, dtype=np.uint8).reshape((target_h, target_w, 3)).copy()
+                frames.append(frame)
+                frame_times.append(float(index * sample_interval))
+                index += 1
+                if progress_callback is not None and total_samples > 0 and (index % 30 == 0 or index == total_samples):
+                    progress_callback(min(index, total_samples), total_samples)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait(timeout=5)
+
+        if proc.returncode not in (0, None):
+            err = (proc.stderr.read().decode("utf-8", "ignore") if proc.stderr else "").strip()
+            raise RuntimeError(f"ffmpeg exited with {proc.returncode}: {err[:400]}")
 
         return frames, frame_times
 
@@ -398,6 +530,49 @@ class DetectionService:
 
         return True, bottom_region.copy()
 
+    @staticmethod
+    def _compute_phash(region: np.ndarray) -> int:
+        """Compute a 64-bit pHash over the right 60% of the strip (name area)."""
+        if region is None or region.size == 0:
+            return 0
+        h, w = region.shape[:2]
+        x0 = int(w * 0.4)
+        roi = region[:, x0:]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+        resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+        dct = cv2.dct(resized)[:8, :8]
+        flat = dct.flatten()
+        median = np.median(flat[1:])  # exclude DC
+        bits = flat > median
+        value = 0
+        for bit in bits:
+            value = (value << 1) | int(bit)
+        return int(value)
+
+    @staticmethod
+    def _hamming(a: int, b: int) -> int:
+        return bin(a ^ b).count("1")
+
+    def _phash_lookup(self, phash: int, max_distance: int = 5) -> dict[str, Any] | None:
+        with self._phash_cache_lock:
+            exact = self._phash_cache.get(phash)
+            if exact is not None:
+                self._phash_cache.move_to_end(phash)
+                return dict(exact)
+            for key in reversed(self._phash_cache):
+                if self._hamming(key, phash) <= max_distance:
+                    value = self._phash_cache[key]
+                    self._phash_cache.move_to_end(key)
+                    return dict(value)
+        return None
+
+    def _phash_store(self, phash: int, value: dict[str, Any]) -> None:
+        with self._phash_cache_lock:
+            self._phash_cache[phash] = dict(value)
+            self._phash_cache.move_to_end(phash)
+            while len(self._phash_cache) > self._phash_cache_max:
+                self._phash_cache.popitem(last=False)
+
     def _run_ai_detection(
         self,
         client: Any,
@@ -410,10 +585,25 @@ class DetectionService:
     ) -> list[dict[str, Any]]:
         detections: list[dict[str, Any]] = []
         completed = 0
+        phash_enabled = os.environ.get("DET_PHASH_DEDUP", "1") != "0"
+        phash_hits = 0
 
-        def process_frame(item: tuple[float, np.ndarray]) -> tuple[float, dict[str, Any]]:
+        def process_frame(item: tuple[float, np.ndarray]) -> tuple[float, dict[str, Any], bool]:
             self._ensure_not_cancelled(cancel_requested)
             time_sec, bottom_region = item
+
+            if phash_enabled:
+                try:
+                    phash = self._compute_phash(bottom_region)
+                except Exception:  # noqa: BLE001
+                    phash = 0
+                if phash:
+                    hit = self._phash_lookup(phash)
+                    if hit is not None:
+                        return time_sec, hit, True
+            else:
+                phash = 0
+
             acquired = False
             try:
                 while not acquired:
@@ -422,7 +612,9 @@ class DetectionService:
 
                 result = self._ai_extract_info(client, bottom_region, ai_backend)
                 self._ensure_not_cancelled(cancel_requested)
-                return time_sec, result
+                if phash_enabled and phash:
+                    self._phash_store(phash, result)
+                return time_sec, result, False
             finally:
                 if acquired:
                     self._ai_request_semaphore.release()
@@ -448,7 +640,9 @@ class DetectionService:
                 for future in done:
                     self._ensure_not_cancelled(cancel_requested)
                     completed += 1
-                    time_sec, result = future.result()
+                    time_sec, result, from_cache = future.result()
+                    if from_cache:
+                        phash_hits += 1
 
                     if result.get("is_athlete_subtitle"):
                         name = result.get("athlete_name", "")
@@ -483,14 +677,61 @@ class DetectionService:
             if not cancelled:
                 executor.shutdown(wait=True, cancel_futures=False)
 
+        self._last_phash_hits = phash_hits
         return detections
 
-    def _ai_extract_info(self, client: Any, image: np.ndarray, ai_backend: str) -> dict[str, Any]:
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-        _, buffer = cv2.imencode(".jpg", image, encode_param)
-        image_base64 = base64.b64encode(buffer).decode("utf-8")
+    def _prepare_payload_image(self, image: np.ndarray) -> np.ndarray:
+        """Crop to the subtitle text region and shrink the short edge.
 
-        prompt = """分析这张体育赛事视频截图的底部字幕条区域。
+        ``image`` is already the bottom 30% band of the frame. We further
+        crop to y∈[0.267, 0.833] × x∈[0.08, 0.92] of the band (the text
+        area, excluding the Cairo floor paint at the edges) and downsize
+        so the shortest side is at most 448 px. Set ``DET_PAYLOAD_CROP=0``
+        to disable and send the raw bottom-30% strip.
+        """
+        if os.environ.get("DET_PAYLOAD_CROP", "1") == "0":
+            return image
+        h, w = image.shape[:2]
+        y0 = int(h * 0.267)
+        y1 = int(h * 0.833)
+        x0 = int(w * 0.08)
+        x1 = int(w * 0.92)
+        cropped = image[y0:y1, x0:x1]
+        ch, cw = cropped.shape[:2]
+        if min(ch, cw) > 448:
+            scale = 448.0 / min(ch, cw)
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            cropped = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return cropped
+
+    def _parse_short_response(self, text: str) -> dict[str, Any]:
+        raw = text.strip()
+        if not raw:
+            return {"is_athlete_subtitle": False, "athlete_name": "", "country": "", "confidence": 0.0}
+        first_line = raw.splitlines()[0].strip().strip('"').strip("'")
+        upper = first_line.upper()
+        for nv in self._NO_VARIANTS:
+            if upper.startswith(nv):
+                return {"is_athlete_subtitle": False, "athlete_name": "", "country": "", "confidence": 0.8}
+        if any(first_line.startswith(p) for p in self._NO_PREFIXES_CN):
+            return {"is_athlete_subtitle": False, "athlete_name": "", "country": "", "confidence": 0.8}
+        match = self._NAME_REGEX.search(first_line)
+        if match and self._HAS_UPPERCASE_TOKEN.search(match.group(1)):
+            name = " ".join(match.group(1).split())  # normalise whitespace
+            return {
+                "is_athlete_subtitle": True,
+                "athlete_name": name,
+                "country": "",
+                "confidence": 0.8,
+            }
+        return {"is_athlete_subtitle": False, "athlete_name": "", "country": "", "confidence": 0.0, "raw": first_line[:80]}
+
+    def _build_prompt(self) -> str:
+        # Short prompt is default; set DET_PROMPT_MODE=json for the old verbose one.
+        if os.environ.get("DET_PROMPT_MODE", "short") != "json":
+            return self._SHORT_PROMPT
+        return """分析这张体育赛事视频截图的底部字幕条区域。
 
 任务：
 1. 确认是否是运动员信息字幕条（必须有运动员姓名）
@@ -509,49 +750,97 @@ class DetectionService:
 
 只返回JSON，不要其他文字。"""
 
-        try:
-            if ai_backend == "zhipu":
-                response = client.chat.completions.create(
-                    model="glm-4v-flash",
-                    timeout=self.AI_REQUEST_TIMEOUT_SECONDS,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
-                                },
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ],
-                )
-                response_text = response.choices[0].message.content.strip()
-            else:
-                message = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=200,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/jpeg",
-                                        "data": image_base64,
-                                    },
-                                },
-                                {"type": "text", "text": prompt},
-                            ],
-                        }
-                    ],
-                    timeout=self.AI_REQUEST_TIMEOUT_SECONDS,
-                )
-                response_text = message.content[0].text.strip()
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+        if status == 429:
+            return True
+        msg = str(exc).lower()
+        return "429" in msg or "rate limit" in msg or "too many" in msg
 
+    def _ai_extract_info(self, client: Any, image: np.ndarray, ai_backend: str) -> dict[str, Any]:
+        payload_image = self._prepare_payload_image(image)
+        jpeg_q = int(os.environ.get("DET_JPEG_QUALITY", 65))
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q]
+        _, buffer = cv2.imencode(".jpg", payload_image, encode_param)
+        image_base64 = base64.b64encode(buffer).decode("utf-8")
+
+        prompt = self._build_prompt()
+        short_mode = os.environ.get("DET_PROMPT_MODE", "short") != "json"
+        retry_enabled = os.environ.get("DET_RETRY_ON_429", "1") != "0"
+
+        zhipu_extra: dict[str, Any] = {}
+        max_tokens_env = os.environ.get("DET_MAX_TOKENS", "64")
+        if max_tokens_env and max_tokens_env != "0":
+            zhipu_extra["max_tokens"] = int(max_tokens_env)
+        temp_env = os.environ.get("DET_TEMPERATURE", "0.01")
+        if temp_env:
+            zhipu_extra["temperature"] = float(temp_env)
+
+        max_attempts = 4 if retry_enabled else 1
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                if ai_backend == "zhipu":
+                    response = client.chat.completions.create(
+                        model="glm-4v-flash",
+                        timeout=self.AI_REQUEST_TIMEOUT_SECONDS,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+                                    },
+                                    {"type": "text", "text": prompt},
+                                ],
+                            }
+                        ],
+                        **zhipu_extra,
+                    )
+                    response_text = response.choices[0].message.content.strip()
+                else:
+                    message = client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=int(max_tokens_env) if max_tokens_env else 200,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/jpeg",
+                                            "data": image_base64,
+                                        },
+                                    },
+                                    {"type": "text", "text": prompt},
+                                ],
+                            }
+                        ],
+                        timeout=self.AI_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    response_text = message.content[0].text.strip()
+                break  # success
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if retry_enabled and self._is_rate_limit_error(exc) and attempt < max_attempts - 1:
+                    sleep = (2 ** attempt) + random.random()
+                    time.sleep(min(sleep, 8.0))
+                    continue
+                return {"is_athlete_subtitle": False, "error": str(exc)}
+        else:
+            return {"is_athlete_subtitle": False, "error": str(last_exc) if last_exc else "unknown"}
+
+        if short_mode:
+            return self._parse_short_response(response_text)
+
+        try:
             if "```" in response_text:
                 parts = response_text.split("```")
                 for part in parts:
@@ -575,8 +864,6 @@ class DetectionService:
             return result
         except json.JSONDecodeError:
             return {"is_athlete_subtitle": False, "error": "JSON解析失败"}
-        except Exception as e:
-            return {"is_athlete_subtitle": False, "error": str(e)}
 
     def _is_valid_athlete_name(self, name: str) -> bool:
         if not name or len(name) < 3:

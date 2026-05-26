@@ -239,6 +239,12 @@ export async function cancelDetectVideo(videoId: string): Promise<CancelDetectRe
   });
 }
 
+export async function addVideoAsCandidate(videoId: string): Promise<ProjectResponse> {
+  return request<ProjectResponse>(`/api/videos/${videoId}/add-as-candidate`, {
+    method: 'POST',
+  });
+}
+
 export async function updateClip(
   clipId: string,
   payload: {
@@ -426,16 +432,16 @@ export async function fetchJob(jobId: string): Promise<JobResponse> {
 export async function retryClipStage(
   clipId: string,
   stage: 'export' | 'oss' | 'platform',
-  options?: {
+  options: {
     output_dir?: string;
     oss_access_key_id?: string;
     oss_access_key_secret?: string;
   },
-): Promise<UpdateClipResponse> {
-  return request<UpdateClipResponse>(`/api/clips/${clipId}/retry-stage`, {
+): Promise<ExportProjectResponse> {
+  return request<ExportProjectResponse>(`/api/clips/${clipId}/retry-stage`, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({stage, ...options}),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stage, ...options }),
   });
 }
 
@@ -453,20 +459,4 @@ export async function fetchVideoThumbnails(
     count: String(payload.count ?? 12),
   });
   return request<ThumbnailResponse>(`/api/videos/${videoId}/thumbnails?${query.toString()}`);
-}
-
-export async function fetchScrubThumbnails(
-  videoId: string,
-  payload: {
-    start: number;
-    end: number;
-    fps?: number;
-  },
-): Promise<ThumbnailResponse> {
-  const query = new URLSearchParams({
-    start: String(payload.start),
-    end: String(payload.end),
-    fps: String(payload.fps ?? 2),
-  });
-  return request<ThumbnailResponse>(`/api/videos/${videoId}/scrub-thumbnails?${query.toString()}`);
 }

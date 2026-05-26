@@ -9,6 +9,12 @@ __pycache__/
 backend/workspace/
 backend/build/
 backend/dist/
+backend/.venv/
+backend/config.json
+backend/experiments/results/
+backend/experiments/frames/
+backend/experiments/logs/
+backend/experiments/__pycache__/
 
 # Frontend / Electron
 gymclip-reviewer/node_modules/

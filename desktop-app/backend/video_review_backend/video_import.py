@@ -197,6 +197,36 @@ def summarize_scope_queries(scope_queries: list[dict[str, object]]) -> dict[str,
     }
 
 
+def build_full_video_clip(video: VideoTask, *, source_label: str) -> CandidateClip:
+    """Construct a candidate clip that covers the full duration of `video`.
+
+    Used both by direct-clip import (file dropped in) and by the manual
+    "把整段加为候选片段" right-click action on an already-imported video.
+    """
+    now = utc_now_iso()
+    duration = float(video.duration or 0.0)
+    return CandidateClip(
+        id=new_id("clip"),
+        video_id=video.id,
+        detection_block_id=None,
+        linked_platform_record_id=None,
+        athlete_name="",
+        country="",
+        subtitle_start=0.0,
+        subtitle_end=duration,
+        candidate_start=0.0,
+        candidate_end=duration,
+        review_start=0.0,
+        review_end=duration,
+        segments=[ClipSegment(id=new_id("seg"), start=0.0, end=duration)],
+        confidence=1.0,
+        status="kept",
+        notes=f"source={source_label}" if source_label else "",
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def import_direct_clips_into_project(
     state: ProjectState,
     clip_inputs: list[str] | list[dict[str, object]],
@@ -286,26 +316,7 @@ def import_direct_clips_into_project(
             created_at=now,
             updated_at=now,
         )
-        clip = CandidateClip(
-            id=new_id("clip"),
-            video_id=video.id,
-            detection_block_id=None,
-            linked_platform_record_id=None,
-            athlete_name="",
-            country="",
-            subtitle_start=0.0,
-            subtitle_end=duration,
-            candidate_start=0.0,
-            candidate_end=duration,
-            review_start=0.0,
-            review_end=duration,
-            segments=[ClipSegment(id=new_id("seg"), start=0.0, end=duration)],
-            confidence=1.0,
-            status="kept",
-            notes="",
-            created_at=now,
-            updated_at=now,
-        )
+        clip = build_full_video_clip(video, source_label="")
         state.videos.append(video)
         state.candidate_clips.append(clip)
         imported_videos.append(video)

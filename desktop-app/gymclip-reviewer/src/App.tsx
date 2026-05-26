@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 
 import {
+  addVideoAsCandidate,
   bindClipPlatformRecord,
   cancelDetectVideo,
   createLocalCard,
@@ -45,7 +46,6 @@ import {
   previewScopePlatformRecords,
   restoreCandidateClips,
   retryClipStage,
-  fetchScrubThumbnails,
   splitClipSegment,
   updateClip,
   updateLocalCard,
@@ -1465,6 +1465,7 @@ export default function App() {
 
   const [isDragging, setIsDragging] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [videoContextMenu, setVideoContextMenu] = useState<{x: number; y: number; videoId: string} | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
   const [importMode, setImportMode] = useState<ImportMode>('full_video');
   const [pendingImportVideos, setPendingImportVideos] = useState<PendingImportVideo[]>([]);
@@ -1535,9 +1536,6 @@ export default function App() {
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [timelineThumbnails, setTimelineThumbnails] = useState<ThumbnailFrame[]>([]);
   const [isLoadingThumbnails, setIsLoadingThumbnails] = useState(false);
-  const [scrubFrames, setScrubFrames] = useState<ThumbnailFrame[]>([]);
-  const [showScrubOverlay, setShowScrubOverlay] = useState(false);
-  const [scrubOverlaySrc, setScrubOverlaySrc] = useState('');
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const directClipFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1545,11 +1543,17 @@ export default function App() {
   const skipTrimSyncRef = useRef(true);
   const isScrubbingRef = useRef(false);
   const resumeAfterScrubRef = useRef(false);
-  const scrubTimeoutRef = useRef<number | null>(null);
+  const scrubRafRef = useRef<number | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
+  const isSeekingRef = useRef(false);
+  const seekSafetyTimerRef = useRef<number | null>(null);
   const trimStartRef = useRef(0);
   const trimEndRef = useRef(0);
   const trimAutoSaveTimerRef = useRef<number | null>(null);
+  const trimScrollRafRef = useRef<number | null>(null);
+  const trimPointerXRef = useRef(0);
+  const trimRectRef = useRef<DOMRect | null>(null);
+  const trimDraggingRef = useRef(false);
   const trimSavePromiseRef = useRef<Promise<ActiveSegmentEditSnapshot | null> | null>(null);
   const handledJobIdsRef = useRef<Set<string>>(new Set());
   const notifiedDesktopJobIdsRef = useRef<Set<string>>(new Set());
@@ -1598,11 +1602,14 @@ export default function App() {
     [videos, activeVideoId],
   );
 
+  const clipOrderById = useMemo(() => {
+    const map = new Map<string, number>();
+    clips.forEach((clip, index) => map.set(clip.id, index));
+    return map;
+  }, [clips]);
+
   const videoClips = useMemo(
-    () =>
-      clips
-        .filter((clip) => clip.video_id === activeVideoId)
-        .sort((a, b) => a.candidate_start - b.candidate_start || a.candidate_end - b.candidate_end),
+    () => clips.filter((clip) => clip.video_id === activeVideoId),
     [clips, activeVideoId],
   );
 
@@ -1633,9 +1640,9 @@ export default function App() {
         if (videoIndexA !== videoIndexB) {
           return videoIndexA - videoIndexB;
         }
-        return a.candidate_start - b.candidate_start || a.candidate_end - b.candidate_end;
+        return (clipOrderById.get(a.id) ?? 0) - (clipOrderById.get(b.id) ?? 0);
       });
-  }, [clips, filterStatus, folderOrderById, platformRecordById, searchQuery, videoById, videoOrderById]);
+  }, [clips, clipOrderById, filterStatus, folderOrderById, platformRecordById, searchQuery, videoById, videoOrderById]);
   const groupedFilteredClips = useMemo(() => {
     const groups: Array<{
       id: string;
@@ -2069,23 +2076,22 @@ export default function App() {
     exportOperation !== 'export_only' && exportTargetBoundCount - exportTargetLocalBoundCount > 0;
 
   const streamUrl = activeVideo ? getVideoStreamUrl(activeVideo.id) : '';
-  const clipWindowBounds = useMemo(() => {
+  const initialClipWindow = useMemo(() => {
     if (!activeClip) return {start: 0, end: CLIP_STEP};
     const baseStart = Math.min(activeClip.candidate_start, activeClip.review_start);
     const baseEnd = Math.max(activeClip.candidate_end, activeClip.review_end, baseStart + CLIP_STEP);
-    const clipIdx = videoClips.findIndex((c) => c.id === activeClip.id);
-    const prevClip = clipIdx > 0 ? videoClips[clipIdx - 1] : null;
-    const nextClip = clipIdx >= 0 && clipIdx < videoClips.length - 1 ? videoClips[clipIdx + 1] : null;
-    const extendLeft = prevClip ? prevClip.candidate_start : Math.max(0, baseStart - 10);
-    const videoDuration = activeVideo?.duration ?? baseEnd + 10;
-    const extendRight = nextClip ? nextClip.candidate_end : Math.min(videoDuration, baseEnd + 10);
+    const EXTEND = 30;
+    const videoDuration = activeVideo?.duration ?? baseEnd + EXTEND;
     return {
-      start: Math.min(baseStart, extendLeft),
-      end: Math.max(baseEnd, extendRight),
+      start: Math.max(0, baseStart - EXTEND),
+      end: Math.min(videoDuration, baseEnd + EXTEND),
     };
-  }, [activeClip, videoClips, activeVideo?.duration]);
-  const clipWindowStart = clipWindowBounds.start;
-  const clipWindowEnd = clipWindowBounds.end;
+  }, [activeClip?.id, activeVideo?.duration]);
+  const [clipWindowOverride, setClipWindowOverride] = useState<{start: number; end: number} | null>(null);
+  const [clipWindowVersion, setClipWindowVersion] = useState(0);
+  useEffect(() => { setClipWindowOverride(null); }, [activeClip?.id]);
+  const clipWindowStart = (clipWindowOverride ?? initialClipWindow).start;
+  const clipWindowEnd = (clipWindowOverride ?? initialClipWindow).end;
   const clipWindowDuration = Math.max(CLIP_STEP, clipWindowEnd - clipWindowStart);
   const trimStartLocal = Math.max(0, trimStart - clipWindowStart);
   const trimEndLocal = Math.max(trimStartLocal + CLIP_STEP, trimEnd - clipWindowStart);
@@ -2568,6 +2574,22 @@ export default function App() {
   }, [toast]);
 
   useEffect(() => {
+    if (!videoContextMenu) return;
+    const close = () => setVideoContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [videoContextMenu]);
+
+  useEffect(() => {
     if (activeJobs.length === 0 && !videos.some((video) => video.status === 'detecting')) return;
     const hasActiveExportJob = activeJobs.some((job) => job.kind === 'export');
     const timer = window.setInterval(() => {
@@ -3031,67 +3053,44 @@ export default function App() {
       setTimelineThumbnails([]);
       return;
     }
+    if (trimDraggingRef.current) return;
 
     let cancelled = false;
-    setIsLoadingThumbnails(true);
-    void fetchVideoThumbnails(activeVideo.id, {
-      start: clipWindowStart,
-      end: clipWindowEnd,
-      count: 12,
-    })
-      .then((response) => {
-        if (cancelled) return;
-        setTimelineThumbnails(response.thumbnails);
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setIsLoadingThumbnails(true);
+      void fetchVideoThumbnails(activeVideo.id, {
+        start: clipWindowStart,
+        end: clipWindowEnd,
+        count: 12,
       })
-      .catch(() => {
-        if (cancelled) return;
-        setTimelineThumbnails([]);
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setIsLoadingThumbnails(false);
-      });
+        .then((response) => {
+          if (cancelled) return;
+          setTimelineThumbnails(response.thumbnails);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setTimelineThumbnails([]);
+        })
+        .finally(() => {
+          if (cancelled) return;
+          setIsLoadingThumbnails(false);
+        });
+    }, 250);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
-  }, [activeVideo?.id, activeClip?.id, clipWindowStart, clipWindowEnd]);
-
-  useEffect(() => {
-    if (!activeVideo || !activeClip) {
-      setScrubFrames([]);
-      return;
-    }
-
-    let cancelled = false;
-    void fetchScrubThumbnails(activeVideo.id, {
-      start: clipWindowStart,
-      end: clipWindowEnd,
-      fps: 2,
-    })
-      .then((response) => {
-        if (cancelled) return;
-        setScrubFrames(response.thumbnails);
-        const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
-        for (const frame of response.thumbnails) {
-          const img = new Image();
-          img.src = `${baseUrl}${frame.url}`;
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setScrubFrames([]);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeVideo?.id, activeClip?.id, clipWindowStart, clipWindowEnd]);
+  }, [activeVideo?.id, activeClip?.id, clipWindowStart, clipWindowEnd, clipWindowVersion]);
 
   useEffect(() => {
     return () => {
-      if (scrubTimeoutRef.current != null) {
-        window.clearTimeout(scrubTimeoutRef.current);
+      if (scrubRafRef.current != null) {
+        cancelAnimationFrame(scrubRafRef.current);
+      }
+      if (seekSafetyTimerRef.current != null) {
+        window.clearTimeout(seekSafetyTimerRef.current);
       }
       if (trimAutoSaveTimerRef.current != null) {
         window.clearTimeout(trimAutoSaveTimerRef.current);
@@ -3503,16 +3502,9 @@ export default function App() {
 
   function updateTrimRange(nextStart: number, nextEnd: number, syncTarget: 'start' | 'end' | null = null) {
     if (!activeClip || !activeSegment) return;
-    const safeWindowStart = clipWindowStart;
-    const safeWindowEnd = clipWindowEnd;
-    const currentSegments = activeClipSegments;
-    const currentIndex = currentSegments.findIndex((segment) => segment.id === activeSegment.id);
-    const previousSegment = currentIndex > 0 ? currentSegments[currentIndex - 1] : null;
-    const nextSegment = currentIndex >= 0 && currentIndex + 1 < currentSegments.length ? currentSegments[currentIndex + 1] : null;
-    const minStart = previousSegment ? previousSegment.end : safeWindowStart;
-    const maxEnd = nextSegment ? nextSegment.start : safeWindowEnd;
-    const safeStart = Math.max(minStart, Math.min(nextStart, maxEnd - CLIP_STEP));
-    const safeEnd = Math.max(safeStart + CLIP_STEP, Math.min(nextEnd, maxEnd));
+    const videoDuration = activeVideo?.duration ?? clipWindowEnd;
+    const safeStart = Math.max(0, Math.min(nextStart, nextEnd - CLIP_STEP));
+    const safeEnd = Math.max(safeStart + CLIP_STEP, Math.min(nextEnd, videoDuration));
 
     const nextTrimStart = Number(safeStart.toFixed(2));
     const nextTrimEnd = Number(safeEnd.toFixed(2));
@@ -3578,56 +3570,98 @@ export default function App() {
 
   function syncVideoTime(nextTime: number, options?: {force?: boolean}) {
     const safeTime = Number(nextTime.toFixed(2));
-    setPlayhead(safeTime);
     pendingSeekRef.current = safeTime;
 
-    if (isScrubbingRef.current && scrubFrames.length > 0) {
-      let best = scrubFrames[0];
-      for (const frame of scrubFrames) {
-        if (Math.abs(frame.time_seconds - safeTime) < Math.abs(best.time_seconds - safeTime)) {
-          best = frame;
-        }
-      }
-      const baseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000';
-      setScrubOverlaySrc(`${baseUrl}${best.url}`);
+    // During scrubbing, defer setPlayhead to rAF to reduce React re-renders
+    if (!isScrubbingRef.current) {
+      setPlayhead(safeTime);
     }
 
     const video = videoRef.current;
     if (!video) return;
 
     const applySeek = () => {
-      if (pendingSeekRef.current == null) return;
+      if (pendingSeekRef.current == null || isSeekingRef.current) return;
       const target = pendingSeekRef.current;
       pendingSeekRef.current = null;
       if (Math.abs(video.currentTime - target) > 0.02) {
-        video.currentTime = target;
+        isSeekingRef.current = true;
+
+        // Clear any previous safety timer
+        if (seekSafetyTimerRef.current != null) {
+          window.clearTimeout(seekSafetyTimerRef.current);
+        }
+
+        const onSeeked = () => {
+          video.removeEventListener('seeked', onSeeked);
+          if (seekSafetyTimerRef.current != null) {
+            window.clearTimeout(seekSafetyTimerRef.current);
+            seekSafetyTimerRef.current = null;
+          }
+          isSeekingRef.current = false;
+          // If a new target accumulated while seeking, apply it immediately
+          if (pendingSeekRef.current != null) {
+            applySeek();
+          }
+        };
+        video.addEventListener('seeked', onSeeked);
+
+        // Safety timeout in case seeked never fires
+        seekSafetyTimerRef.current = window.setTimeout(() => {
+          video.removeEventListener('seeked', onSeeked);
+          seekSafetyTimerRef.current = null;
+          isSeekingRef.current = false;
+          if (pendingSeekRef.current != null) {
+            applySeek();
+          }
+        }, 300);
+
+        // Fast scrub: use fastSeek for large jumps (keyframe-only, instant)
+        const delta = Math.abs(target - video.currentTime);
+        if (delta > 2 && typeof video.fastSeek === 'function') {
+          video.fastSeek(target);
+        } else {
+          video.currentTime = target;
+        }
       }
     };
 
     if (options?.force) {
-      if (scrubTimeoutRef.current != null) {
-        window.clearTimeout(scrubTimeoutRef.current);
-        scrubTimeoutRef.current = null;
+      if (scrubRafRef.current != null) {
+        cancelAnimationFrame(scrubRafRef.current);
+        scrubRafRef.current = null;
+      }
+      isSeekingRef.current = false;
+      if (seekSafetyTimerRef.current != null) {
+        window.clearTimeout(seekSafetyTimerRef.current);
+        seekSafetyTimerRef.current = null;
+      }
+      pendingSeekRef.current = safeTime;
+      setPlayhead(safeTime);
+      // Force seek always uses precise currentTime
+      if (Math.abs(video.currentTime - safeTime) > 0.02) {
+        video.currentTime = safeTime;
+      }
+      return;
+    }
+
+    if (scrubRafRef.current != null) {
+      return;
+    }
+
+    scrubRafRef.current = requestAnimationFrame(() => {
+      scrubRafRef.current = null;
+      if (pendingSeekRef.current != null) {
+        setPlayhead(pendingSeekRef.current);
       }
       applySeek();
-      return;
-    }
-
-    if (scrubTimeoutRef.current != null) {
-      return;
-    }
-
-    scrubTimeoutRef.current = window.setTimeout(() => {
-      scrubTimeoutRef.current = null;
-      applySeek();
-    }, 60);
+    });
   }
 
   function beginScrub() {
     const video = videoRef.current;
     isScrubbingRef.current = true;
     setIsScrubbing(true);
-    setShowScrubOverlay(scrubFrames.length > 0);
     resumeAfterScrubRef.current = Boolean(video && !video.paused);
     if (video && !video.paused) {
       video.pause();
@@ -3637,10 +3671,14 @@ export default function App() {
   function endScrub() {
     isScrubbingRef.current = false;
     setIsScrubbing(false);
-    setShowScrubOverlay(false);
-    if (scrubTimeoutRef.current != null) {
-      window.clearTimeout(scrubTimeoutRef.current);
-      scrubTimeoutRef.current = null;
+    if (scrubRafRef.current != null) {
+      cancelAnimationFrame(scrubRafRef.current);
+      scrubRafRef.current = null;
+    }
+    isSeekingRef.current = false;
+    if (seekSafetyTimerRef.current != null) {
+      window.clearTimeout(seekSafetyTimerRef.current);
+      seekSafetyTimerRef.current = null;
     }
     if (pendingSeekRef.current != null) {
       syncVideoTime(pendingSeekRef.current, {force: true});
@@ -3657,6 +3695,78 @@ export default function App() {
       void video.play().catch(() => undefined);
     } else {
       resumeAfterScrubRef.current = false;
+    }
+  }
+
+  function startTrimScroll(edge: 'left' | 'right') {
+    trimDraggingRef.current = true;
+    const tick = () => {
+      const rect = trimRectRef.current;
+      if (!rect || rect.width === 0) {
+        trimScrollRafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
+      const x = trimPointerXRef.current;
+      const fraction = (x - rect.left) / rect.width;
+
+      const EDGE_ZONE = 0.1;
+      const MAX_SPEED = 2;
+      let scrollSpeed = 0;
+
+      if (fraction < 0) {
+        scrollSpeed = -MAX_SPEED;
+      } else if (fraction < EDGE_ZONE) {
+        scrollSpeed = -MAX_SPEED * ((EDGE_ZONE - fraction) / EDGE_ZONE);
+      } else if (fraction > 1) {
+        scrollSpeed = MAX_SPEED;
+      } else if (fraction > 1 - EDGE_ZONE) {
+        scrollSpeed = MAX_SPEED * ((fraction - (1 - EDGE_ZONE)) / EDGE_ZONE);
+      }
+
+      if (scrollSpeed !== 0) {
+        const dt = scrollSpeed / 60;
+        setClipWindowOverride((prev) => {
+          const cur = prev ?? initialClipWindow;
+          const videoDur = activeVideo?.duration ?? cur.end;
+          const shift = edge === 'left'
+            ? Math.max(-cur.start, dt < 0 ? dt : 0)
+            : Math.min(videoDur - cur.end, dt > 0 ? dt : 0);
+          if (edge === 'left' && dt < 0) {
+            return {start: Math.max(0, cur.start + dt), end: cur.end};
+          }
+          if (edge === 'right' && dt > 0) {
+            return {start: cur.start, end: Math.min(videoDur, cur.end + dt)};
+          }
+          if (dt < 0) {
+            return {start: Math.max(0, cur.start + dt), end: cur.end};
+          }
+          return {start: cur.start, end: Math.min(videoDur, cur.end + dt)};
+        });
+      }
+
+      const clampedF = Math.max(0, Math.min(1, fraction));
+      const t = clipWindowStart + clampedF * clipWindowDuration;
+      if (edge === 'left') {
+        updateTrimRange(t, trimEndRef.current, 'start');
+      } else {
+        updateTrimRange(trimStartRef.current, t, 'end');
+      }
+
+      trimScrollRafRef.current = requestAnimationFrame(tick);
+    };
+
+    trimScrollRafRef.current = requestAnimationFrame(tick);
+  }
+
+  function stopTrimScroll() {
+    if (trimScrollRafRef.current != null) {
+      cancelAnimationFrame(trimScrollRafRef.current);
+      trimScrollRafRef.current = null;
+    }
+    if (trimDraggingRef.current) {
+      trimDraggingRef.current = false;
+      setClipWindowVersion((v) => v + 1);
     }
   }
 
@@ -4278,6 +4388,19 @@ export default function App() {
     }
   }
 
+  async function handleAddVideoAsCandidate(videoId: string) {
+    const targetVideo = videos.find((video) => video.id === videoId);
+    if (!targetVideo) return;
+    try {
+      const nextProject = await addVideoAsCandidate(videoId);
+      setProjectState(nextProject);
+      setErrorMessage(null);
+      setSuccessMessage(`已把整段视频「${targetVideo.file_name}」加为候选片段`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '把整段视频加为候选片段失败');
+    }
+  }
+
   async function handleStatusChange(clipId: string, status: ClipStatus) {
     if (guardClipMutation(clipId)) return;
     const currentIndex = filteredClips.findIndex((clip) => clip.id === clipId);
@@ -4665,6 +4788,31 @@ export default function App() {
         .filter(Boolean)
         .join(' · ');
       return `导出 ${localExported}/${total || localExported} · 上传 ${uploaded} · 回写 ${synced}${detail ? ` · ${detail}` : ''}`.trim();
+    }
+    if (job.kind === 'detect') {
+      const currentName = String((job.progress as Record<string, unknown>).current_name || '');
+      const stageLabel =
+        stage === 'extracting'
+          ? '正在采样视频帧'
+          : stage === 'start'
+            ? '准备开始检测'
+            : stage === 'precheck_complete'
+              ? '预检查完成'
+              : stage === 'detecting'
+                ? `AI 检测中${currentName ? `: ${currentName}` : ''}`
+                : stage === 'completed'
+                  ? '检测完成'
+                  : stage === 'cancel_requested'
+                    ? '正在取消检测...'
+                    : stage === 'cancelled'
+                      ? '检测已取消'
+                      : '';
+      const label = stageLabel || (message && message !== '等待检测任务开始' ? message : '') ||
+        (job.status === 'queued' ? '已排队，准备抽帧' : '准备开始检测');
+      if (total > 0) {
+        return `${completed}/${total} ${label}`.trim();
+      }
+      return label;
     }
     if (total > 0) {
       return `${completed}/${total} ${message}`.trim();
@@ -5054,6 +5202,11 @@ export default function App() {
                           <div
                             key={video.id}
                             onClick={() => setActiveVideoId(video.id)}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              setVideoContextMenu({x: event.clientX, y: event.clientY, videoId: video.id});
+                            }}
                             className={`w-full cursor-pointer text-left p-3 rounded-xl border transition-all ${
                               activeVideoId === video.id
                                 ? 'bg-white border-gray-200 shadow-sm'
@@ -5427,14 +5580,6 @@ export default function App() {
                       onError={() => setVideoPlaybackError(activeVideo.error_message || '视频加载失败，请确认源文件仍存在。')}
                     />
 
-                    {showScrubOverlay && scrubOverlaySrc && (
-                      <img
-                        src={scrubOverlaySrc}
-                        alt=""
-                        className="absolute inset-0 w-full h-full object-contain bg-black z-10 pointer-events-none"
-                        draggable={false}
-                      />
-                    )}
 
                     {videoPlaybackError && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/75 px-6 text-center">
@@ -5570,16 +5715,18 @@ export default function App() {
                                   e.preventDefault();
                                   const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
                                   if (!containerEl) return;
-                                  const rect = containerEl.getBoundingClientRect();
+                                  trimRectRef.current = containerEl.getBoundingClientRect();
+                                  trimPointerXRef.current = e.clientX;
                                   beginScrub();
+                                  startTrimScroll('left');
                                   const onMove = (ev: PointerEvent) => {
-                                    const f = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-                                    const t = clipWindowStart + f * clipWindowDuration;
-                                    updateTrimRange(t, trimEndRef.current, 'start');
+                                    trimPointerXRef.current = ev.clientX;
+                                    trimRectRef.current = containerEl.getBoundingClientRect();
                                   };
                                   const onUp = () => {
                                     document.removeEventListener('pointermove', onMove);
                                     document.removeEventListener('pointerup', onUp);
+                                    stopTrimScroll();
                                     endScrub();
                                   };
                                   document.addEventListener('pointermove', onMove);
@@ -5597,16 +5744,18 @@ export default function App() {
                                   e.preventDefault();
                                   const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
                                   if (!containerEl) return;
-                                  const rect = containerEl.getBoundingClientRect();
+                                  trimRectRef.current = containerEl.getBoundingClientRect();
+                                  trimPointerXRef.current = e.clientX;
                                   beginScrub();
+                                  startTrimScroll('right');
                                   const onMove = (ev: PointerEvent) => {
-                                    const f = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-                                    const t = clipWindowStart + f * clipWindowDuration;
-                                    updateTrimRange(trimStartRef.current, t, 'end');
+                                    trimPointerXRef.current = ev.clientX;
+                                    trimRectRef.current = containerEl.getBoundingClientRect();
                                   };
                                   const onUp = () => {
                                     document.removeEventListener('pointermove', onMove);
                                     document.removeEventListener('pointerup', onUp);
+                                    stopTrimScroll();
                                     endScrub();
                                   };
                                   document.addEventListener('pointermove', onMove);
@@ -6915,6 +7064,25 @@ export default function App() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+      {videoContextMenu && (
+        <div
+          className="fixed z-50 min-w-[200px] rounded-lg border border-gray-200 bg-white py-1 shadow-lg"
+          style={{left: videoContextMenu.x, top: videoContextMenu.y}}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="block w-full px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100"
+            onClick={() => {
+              const targetId = videoContextMenu.videoId;
+              setVideoContextMenu(null);
+              void handleAddVideoAsCandidate(targetId);
+            }}
+          >
+            把整段加为候选片段
+          </button>
         </div>
       )}
     </div>

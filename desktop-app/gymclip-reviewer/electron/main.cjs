@@ -4,6 +4,11 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Ensure hardware-accelerated video decode for smooth scrubbing
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-accelerated-video-decode');
+app.commandLine.appendSwitch('enable-zero-copy');
+
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = process.env.GYMCLIP_BACKEND_PORT || '8000';
 const RENDERER_URL = process.env.ELECTRON_RENDERER_URL || null;

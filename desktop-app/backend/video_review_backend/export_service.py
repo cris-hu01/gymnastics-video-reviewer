@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +19,14 @@ from .oss_upload_service import OSSUploadService
 from .platform_client import PlatformClient, SPORT_ITEM_LABELS
 
 
+logger = logging.getLogger(__name__)
+
+
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS = 3
+DEFAULT_PLATFORM_SYNC_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
 
 def _clean_path_component(value: str) -> str:
@@ -615,6 +624,10 @@ class ExportService:
                 )
                 return result
             except Exception as error:
+                logger.exception(
+                    "clip upload/platform-callback failed: clip_id=%s file=%s: %s",
+                    clip.id, source_file, error,
+                )
                 with runtime_lock:
                     upload_items[clip.id] = {
                         **upload_items.get(clip.id, {}),
@@ -792,18 +805,37 @@ class ExportService:
         source_file: Path,
         uploaded_url: str,
     ) -> None:
-        self.platform_client.update_video_urls(
-            [platform_record],
-            {
-                platform_record.id: {
-                    "link": uploaded_url,
-                    "originalName": source_file.name,
-                }
-            },
-        )
-        clip.platform_sync_status = "synced"
-        clip.platform_sync_error_message = None
-        clip.updated_at = utc_now_iso()
+        last_error: Exception | None = None
+        for attempt in range(1, DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS + 1):
+            try:
+                self.platform_client.update_video_urls(
+                    [platform_record],
+                    {
+                        platform_record.id: {
+                            "link": uploaded_url,
+                            "originalName": source_file.name,
+                        }
+                    },
+                )
+                clip.platform_sync_status = "synced"
+                clip.platform_sync_error_message = None
+                clip.updated_at = utc_now_iso()
+                if attempt > 1:
+                    logger.info(
+                        "platform writeback recovered on attempt %d for clip=%s",
+                        attempt, clip.id,
+                    )
+                return
+            except Exception as error:
+                last_error = error
+                logger.warning(
+                    "platform writeback attempt %d/%d failed for clip=%s: %s",
+                    attempt, DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS, clip.id, error,
+                )
+                if attempt < DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS:
+                    time.sleep(DEFAULT_PLATFORM_SYNC_RETRY_BACKOFF_SECONDS[attempt - 1])
+        assert last_error is not None
+        raise last_error
 
     def _select_exportable_clips(
         self,
@@ -889,13 +921,6 @@ class ExportService:
         if explicit_sex is not None:
             return explicit_sex
 
-        derived_from_selection = _derive_sex_from_selection_keys(
-            video.sport_selection_keys,
-            record.sport_item_id,
-        )
-        if derived_from_selection is not None:
-            return derived_from_selection
-
         derived_from_text = _derive_sex_from_text(
             record.venue,
             (record.raw_record or {}).get("venue"),
@@ -904,6 +929,13 @@ class ExportService:
         )
         if derived_from_text is not None:
             return derived_from_text
+
+        derived_from_selection = _derive_sex_from_selection_keys(
+            video.sport_selection_keys,
+            record.sport_item_id,
+        )
+        if derived_from_selection is not None:
+            return derived_from_selection
 
         derived_from_sport_item = _derive_sex_from_sport_item(record.sport_item_id)
         if derived_from_sport_item is not None:

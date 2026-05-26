@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import re
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
-
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from .models import PlatformRecord, PlatformScopeQuery, VideoTask, utc_now_iso
 
@@ -72,6 +70,11 @@ def _stringify(value: Any) -> str:
         return ""
     return str(value).strip()
 
+
+def _safe_request_data(payload: dict[str, Any] | list[dict[str, Any]] | None) -> bytes | None:
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _normalize_public_video_url(value: Any) -> str:
@@ -169,23 +172,6 @@ class PlatformClient:
         self.token_header = (os.environ.get("GYMCLIP_PLATFORM_TOKEN_HEADER") or "Authorization").strip() or "Authorization"
         self.token_prefix = os.environ.get("GYMCLIP_PLATFORM_TOKEN_PREFIX", "Bearer").strip()
         self.verify_ssl = os.environ.get("GYMCLIP_PLATFORM_VERIFY_SSL", "1").strip() != "0"
-
-        retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self._session = requests.Session()
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
-        if self.verify_ssl:
-            self._session.verify = certifi.where() if certifi else True
-        else:
-            self._session.verify = False
-        self._session.headers["Accept"] = "application/json"
-        if self.token:
-            if self.token_header.lower() == "authorization" and self.token_prefix:
-                self._session.headers[self.token_header] = f"{self.token_prefix} {self.token}"
-            else:
-                self._session.headers[self.token_header] = self.token
-        self._request_semaphore = threading.Semaphore(3)
 
     def fetch_matches(self) -> list[dict[str, Any]]:
         data = self._request("GET", "/matchInfo/selectList")
@@ -308,7 +294,7 @@ class PlatformClient:
                 records.extend(run_query(index, query))
             return self._dedupe_records(records)
 
-        with ThreadPoolExecutor(max_workers=min(3, len(scope_queries)), thread_name_prefix="gymclip-platform-scope") as executor:
+        with ThreadPoolExecutor(max_workers=min(6, len(scope_queries)), thread_name_prefix="gymclip-platform-scope") as executor:
             futures = [
                 executor.submit(run_query, index, query)
                 for index, query in enumerate(scope_queries, start=1)
@@ -409,7 +395,6 @@ class PlatformClient:
                         sport_item_id=sport_item_id,
                         category=query.category,
                         team_country=item_country if query.category.upper() == "TF" else None,
-                        resolved_sex=item_sex,
                     )
                 )
             return results
@@ -419,7 +404,7 @@ class PlatformClient:
                 normalized.extend(fetch_one(frequency_info_id, venue, sport_item_id))
             return normalized
 
-        with ThreadPoolExecutor(max_workers=min(3, len(tasks)), thread_name_prefix="gymclip-platform-score") as executor:
+        with ThreadPoolExecutor(max_workers=min(6, len(tasks)), thread_name_prefix="gymclip-platform-score") as executor:
             futures = [
                 executor.submit(fetch_one, frequency_info_id, venue, sport_item_id)
                 for frequency_info_id, venue, sport_item_id in tasks
@@ -517,7 +502,6 @@ class PlatformClient:
                             sport_item_id=sport_item_id,
                             category=query.category,
                             team_country=None,
-                            resolved_sex=score_sex,
                         )
                     )
         self._assign_vault_attempts(normalized)
@@ -583,7 +567,6 @@ class PlatformClient:
                                     sport_item_id=sport_item_id,
                                     category=query.category,
                                     team_country=athlete_country,
-                                    resolved_sex=score_sex,
                                 )
                             )
                         continue
@@ -601,7 +584,6 @@ class PlatformClient:
                             sport_item_id=sport_item_id,
                             category=query.category,
                             team_country=athlete_country,
-                            resolved_sex=_coerce_int(athlete.get("sex")) or sex,
                         )
                     )
         return normalized
@@ -643,7 +625,6 @@ class PlatformClient:
         sport_item_id: int | None,
         category: str,
         team_country: str | None,
-        resolved_sex: int | None = None,
     ) -> PlatformRecord:
         platform_id = _stringify(raw_record.get("id")) or None
         ranking = _stringify(raw_record.get("ranking"))
@@ -669,7 +650,7 @@ class PlatformClient:
             frequency_info_id=_stringify(raw_record.get("frequencyInfoId")) or video.frequency_info_id,
             venue=_stringify(raw_record.get("venue")) or video.venue,
             category=category,
-            sex=_coerce_int(raw_record.get("sex")) or resolved_sex or video.sex,
+            sex=_coerce_int(raw_record.get("sex")) or video.sex,
             team_country=team_country,
             sport_item_id=sport_item_id,
             sport_item_label=SPORT_ITEM_LABELS.get(sport_item_id or -1, _stringify(raw_record.get("sportItem"))),
@@ -725,39 +706,49 @@ class PlatformClient:
             key: value
             for key, value in (params or {}).items()
             if value not in (None, "", [])
-        } or None
+        }
         url = f"{self.base_url}{path}"
+        if filtered_params:
+            url = f"{url}?{urlencode(filtered_params, doseq=True)}"
 
-        with self._request_semaphore:
+        headers = {
+            "Accept": "application/json",
+        }
+        data = None
+        if json_body is not None:
+            data = _safe_request_data(json_body)
+            headers["Content-Type"] = "application/json"
+
+        if self.token:
+            if self.token_header.lower() == "authorization" and self.token_prefix:
+                headers[self.token_header] = f"{self.token_prefix} {self.token}"
+            else:
+                headers[self.token_header] = self.token
+
+        request = Request(url, data=data, method=method.upper(), headers=headers)
+        try:
+            with urlopen(request, timeout=self.timeout_seconds, context=self._build_ssl_context()) as response:
+                payload = response.read().decode("utf-8")
+        except HTTPError as error:
             try:
-                response = self._session.request(
-                    method.upper(),
-                    url,
-                    params=filtered_params,
-                    json=json_body,
-                    timeout=self.timeout_seconds,
-                )
-            except Exception as error:
-                raise PlatformApiError(f"平台接口请求失败: {error}") from error
-
-            payload = response.text
-
-            if response.status_code >= 400:
-                try:
-                    error_result = response.json() if payload.strip() else None
-                except (json.JSONDecodeError, ValueError):
-                    error_result = None
-                if isinstance(error_result, dict):
-                    message = _stringify(error_result.get("msg")) or _stringify(error_result.get("message"))
-                    if message:
-                        raise PlatformApiError(
-                            f"平台接口请求失败: HTTP {response.status_code} {response.reason} - {message}"
-                        )
-                if _looks_like_html(payload):
-                    raise PlatformApiError(
-                        f"平台接口未接通: {url} 返回了 HTML 页面（HTTP {response.status_code}），请检查 API 路径、白名单或网关代理配置"
-                    )
-                raise PlatformApiError(f"平台接口请求失败: HTTP {response.status_code} {response.reason}")
+                error_payload = error.read().decode("utf-8", "replace")
+            except Exception:
+                error_payload = ""
+            try:
+                error_result = json.loads(error_payload) if error_payload else None
+            except json.JSONDecodeError:
+                error_result = None
+            if isinstance(error_result, dict):
+                message = _stringify(error_result.get("msg")) or _stringify(error_result.get("message"))
+                if message:
+                    raise PlatformApiError(f"平台接口请求失败: HTTP {error.code} {error.reason} - {message}") from error
+            if _looks_like_html(error_payload):
+                raise PlatformApiError(
+                    f"平台接口未接通: {url} 返回了 HTML 页面（HTTP {error.code}），请检查 API 路径、白名单或网关代理配置"
+                ) from error
+            raise PlatformApiError(f"平台接口请求失败: HTTP {error.code} {error.reason}") from error
+        except Exception as error:
+            raise PlatformApiError(f"平台接口请求失败: {error}") from error
 
         if _looks_like_html(payload):
             raise PlatformApiError(
@@ -794,3 +785,9 @@ class PlatformClient:
             return False
         return expected in actual or actual in expected
 
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        if not self.verify_ssl:
+            return ssl._create_unverified_context()
+        if certifi is not None:
+            return ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context()
