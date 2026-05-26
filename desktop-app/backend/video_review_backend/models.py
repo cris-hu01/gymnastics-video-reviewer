@@ -455,6 +455,7 @@ class PlatformRecord:
     vault_attempt: int | None = None
     raw_record: dict[str, Any] = field(default_factory=dict)
     linked_clip_ids: list[str] = field(default_factory=list)
+    is_local: bool = False
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
 
@@ -492,6 +493,7 @@ class PlatformRecord:
             vault_attempt=_coerce_int(data.get("vault_attempt")),
             raw_record=dict(data.get("raw_record") or {}),
             linked_clip_ids=[str(value) for value in data.get("linked_clip_ids", []) if str(value)],
+            is_local=bool(data.get("is_local") or False),
             created_at=str(data.get("created_at") or utc_now_iso()),
             updated_at=str(data.get("updated_at") or utc_now_iso()),
         )
@@ -599,7 +601,8 @@ class ProjectState:
 
     def replace_scope_platform_records(self, scope_id: str, records: list[PlatformRecord]) -> None:
         self.platform_records = [
-            record for record in self.platform_records if record.platform_scope_id != scope_id
+            record for record in self.platform_records
+            if record.platform_scope_id != scope_id or record.is_local
         ]
         for record in records:
             record.platform_scope_id = scope_id

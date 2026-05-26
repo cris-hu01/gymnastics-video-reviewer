@@ -186,6 +186,7 @@ class ExportService:
         upload_progress_fraction: dict[str, float] = {}
         local_export_completed = 0
         platform_completed = 0
+        skipped_local_count = 0
 
         def _completed_steps_unlocked() -> float:
             completed_steps = float(local_export_completed)
@@ -261,6 +262,7 @@ class ExportService:
                     "local_exported": local_export_completed,
                     "uploaded": _upload_completed_unlocked(),
                     "synced": platform_completed,
+                    "skipped_local_count": skipped_local_count,
                     "upload_items": upload_items_payload,
                     "aggregate_upload_speed_bps": aggregate_upload_speed_bps,
                     "active_upload_count": active_upload_count,
@@ -290,6 +292,7 @@ class ExportService:
             local_exported=0,
             uploaded=0,
             synced=0,
+            skipped_local_count=0,
             upload_items=[],
             aggregate_upload_speed_bps=0.0,
             active_upload_count=0,
@@ -322,6 +325,24 @@ class ExportService:
                 if clip.linked_platform_record_id
                 else None
             )
+            is_local_record = platform_record is not None and platform_record.is_local
+            if is_local_record and operation == "upload_only":
+                skipped_local_count += 1
+                with runtime_lock:
+                    results_by_clip_id[clip.id] = ExportedClipResult(
+                        clip_id=clip.id,
+                        video_id=video.id,
+                        output_file=clip.exported_path or "",
+                        success=True,
+                    )
+                _emit_export_progress(
+                    "progress",
+                    "已跳过本地补录片段（不上传、不回写）",
+                    clip_id=clip.id,
+                    success=True,
+                    output_file=clip.exported_path or None,
+                )
+                continue
             try:
                 if operation == "upload_only":
                     with runtime_lock:
@@ -411,7 +432,7 @@ class ExportService:
                     local_export_completed += 1
                     _persist_export_state({clip.id})
 
-                if operation == "export_and_upload" and platform_record is not None:
+                if operation == "export_and_upload" and platform_record is not None and not is_local_record:
                     with runtime_lock:
                         upload_progress_fraction[clip.id] = 0.0
                         upload_items[clip.id] = {
@@ -440,6 +461,9 @@ class ExportService:
                         output_file=str(output_file),
                     )
                     continue
+
+                if is_local_record:
+                    skipped_local_count += 1
 
                 with runtime_lock:
                     results_by_clip_id[clip.id] = ExportedClipResult(
@@ -813,15 +837,19 @@ class ExportService:
         state: ProjectState | None = None,
     ) -> Path:
         record = state.get_platform_record(clip.linked_platform_record_id) if state and clip.linked_platform_record_id else None
+        target_dir = output_dir
         if record is not None:
             file_name = self._build_bound_record_file_name(record)
+            if record.is_local:
+                target_dir = output_dir / "本地补录"
+                target_dir.mkdir(parents=True, exist_ok=True)
         else:
             video_name = Path(video.file_name).stem
             athlete_name = self._clean_name(clip.athlete_name) or "clip"
             if clip.country:
                 athlete_name = f"{athlete_name}_{self._clean_name(clip.country)}"
             file_name = f"{video_name}_{index:02d}_{athlete_name}.mp4"
-        target = output_dir / file_name
+        target = target_dir / file_name
         return self._ensure_unique_path(target)
 
     def _build_bound_record_file_name(self, record: PlatformRecord) -> str:
@@ -1164,6 +1192,8 @@ class ExportService:
                 raise ValueError(f"导出文件已丢失: {clip.exported_path}")
             if not platform_record:
                 raise ValueError("片段未绑定平台记录，无法上传 OSS")
+            if platform_record.is_local:
+                raise ValueError("本地补录卡片绑定的片段不参与 OSS 上传")
             object_key, uploaded_url = self._upload_clip_output(
                 source_file=source_file,
                 video=video,
@@ -1190,6 +1220,8 @@ class ExportService:
                 raise ValueError("本地导出文件不存在")
             if not platform_record:
                 raise ValueError("片段未绑定平台记录，无法回写平台")
+            if platform_record.is_local:
+                raise ValueError("本地补录卡片绑定的片段不参与平台回写")
             self._sync_platform_video_url(
                 clip=clip,
                 platform_record=platform_record,

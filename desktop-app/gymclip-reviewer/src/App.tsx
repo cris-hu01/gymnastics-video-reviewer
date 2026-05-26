@@ -26,6 +26,8 @@ import {
 import {
   bindClipPlatformRecord,
   cancelDetectVideo,
+  createLocalCard,
+  deleteLocalCard,
   deleteProjectVideo,
   deleteClipSegment,
   detectProjectVideo,
@@ -46,6 +48,7 @@ import {
   fetchScrubThumbnails,
   splitClipSegment,
   updateClip,
+  updateLocalCard,
 } from './api';
 import type {
   AppJob,
@@ -91,6 +94,19 @@ type PendingDirectClipFile = {
   path: string | null;
   name: string;
   sizeBytes: number;
+};
+
+type LocalCardFormState = {
+  user_name: string;
+  english_name: string;
+  country: string;
+  sport_item_id: string;
+  difficulty_score: string;
+  execution_score: string;
+  bonus_score: string;
+  penalty_score: string;
+  total_score: string;
+  total_overridden: boolean;
 };
 
 type ClipUndoSnapshot = {
@@ -1211,6 +1227,227 @@ function ScoreFilterDropdown({
   );
 }
 
+function emptyLocalCardForm(): LocalCardFormState {
+  return {
+    user_name: '',
+    english_name: '',
+    country: '',
+    sport_item_id: '',
+    difficulty_score: '',
+    execution_score: '',
+    bonus_score: '',
+    penalty_score: '',
+    total_score: '',
+    total_overridden: false,
+  };
+}
+
+function localCardRecordToForm(record: PlatformRecord): LocalCardFormState {
+  return {
+    user_name: record.user_name || '',
+    english_name: record.english_name || '',
+    country: record.country || '',
+    sport_item_id: record.sport_item_id != null ? String(record.sport_item_id) : '',
+    difficulty_score: record.difficulty_score || '',
+    execution_score: record.execution_score || '',
+    bonus_score: record.bonus_score || '',
+    penalty_score: record.penalty_score || '',
+    total_score: record.total_score || '',
+    total_overridden: true,
+  };
+}
+
+function parseScoreNumber(value: string): number {
+  const parsed = Number(String(value).trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function computeLocalCardAutoTotal(form: LocalCardFormState): string {
+  const total =
+    parseScoreNumber(form.difficulty_score) +
+    parseScoreNumber(form.execution_score) +
+    parseScoreNumber(form.bonus_score) -
+    parseScoreNumber(form.penalty_score);
+  return total.toFixed(3).replace(/\.?0+$/, '') || '0';
+}
+
+const LOCAL_CARD_SPORT_OPTIONS: Array<{value: string; label: string}> = Object.entries(SPORT_ITEM_LABELS).map(
+  ([id, label]) => ({value: id, label: `${label} (${id})`}),
+);
+
+function stopFormShortcutPropagation(event: React.KeyboardEvent<HTMLElement>) {
+  event.stopPropagation();
+}
+
+type LocalCardInlineFormProps = {
+  form: LocalCardFormState;
+  setForm: (updater: (prev: LocalCardFormState) => LocalCardFormState) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  saving: boolean;
+  title: string;
+  onDelete?: () => void;
+};
+
+function LocalCardInlineForm({
+  form,
+  setForm,
+  onSave,
+  onCancel,
+  saving,
+  title,
+  onDelete,
+}: LocalCardInlineFormProps) {
+  const autoTotal = computeLocalCardAutoTotal(form);
+  const totalDisplay = form.total_overridden && form.total_score.trim() !== '' ? form.total_score : autoTotal;
+  return (
+    <div
+      className="rounded-2xl border border-amber-300 bg-amber-50/70 p-3 shadow-sm space-y-2.5"
+      onKeyDown={stopFormShortcutPropagation}
+    >
+      <div className="flex items-center justify-between">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-200/70 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
+          本地补录
+        </span>
+        <span className="text-[11px] text-amber-700">{title}</span>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block text-[11px] text-amber-900">
+          姓名 *
+          <input
+            type="text"
+            value={form.user_name}
+            onChange={(event) => setForm((prev) => ({...prev, user_name: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          英文名
+          <input
+            type="text"
+            value={form.english_name}
+            onChange={(event) => setForm((prev) => ({...prev, english_name: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          国家
+          <input
+            type="text"
+            value={form.country}
+            onChange={(event) => setForm((prev) => ({...prev, country: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          项目 *
+          <select
+            value={form.sport_item_id}
+            onChange={(event) => setForm((prev) => ({...prev, sport_item_id: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          >
+            <option value="">-- 选择 --</option>
+            {LOCAL_CARD_SPORT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        <label className="block text-[11px] text-amber-900">
+          难度 D
+          <input
+            type="number"
+            step="0.1"
+            value={form.difficulty_score}
+            onChange={(event) => setForm((prev) => ({...prev, difficulty_score: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          执行 E
+          <input
+            type="number"
+            step="0.1"
+            value={form.execution_score}
+            onChange={(event) => setForm((prev) => ({...prev, execution_score: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          加点
+          <input
+            type="number"
+            step="0.1"
+            value={form.bonus_score}
+            onChange={(event) => setForm((prev) => ({...prev, bonus_score: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+        <label className="block text-[11px] text-amber-900">
+          扣分
+          <input
+            type="number"
+            step="0.1"
+            value={form.penalty_score}
+            onChange={(event) => setForm((prev) => ({...prev, penalty_score: event.target.value}))}
+            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+        </label>
+      </div>
+      <label className="block text-[11px] text-amber-900">
+        总分 {!form.total_overridden && <span className="text-[10px] text-amber-700">(自动 = D + E + 加点 − 扣分)</span>}
+        <div className="mt-0.5 flex items-center gap-2">
+          <input
+            type="number"
+            step="0.001"
+            value={totalDisplay}
+            onChange={(event) => setForm((prev) => ({...prev, total_score: event.target.value, total_overridden: true}))}
+            className="w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm font-semibold text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
+          />
+          {form.total_overridden && (
+            <button
+              type="button"
+              onClick={() => setForm((prev) => ({...prev, total_score: '', total_overridden: false}))}
+              className="text-[11px] text-amber-700 underline hover:text-amber-900"
+            >
+              恢复自动
+            </button>
+          )}
+        </div>
+      </label>
+      <div className="flex items-center justify-end gap-2 pt-1">
+        {onDelete && (
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={saving}
+            className="mr-auto inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-[12px] text-red-600 hover:bg-red-50 disabled:opacity-50"
+          >
+            删除
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={saving}
+          className="rounded-md border border-gray-200 bg-white px-3 py-1 text-[12px] text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+        >
+          取消
+        </button>
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={saving}
+          className="rounded-md border border-amber-600 bg-amber-600 px-3 py-1 text-[12px] font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
+        >
+          {saving ? '保存中...' : '保存'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
   const [project, setProject] = useState<ProjectState | null>(null);
@@ -1273,6 +1510,10 @@ export default function App() {
   const [scoreSexFilter, setScoreSexFilter] = useState('all');
   const [scoreCountryFilter, setScoreCountryFilter] = useState('all');
   const [openScoreFilter, setOpenScoreFilter] = useState<ScoreFilterMenu | null>(null);
+  const [localCardDraft, setLocalCardDraft] = useState<LocalCardFormState | null>(null);
+  const [editingLocalCardId, setEditingLocalCardId] = useState<string | null>(null);
+  const [editingLocalCardForm, setEditingLocalCardForm] = useState<LocalCardFormState | null>(null);
+  const [localCardSaving, setLocalCardSaving] = useState(false);
   const [isOssCredentialsExpanded, setIsOssCredentialsExpanded] = useState(true);
   const [exportSummary, setExportSummary] = useState<{
     operation: ExportOperation;
@@ -1783,15 +2024,30 @@ export default function App() {
       ).length,
     [clips, exportTargetClipIds],
   );
+  const exportTargetLocalBoundCount = useMemo(
+    () =>
+      clips.filter((clip) => {
+        if (!exportTargetClipIds.includes(clip.id)) return false;
+        if (!isClipExportSelectable(clip.status)) return false;
+        if (!clip.linked_platform_record_id) return false;
+        const record = platformRecordById.get(clip.linked_platform_record_id);
+        return Boolean(record?.is_local);
+      }).length,
+    [clips, exportTargetClipIds, platformRecordById],
+  );
   const uploadOnlyInvalidClips = useMemo(
     () =>
       exportTargetClips.filter(
         (clip) => {
           const clipVideo = videoById.get(clip.video_id) ?? null;
+          const record = clip.linked_platform_record_id
+            ? platformRecordById.get(clip.linked_platform_record_id) ?? null
+            : null;
+          if (record?.is_local) return false;
           return getUploadOnlySourceMode(clip, clipVideo) === 'invalid' || !clip.linked_platform_record_id;
         },
       ),
-    [exportTargetClips, videoById],
+    [exportTargetClips, videoById, platformRecordById],
   );
   const uploadOnlySourceSummary = useMemo(() => {
     let exportedFileCount = 0;
@@ -1809,7 +2065,8 @@ export default function App() {
   }, [exportTargetClips, videoById]);
   const hasOssCredentials = Boolean(ossAccessKeyId.trim() && ossAccessKeySecret.trim());
   const hasSavedOutputDir = savedOutputDir.trim().length > 0;
-  const requiresUploadCredentials = exportOperation !== 'export_only' && exportTargetBoundCount > 0;
+  const requiresUploadCredentials =
+    exportOperation !== 'export_only' && exportTargetBoundCount - exportTargetLocalBoundCount > 0;
 
   const streamUrl = activeVideo ? getVideoStreamUrl(activeVideo.id) : '';
   const clipWindowBounds = useMemo(() => {
@@ -1960,6 +2217,7 @@ export default function App() {
   const filteredPlatformRecords = useMemo(() => {
     const query = scoreSearchQuery.trim().toLowerCase();
     return videoScopedPlatformRecords.filter((entry) => {
+      if (entry.is_local) return false;
       const entryVideo = videoById.get(entry.video_id) ?? null;
       const resolvedSex = getResolvedPlatformRecordSex(entry, entryVideo);
       const matchesQuery =
@@ -1975,6 +2233,18 @@ export default function App() {
       return matchesQuery && matchesApparatus && matchesSex && matchesCountry;
     });
   }, [videoScopedPlatformRecords, scoreSearchQuery, scoreApparatusFilter, scoreSexFilter, scoreCountryFilter, videoById]);
+  const localPlatformRecords = useMemo(() => {
+    const query = scoreSearchQuery.trim().toLowerCase();
+    return videoScopedPlatformRecords.filter((entry) => {
+      if (!entry.is_local) return false;
+      if (!query) return true;
+      return (
+        entry.user_name.toLowerCase().includes(query) ||
+        entry.english_name.toLowerCase().includes(query) ||
+        entry.country.toLowerCase().includes(query)
+      );
+    });
+  }, [videoScopedPlatformRecords, scoreSearchQuery]);
   const groupedPlatformRecords = useMemo(() => {
     const groups: Array<{
       matchName: string;
@@ -2922,8 +3192,9 @@ export default function App() {
       const activeElement = document.activeElement;
       const isUndoShortcut = (event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z';
       if (
-        activeElement instanceof HTMLInputElement &&
-        activeElement.type !== 'range'
+        (activeElement instanceof HTMLInputElement && activeElement.type !== 'range') ||
+        activeElement instanceof HTMLSelectElement ||
+        activeElement instanceof HTMLTextAreaElement
       ) {
         return;
       }
@@ -3695,6 +3966,98 @@ export default function App() {
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '绑定平台成绩卡片失败');
     }
+  }
+
+  function validateLocalCardForm(form: LocalCardFormState): string | null {
+    if (!form.user_name.trim()) return '姓名不能为空';
+    if (!form.sport_item_id.trim()) return '请选择项目';
+    return null;
+  }
+
+  function buildLocalCardPayload(form: LocalCardFormState) {
+    const total = form.total_overridden && form.total_score.trim() !== ''
+      ? form.total_score.trim()
+      : computeLocalCardAutoTotal(form);
+    return {
+      user_name: form.user_name.trim(),
+      english_name: form.english_name.trim() || undefined,
+      country: form.country.trim() || undefined,
+      sport_item_id: Number(form.sport_item_id),
+      difficulty_score: form.difficulty_score.trim() || '0',
+      execution_score: form.execution_score.trim() || '0',
+      bonus_score: form.bonus_score.trim() || '0',
+      penalty_score: form.penalty_score.trim() || '0',
+      total_score: total,
+    };
+  }
+
+  async function handleSaveLocalCardDraft() {
+    if (!activeVideo || !localCardDraft || localCardSaving) return;
+    const validation = validateLocalCardForm(localCardDraft);
+    if (validation) {
+      setErrorMessage(validation);
+      return;
+    }
+    setLocalCardSaving(true);
+    try {
+      const response = await createLocalCard(activeVideo.id, buildLocalCardPayload(localCardDraft));
+      setProjectState(response.project);
+      setLocalCardDraft(null);
+      setErrorMessage(null);
+      setSuccessMessage('已创建本地补录卡片');
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '创建本地补录卡片失败');
+    } finally {
+      setLocalCardSaving(false);
+    }
+  }
+
+  async function handleSaveLocalCardEdit(recordId: string) {
+    if (!activeVideo || !editingLocalCardForm || localCardSaving) return;
+    const validation = validateLocalCardForm(editingLocalCardForm);
+    if (validation) {
+      setErrorMessage(validation);
+      return;
+    }
+    setLocalCardSaving(true);
+    try {
+      const response = await updateLocalCard(activeVideo.id, recordId, buildLocalCardPayload(editingLocalCardForm));
+      setProjectState(response.project);
+      setEditingLocalCardId(null);
+      setEditingLocalCardForm(null);
+      setErrorMessage(null);
+      setSuccessMessage('已更新本地补录卡片');
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '更新本地补录卡片失败');
+    } finally {
+      setLocalCardSaving(false);
+    }
+  }
+
+  async function handleDeleteLocalCardClick(recordId: string) {
+    if (!activeVideo || localCardSaving) return;
+    if (!window.confirm('删除本地补录卡片?已绑定的片段将自动解绑。')) return;
+    setLocalCardSaving(true);
+    try {
+      const response = await deleteLocalCard(activeVideo.id, recordId);
+      setProjectState(response.project);
+      if (editingLocalCardId === recordId) {
+        setEditingLocalCardId(null);
+        setEditingLocalCardForm(null);
+      }
+      setErrorMessage(null);
+      setSuccessMessage('已删除本地补录卡片');
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '删除本地补录卡片失败');
+    } finally {
+      setLocalCardSaving(false);
+    }
+  }
+
+  function startEditingLocalCard(record: PlatformRecord) {
+    setLocalCardDraft(null);
+    setEditingLocalCardId(record.id);
+    setEditingLocalCardForm(localCardRecordToForm(record));
   }
 
   async function handleDetectActiveVideo() {
@@ -5397,6 +5760,21 @@ export default function App() {
                       {activeVideo ? `${categoryLabel(activeVideo.category)} · ${activeVideo.file_name}` : '平台成绩卡片'}
                     </div>
                   </div>
+                  {activeVideo && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingLocalCardId(null);
+                        setEditingLocalCardForm(null);
+                        setLocalCardDraft((current) => (current ? current : emptyLocalCardForm()));
+                      }}
+                      disabled={localCardDraft != null}
+                      title="新增本地补录卡片"
+                      className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                    >
+                      + 本地补录
+                    </button>
+                  )}
                 </div>
 
                 <div className="relative">
@@ -5450,14 +5828,148 @@ export default function App() {
                     当前没有选中视频。
                   </div>
                 )}
-                {activeVideo && videoScopedPlatformRecords.length === 0 && (
+                {activeVideo && videoScopedPlatformRecords.length === 0 && !localCardDraft && (
                   <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
-                    当前视频上下文没有查到平台成绩卡片。请检查导入时选择的比赛、场次和项目。
+                    当前视频上下文没有查到平台成绩卡片。请检查导入时选择的比赛、场次和项目；或点击右上角「+ 本地补录」手动添加。
                   </div>
                 )}
-                {activeVideo && videoScopedPlatformRecords.length > 0 && filteredPlatformRecords.length === 0 && (
+                {activeVideo && videoScopedPlatformRecords.length > 0 && filteredPlatformRecords.length === 0 && localPlatformRecords.length === 0 && (
                   <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
                     当前筛选条件下没有命中的成绩卡片。
+                  </div>
+                )}
+                {localCardDraft && activeVideo && (
+                  <LocalCardInlineForm
+                    form={localCardDraft}
+                    setForm={(updater) => setLocalCardDraft((prev) => (prev ? updater(prev) : prev))}
+                    onSave={() => void handleSaveLocalCardDraft()}
+                    onCancel={() => setLocalCardDraft(null)}
+                    saving={localCardSaving}
+                    title="新建本地补录卡片"
+                  />
+                )}
+                {activeVideo && localPlatformRecords.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-amber-700">
+                      本地补录
+                    </div>
+                    {localPlatformRecords.map((entry) => {
+                      const isActive = activeClip.linked_platform_record_id === entry.id;
+                      const isBound = entry.linked_clip_ids.length > 0;
+                      const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
+                      const theme = bindingTheme(entry.id);
+                      const linkedClipLabels = entry.linked_clip_ids
+                        .map((clipId) => clipOrdinalById.get(clipId))
+                        .filter((value): value is number => value != null)
+                        .map((value) => `#${value}`);
+                      const bindingLabel = isActive
+                        ? `片段${linkedClipLabels[0] ?? `#${clipOrdinalById.get(activeClip.id) ?? '--'}`}`
+                        : isBoundElsewhere
+                          ? `片段${linkedClipLabels[0]}`
+                          : null;
+
+                      if (editingLocalCardId === entry.id && editingLocalCardForm) {
+                        return (
+                          <React.Fragment key={entry.id}>
+                            <LocalCardInlineForm
+                              form={editingLocalCardForm}
+                              setForm={(updater) => setEditingLocalCardForm((prev) => (prev ? updater(prev) : prev))}
+                              onSave={() => void handleSaveLocalCardEdit(entry.id)}
+                              onCancel={() => {
+                                setEditingLocalCardId(null);
+                                setEditingLocalCardForm(null);
+                              }}
+                              saving={localCardSaving}
+                              title="编辑本地补录卡片"
+                              onDelete={() => void handleDeleteLocalCardClick(entry.id)}
+                            />
+                          </React.Fragment>
+                        );
+                      }
+
+                      return (
+                        <button
+                          key={entry.id}
+                          type="button"
+                          disabled={isBoundElsewhere || activeClipLockedByExport}
+                          onClick={(event) => {
+                            event.currentTarget.blur();
+                            if (isBoundElsewhere || activeClipLockedByExport) return;
+                            void handleBindScoreCard(isActive ? null : entry.id);
+                          }}
+                          className={`relative w-full rounded-2xl border border-amber-200 bg-amber-50/40 px-3 py-2.5 text-left transition-all shadow-[0_6px_18px_rgba(15,23,42,0.05)] ${
+                            isActive
+                              ? 'hover:border-amber-300'
+                              : isBoundElsewhere || activeClipLockedByExport
+                                ? 'cursor-not-allowed opacity-90'
+                                : 'hover:border-amber-300 hover:shadow-[0_10px_24px_rgba(15,23,42,0.08)]'
+                          }`}
+                        >
+                          {(isActive || isBound) && (
+                            <span
+                              className="absolute left-1 top-2 bottom-2 w-1 rounded-full"
+                              style={{backgroundColor: theme.accent}}
+                            />
+                          )}
+                          <div className="absolute right-2 top-2 flex items-center gap-1">
+                            <span className="rounded-full bg-amber-200/80 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900">
+                              本地补录
+                            </span>
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                event.preventDefault();
+                                startEditingLocalCard(entry);
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.stopPropagation();
+                                  event.preventDefault();
+                                  startEditingLocalCard(entry);
+                                }
+                              }}
+                              className="cursor-pointer rounded-md border border-amber-300 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-100"
+                            >
+                              编辑
+                            </span>
+                          </div>
+                          <div className="flex items-start justify-between gap-3 pr-20">
+                            <div className="min-w-0">
+                              <p className="text-[15px] font-semibold leading-5 text-gray-900 truncate">
+                                {entry.english_name || entry.user_name || '未命名'}
+                              </p>
+                              {entry.user_name && (
+                                <div className="mt-0.5 text-[11px] text-gray-500 truncate">{entry.user_name}</div>
+                              )}
+                              <div className="mt-1 text-[11px] text-gray-500 truncate">
+                                {(entry.country || '--')} · {(entry.sport_item_label || '--')}
+                              </div>
+                              <div className="mt-2 text-[11px] font-semibold text-black whitespace-nowrap overflow-hidden text-ellipsis">
+                                {scoreFormulaLabel(entry)}
+                              </div>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <div className="text-xl font-bold text-black">{primaryScoreValue(entry)}</div>
+                              {bindingLabel && (
+                                <div
+                                  className="mt-1 text-[11px] font-medium"
+                                  style={{color: theme.text}}
+                                >
+                                  {bindingLabel}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          {!isBound && (
+                            <div className="mt-2 text-[11px] text-gray-400">
+                              {activeClipLockedByExport ? '导出批次中，只读' : '可绑定'}
+                            </div>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
                 {groupedPlatformRecords.map((matchGroup) => (
@@ -6128,7 +6640,7 @@ export default function App() {
                           ? uploadOnlyInvalidClips.length > 0
                             ? `仅上传要求所选片段已绑定平台卡片，且已导出或满足已有片段原片直传条件；当前有 ${uploadOnlyInvalidClips.length} 个片段不满足条件。`
                             : `当前将直接上传所选片段；默认优先上传已导出文件，仅当没有导出文件时才会重命名原片直传。已绑定平台卡片会在 OSS 成功后自动回写平台。`
-                          : `当前将导出所选片段；其中 ${exportTargetBoundCount} 个已绑定平台卡片会自动上传 OSS 并回写平台。`
+                          : `当前将导出所选片段；其中 ${Math.max(exportTargetBoundCount - exportTargetLocalBoundCount, 0)} 个已绑定平台卡片会自动上传 OSS 并回写平台${exportTargetLocalBoundCount > 0 ? `，${exportTargetLocalBoundCount} 个本地补录片段会落入"本地补录"子文件夹` : ''}。`
                       : '请先在候选片段列表中选择要导出的片段。'}
                   </p>
                 </div>
@@ -6167,6 +6679,11 @@ export default function App() {
                   <div className="rounded-2xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-700">
                     当前上传来源：已导出文件 {uploadOnlySourceSummary.exportedFileCount} 个；原片直传 {uploadOnlySourceSummary.directSourceCount} 个。
                     规则：如果片段已有导出文件，优先上传导出文件；只有没有导出文件时，才会对未编辑的已有片段重命名原文件后直传。
+                  </div>
+                )}
+                {exportOperation !== 'export_only' && exportTargetLocalBoundCount > 0 && (
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
+                    选中片段中有 {exportTargetLocalBoundCount} 个绑定本地补录卡片，将自动跳过上传与平台回写，{exportOperation === 'upload_only' ? '仅作为跳过处理' : '本地导出后落入"本地补录"子文件夹'}。
                   </div>
                 )}
               </div>
