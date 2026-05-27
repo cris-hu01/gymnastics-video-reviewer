@@ -11,7 +11,9 @@ from ..storage import (
     project_state_lock,
     save_project_state,
 )
-from .paths import PROJECT_FILE
+# Import the module (not the name) so monkeypatch.setattr(paths, "PROJECT_FILE", ...)
+# in tests is picked up by load_state / persist_state on every call.
+from . import paths as _paths
 
 
 __all__ = ["load_state", "persist_state", "project_state_lock"]
@@ -19,9 +21,9 @@ __all__ = ["load_state", "persist_state", "project_state_lock"]
 
 def load_state() -> ProjectState:
     """Load the current project state from the workspace project file."""
-    return load_project_state(PROJECT_FILE)
+    return load_project_state(_paths.PROJECT_FILE)
 
 
 def persist_state(state: ProjectState) -> None:
     """Atomically save project state back to disk."""
-    save_project_state(PROJECT_FILE, state)
+    save_project_state(_paths.PROJECT_FILE, state)
