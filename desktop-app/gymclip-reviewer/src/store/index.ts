@@ -24,6 +24,7 @@
  *   schema change.
  */
 import { createActiveSlice, type ActiveSlice } from './active';
+import { createProjectSlice, type ProjectSlice } from './project';
 import { createSelectionSlice, type SelectionSlice } from './selection';
 import { create } from 'zustand';
 
@@ -34,11 +35,12 @@ import { create } from 'zustand';
  *
  * As we migrate more state in A3/A4, add new slice types here.
  */
-export type AppStore = SelectionSlice & ActiveSlice;
+export type AppStore = SelectionSlice & ActiveSlice & ProjectSlice;
 
 export const useStore = create<AppStore>()((set, get, store) => ({
   ...createSelectionSlice(set, get, store),
   ...createActiveSlice(set, get, store),
+  ...createProjectSlice(set, get, store),
 }));
 
 /**

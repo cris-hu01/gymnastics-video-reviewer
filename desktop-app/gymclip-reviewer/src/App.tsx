@@ -179,7 +179,12 @@ const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出�
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
-  const [project, setProject] = useState<ProjectState | null>(null);
+  // A3: project state migrated to zustand (see store/project.ts). The hook form
+  // is used here so renders that depend on the snapshot stay subscribed; mutation
+  // paths use the store actions directly (still stable across renders).
+  const project = useStore((s) => s.project);
+  const setProject = useStore((s) => s.setProject);
+  const patchProject = useStore((s) => s.patchProject);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -1490,8 +1495,8 @@ export default function App() {
   function markVideosQueued(videoIds: string[]) {
     if (videoIds.length === 0) return;
     const videoIdSet = new Set(videoIds);
-    setProject((current) => {
-      if (!current) return current;
+    patchProject((current) => {
+      if (!current) return undefined;
       return {
         ...current,
         videos: current.videos.map((video) =>
