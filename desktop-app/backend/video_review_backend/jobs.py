@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from threading import RLock
 from typing import Any, Callable
 
 from .models import new_id, utc_now_iso
+
+
+logger = logging.getLogger(__name__)
 
 
 JobRunner = Callable[
@@ -90,6 +94,7 @@ class JobManager:
             self._cancel_requests[job.id] = False
             future = self._executor.submit(self._run_job, job.id, runner)
             self._futures[job.id] = future
+        logger.info("job submitted id=%s kind=%s video=%s", job.id, kind, video_id)
         return self._clone_job(job)
 
     def cancel_job(self, job_id: str) -> AppJob | None:
@@ -165,6 +170,7 @@ class JobManager:
         try:
             result = runner(progress_callback, lambda: self.is_cancel_requested(job_id)) or {}
         except JobCancelledError as e:
+            logger.info("job cancelled id=%s reason=%s", job_id, e)
             self.update_job(
                 job_id,
                 status="cancelled",
@@ -173,6 +179,7 @@ class JobManager:
                 progress={"stage": "cancelled", "message": str(e) or "任务已取消"},
             )
         except Exception as e:
+            logger.exception("job failed id=%s", job_id)
             self.update_job(
                 job_id,
                 status="failed",
@@ -181,6 +188,7 @@ class JobManager:
                 progress={"stage": "error", "message": str(e)},
             )
         else:
+            logger.info("job completed id=%s", job_id)
             self.update_job(
                 job_id,
                 status="completed",
