@@ -225,6 +225,12 @@ class ReviewService:
             segment_id = str(item.get("id") or new_id("seg"))
             start = float(item.get("start") or 0.0)
             end = float(item.get("end") or start)
+            if duration is not None:
+                start = max(0.0, min(start, duration))
+                end = max(0.0, min(end, duration))
+            else:
+                start = max(0.0, start)
+                end = max(0.0, end)
             self._validate_segment_bounds(
                 start=start,
                 end=end,
@@ -262,8 +268,6 @@ class ReviewService:
             raise ValueError("选区终点必须大于起点")
         if end - start < MIN_SEGMENT_DURATION_SECONDS:
             raise ValueError("每个选区至少保留 0.5 秒")
-        if duration is not None and end > duration:
-            raise ValueError("选区超过视频总时长")
 
     def _reset_clip_after_structure_change(self, clip: CandidateClip) -> None:
         clip.linked_platform_record_id = None
