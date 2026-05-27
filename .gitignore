@@ -68,3 +68,10 @@ desktop-app/backend/workspace/
 desktop-app/gymclip-reviewer/.env.local
 desktop-app/backend/dist/standalone/
 desktop-app/backend/dist/media-tools/
+
+# 本地探索/实验/工作目录（不进版本控制）
+desktop-app/.claude/
+desktop-app/planning/
+desktop-app/backend/experiments/
+专利交底书/
+测试/
