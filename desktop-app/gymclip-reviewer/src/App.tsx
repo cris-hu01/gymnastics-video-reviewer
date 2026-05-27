@@ -109,6 +109,20 @@ import {
   getResolvedPlatformRecordSex,
   isClipExportSelectable,
 } from './lib/filters';
+import {
+  cloneCandidateClips,
+  clipEffectiveDuration,
+  computeLocalCardAutoTotal,
+  deriveDisplayedScore,
+  firstEditableSegment,
+  firstNonEmptyScore,
+  getUploadOnlySourceMode,
+  normalizeSegments,
+  orderedSegments,
+  parseNumericScore,
+  summarizeExportJob,
+  toUploadItem,
+} from './lib/clip-math';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
@@ -287,27 +301,6 @@ const EXPORT_OPERATION_DETAILS: Record<ExportOperation, {label: string; descript
   },
 };
 
-function normalizeJobCount(value: unknown): number {
-  const parsed = Number(value || 0);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return 0;
-  }
-  return Math.floor(parsed);
-}
-
-function summarizeExportJob(job: AppJob, fallbackOutputDir: string): ExportJobSummary {
-  const operation = String(job.progress.operation || 'export_and_upload') as ExportOperation;
-  return {
-    operation,
-    attempted: normalizeJobCount(job.result.attempted),
-    exported: normalizeJobCount(job.result.exported),
-    failed: normalizeJobCount(job.result.failed),
-    uploaded: normalizeJobCount(job.result.uploaded),
-    synced: normalizeJobCount(job.result.synced),
-    output_directory: String(job.result.output_directory || fallbackOutputDir || ''),
-  };
-}
-
 function buildExportCompletedNotification(summary: ExportJobSummary): DesktopNotificationPayload {
   const title = summary.failed > 0
     ? `${EXPORT_OPERATION_DETAILS[summary.operation].label}完成（部分失败）`
@@ -389,24 +382,6 @@ function saveBrowserUploadSettings(uploadParallelFiles: number, uploadPartThread
   }
 }
 
-function toUploadItem(value: unknown): ExportUploadItem | null {
-  if (!value || typeof value !== 'object') return null;
-  const item = value as Record<string, unknown>;
-  const clipId = String(item.clip_id || '').trim();
-  const fileName = String(item.file_name || '').trim();
-  if (!clipId || !fileName) return null;
-  return {
-    clip_id: clipId,
-    file_name: fileName,
-    stage: String(item.stage || '').trim(),
-    bytes_sent: Number(item.bytes_sent || 0),
-    total_bytes: Number(item.total_bytes || 0),
-    percent: Number(item.percent || 0),
-    speed_bps: Number(item.speed_bps || 0),
-    error_message: item.error_message == null ? null : String(item.error_message),
-  };
-}
-
 function normalizeCategory(value: string | null | undefined): PlatformCategory | '' {
   if (value === 'EF' || value === 'AA' || value === 'TF' || value === 'QF') {
     return value;
@@ -480,78 +455,6 @@ function deriveSelectionFromVenue(venue: string): VenueDerivedSelection {
     }
   }
   return {sex, sportItemId: null};
-}
-
-function orderedSegments(clip: CandidateClip): ClipSegment[] {
-  return [...clip.segments].sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
-}
-
-function clipEffectiveDuration(clip: CandidateClip): number {
-  return orderedSegments(clip).reduce((total, segment) => total + Math.max(0, segment.end - segment.start), 0);
-}
-
-function isDirectSourceUploadEligible(
-  clip: CandidateClip,
-  video?: ProjectState['videos'][number] | null,
-): boolean {
-  if (!video || video.source_kind !== 'direct_clip' || video.duration == null) return false;
-  const segments = orderedSegments(clip);
-  if (segments.length !== 1) return false;
-  const tolerance = 0.05;
-  const duration = Number(video.duration);
-  return (
-    Math.abs(segments[0].start - 0) <= tolerance
-    && Math.abs(segments[0].end - duration) <= tolerance
-    && Math.abs(clip.review_start - 0) <= tolerance
-    && Math.abs(clip.review_end - duration) <= tolerance
-    && Math.abs(clip.candidate_start - 0) <= tolerance
-    && Math.abs(clip.candidate_end - duration) <= tolerance
-  );
-}
-
-function getUploadOnlySourceMode(
-  clip: CandidateClip,
-  video?: ProjectState['videos'][number] | null,
-): 'exported_file' | 'direct_source' | 'invalid' {
-  if (clip.exported_path) return 'exported_file';
-  if (isDirectSourceUploadEligible(clip, video)) return 'direct_source';
-  return 'invalid';
-}
-
-function normalizeSegments(
-  _clip: CandidateClip,
-  segments: ClipSegment[],
-): ClipSegment[] {
-  const sorted = [...segments]
-    .map((segment) => ({
-      ...segment,
-      start: Number(segment.start.toFixed(3)),
-      end: Number(segment.end.toFixed(3)),
-    }))
-    .sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
-
-  let previousEnd: number | null = null;
-  return sorted.map((segment) => {
-    const start = Math.max(previousEnd ?? 0, segment.start);
-    const end = Math.max(start + CLIP_STEP, segment.end);
-    previousEnd = end;
-    return {
-      ...segment,
-      start: Number(start.toFixed(3)),
-      end: Number(end.toFixed(3)),
-    };
-  });
-}
-
-function firstEditableSegment(clip: CandidateClip): ClipSegment | null {
-  return orderedSegments(clip)[0] ?? null;
-}
-
-function cloneCandidateClips(clips: CandidateClip[]): CandidateClip[] {
-  return clips.map((clip) => ({
-    ...clip,
-    segments: clip.segments.map((segment) => ({...segment})),
-  }));
 }
 
 function StatusBadge({
@@ -699,20 +602,6 @@ function localCardRecordToForm(record: PlatformRecord): LocalCardFormState {
     total_score: record.total_score || '',
     total_overridden: true,
   };
-}
-
-function parseScoreNumber(value: string): number {
-  const parsed = Number(String(value).trim());
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function computeLocalCardAutoTotal(form: LocalCardFormState): string {
-  const total =
-    parseScoreNumber(form.difficulty_score) +
-    parseScoreNumber(form.execution_score) +
-    parseScoreNumber(form.bonus_score) -
-    parseScoreNumber(form.penalty_score);
-  return total.toFixed(3).replace(/\.?0+$/, '') || '0';
 }
 
 const LOCAL_CARD_SPORT_OPTIONS: Array<{value: string; label: string}> = Object.entries(SPORT_ITEM_LABELS).map(
