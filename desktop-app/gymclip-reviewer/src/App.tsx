@@ -13,7 +13,6 @@ import {
   Filter,
   FolderOpen,
   Key,
-  Minus,
   Pause,
   Play,
   RefreshCw,
@@ -66,48 +65,99 @@ import type {
   ThumbnailFrame,
   VideoStatus,
 } from './types';
+import {
+  categoryLabel,
+  extractOutputDirectoryLabel,
+  firstDisplayText,
+  formatClock,
+  formatDuration,
+  formatNotificationCount,
+  formatNotificationResultSummary,
+  formatNotificationTargetCount,
+  formatScopeFolderLabel,
+  formatScoreValue,
+  formatSpeed,
+  formatSportItemLabel,
+  getExportQueueStatusLabel,
+  hashString,
+  parseSportKey,
+  pipelineToneClass,
+  primaryScoreValue,
+  scoreFormulaLabel,
+  statusLabel,
+  truncateNotificationText,
+  videoStatusClass,
+  videoStatusLabel,
+} from './lib/format';
+import {
+  bindingTheme,
+  coerceRecordSex,
+  deriveSexFromSelectionKeys,
+  deriveSexFromSportItemId,
+  deriveSexFromText,
+  getClipDisplayCountry,
+  getClipDisplayName,
+  getClipFailureStage,
+  getClipPipelineBadges,
+  getClipRuntimeStatusText,
+  getClipSearchText,
+  getClipUploadItem,
+  getJobTargetClipIds,
+  getJobUploadItems,
+  getResolvedPlatformRecordSex,
+  isClipExportSelectable,
+} from './lib/filters';
+import {
+  cloneCandidateClips,
+  clipEffectiveDuration,
+  computeLocalCardAutoTotal,
+  deriveDisplayedScore,
+  firstEditableSegment,
+  firstNonEmptyScore,
+  getUploadOnlySourceMode,
+  normalizeSegments,
+  orderedSegments,
+  parseNumericScore,
+  summarizeExportJob,
+  toUploadItem,
+} from './lib/clip-math';
+import {
+  EXPORT_OPERATION_DETAILS,
+  buildExportCompletedNotification,
+  buildExportFailedNotification,
+  createPendingDirectClipFile,
+  createPendingImportVideo,
+  deriveSelectionFromVenue,
+  emptyLocalCardForm,
+  isDesktopImportSource,
+  loadBrowserDefaultExportDirectory,
+  loadBrowserUploadSettings,
+  localCardRecordToForm,
+  normalizeCategory,
+  saveBrowserDefaultExportDirectory,
+  saveBrowserUploadSettings,
+  sportKey,
+  stripFileExtension,
+  toggleSportKey,
+} from './lib/utils';
+import type {
+  DesktopImportSource,
+  ExportJobSummary,
+  ExportOperation,
+  LocalCardFormState,
+  PendingDirectClipFile,
+  PendingImportVideo,
+} from './lib/utils';
+import { useStore } from './store';
+import { StatusBadge } from './components/StatusBadge';
+import { TriStateCheckboxButton } from './components/TriStateCheckboxButton';
+import { ScoreFilterDropdown } from './components/ScoreFilterDropdown';
+import type { ScoreFilterMenu } from './components/ScoreFilterDropdown';
+import { LocalCardInlineForm } from './components/LocalCardInlineForm';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
-type ExportOperation = 'export_only' | 'upload_only' | 'export_and_upload';
 type ImportMode = 'full_video' | 'direct_clip';
-type DesktopImportSource = {
-  path: string;
-  name: string;
-  size: number;
-};
-
-type PendingImportVideo = {
-  clientFileId: string;
-  file: File | null;
-  path: string | null;
-  name: string;
-  sizeBytes: number;
-  matchId: string | null;
-  selectedFrequencies: PlatformFrequency[];
-  manualSportKeys: string[];
-};
-
-type PendingDirectClipFile = {
-  clientFileId: string;
-  file: File | null;
-  path: string | null;
-  name: string;
-  sizeBytes: number;
-};
-
-type LocalCardFormState = {
-  user_name: string;
-  english_name: string;
-  country: string;
-  sport_item_id: string;
-  difficulty_score: string;
-  execution_score: string;
-  bonus_score: string;
-  penalty_score: string;
-  total_score: string;
-  total_overridden: boolean;
-};
 
 type ClipUndoSnapshot = {
   candidateClips: CandidateClip[];
@@ -126,11 +176,6 @@ type ApparatusOption = {
   label: string;
 };
 
-type ScoreFilterMenu = 'apparatus' | 'sex' | 'country';
-type ScoreFilterOption = {
-  value: string;
-  label: string;
-};
 type PipelineTone = 'neutral' | 'muted' | 'success' | 'warning' | 'danger';
 type ClipPipelineBadgeItem = {
   key: 'export' | 'oss' | 'platform';
@@ -146,20 +191,6 @@ type ExportUploadItem = {
   percent: number;
   speed_bps: number;
   error_message: string | null;
-};
-type DesktopNotificationPayload = {
-  title: string;
-  subtitle?: string;
-  body?: string;
-};
-type ExportJobSummary = {
-  operation: ExportOperation;
-  attempted: number;
-  exported: number;
-  failed: number;
-  uploaded: number;
-  synced: number;
-  output_directory: string;
 };
 type ToastKind = 'success' | 'error';
 type AppToast = {
@@ -207,16 +238,8 @@ const SEX_LABELS: Record<number, string> = {
   2: '女子',
 };
 
-type VenueDerivedSelection = {
-  sex: number | null;
-  sportItemId: number | null;
-};
-
 const CLIP_STEP = 0.2;
 const MIN_SEGMENT_DURATION = 0.5;
-const DEFAULT_EXPORT_DIRECTORY_STORAGE_KEY = 'gymclip-default-output-dir';
-const UPLOAD_PARALLEL_FILES_STORAGE_KEY = 'gymclip-upload-parallel-files';
-const UPLOAD_PART_THREADS_STORAGE_KEY = 'gymclip-upload-part-threads';
 const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出完成前不可编辑';
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
 const EXPORT_MODE_DETAILS: Record<ExportMode, {label: string; description: string}> = {
@@ -229,1238 +252,6 @@ const EXPORT_MODE_DETAILS: Record<ExportMode, {label: string; description: strin
     description: '更快导出，但压缩效率更低，文件通常更大。',
   },
 };
-const EXPORT_OPERATION_DETAILS: Record<ExportOperation, {label: string; description: string}> = {
-  export_only: {
-    label: '仅导出',
-    description: '只执行本地导出，不上传 OSS，也不回写平台。',
-  },
-  upload_only: {
-    label: '仅上传',
-    description: '使用已有本地导出文件上传 OSS，并在成功后继续回写平台。',
-  },
-  export_and_upload: {
-    label: '导出+上传',
-    description: '默认模式：先本地导出，再上传 OSS，并对已绑定片段回写平台。',
-  },
-};
-
-function normalizeJobCount(value: unknown): number {
-  const parsed = Number(value || 0);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return 0;
-  }
-  return Math.floor(parsed);
-}
-
-function summarizeExportJob(job: AppJob, fallbackOutputDir: string): ExportJobSummary {
-  const operation = String(job.progress.operation || 'export_and_upload') as ExportOperation;
-  return {
-    operation,
-    attempted: normalizeJobCount(job.result.attempted),
-    exported: normalizeJobCount(job.result.exported),
-    failed: normalizeJobCount(job.result.failed),
-    uploaded: normalizeJobCount(job.result.uploaded),
-    synced: normalizeJobCount(job.result.synced),
-    output_directory: String(job.result.output_directory || fallbackOutputDir || ''),
-  };
-}
-
-function formatNotificationCount(label: string, completed: number, total: number): string {
-  if (total > 0) {
-    return `${label}：${completed}/${total}`;
-  }
-  return `${label}：${completed}`;
-}
-
-function truncateNotificationText(value: string, maxLength = 96): string {
-  const trimmed = value.trim();
-  if (trimmed.length <= maxLength) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
-
-function formatNotificationTargetCount(count: number): string {
-  return `目标片段：${count}`;
-}
-
-function formatNotificationResultSummary(summary: ExportJobSummary): string {
-  if (summary.failed > 0) {
-    return `部分完成，失败 ${summary.failed}`;
-  }
-  return '全部完成';
-}
-
-function extractOutputDirectoryLabel(outputDirectory: string): string {
-  const trimmed = outputDirectory.trim().replace(/[\\/]+$/, '');
-  if (!trimmed) return '';
-  const segments = trimmed.split(/[\\/]/).filter(Boolean);
-  const folderName = segments[segments.length - 1] || trimmed;
-  return truncateNotificationText(folderName, 28);
-}
-
-function buildExportCompletedNotification(summary: ExportJobSummary): DesktopNotificationPayload {
-  const title = summary.failed > 0
-    ? `${EXPORT_OPERATION_DETAILS[summary.operation].label}完成（部分失败）`
-    : `${EXPORT_OPERATION_DETAILS[summary.operation].label}完成`;
-  const outputDirectoryLabel = extractOutputDirectoryLabel(summary.output_directory);
-  const lines = [
-    summary.operation !== 'upload_only' && outputDirectoryLabel ? `输出目录：${outputDirectoryLabel}` : '',
-    summary.operation !== 'upload_only' ? formatNotificationCount('本地导出', summary.exported, summary.attempted) : '',
-    summary.operation !== 'export_only' ? formatNotificationCount('OSS 上传', summary.uploaded, summary.attempted) : '',
-    summary.operation !== 'export_only' ? `平台回写：${summary.synced}` : '',
-    `失败：${summary.failed}`,
-  ].filter(Boolean);
-  return {
-    title,
-    subtitle: `${formatNotificationTargetCount(summary.attempted)} · ${formatNotificationResultSummary(summary)}`,
-    body: lines.join('\n'),
-  };
-}
-
-function buildExportFailedNotification(job: AppJob, fallbackOutputDir: string): DesktopNotificationPayload {
-  const summary = summarizeExportJob(job, fallbackOutputDir);
-  const errorMessage = truncateNotificationText(job.error_message || '任务执行失败');
-  const outputDirectoryLabel = extractOutputDirectoryLabel(summary.output_directory);
-  const lines = [
-    summary.operation !== 'upload_only' && outputDirectoryLabel ? `输出目录：${outputDirectoryLabel}` : '',
-    summary.operation !== 'upload_only' ? formatNotificationCount('已导出', summary.exported, summary.attempted) : '',
-    summary.operation !== 'export_only' ? formatNotificationCount('已上传', summary.uploaded, summary.attempted) : '',
-    summary.operation !== 'export_only' ? `已回写：${summary.synced}` : '',
-    summary.failed > 0 ? `失败：${summary.failed}` : '',
-    `原因：${errorMessage}`,
-  ].filter(Boolean);
-  return {
-    title: `${EXPORT_OPERATION_DETAILS[summary.operation].label}失败`,
-    subtitle: `${formatNotificationTargetCount(summary.attempted)} · 已中断`,
-    body: lines.join('\n'),
-  };
-}
-
-function loadBrowserDefaultExportDirectory(): string {
-  try {
-    return window.localStorage.getItem(DEFAULT_EXPORT_DIRECTORY_STORAGE_KEY)?.trim() || '';
-  } catch {
-    return '';
-  }
-}
-
-function saveBrowserDefaultExportDirectory(nextPath: string): void {
-  try {
-    const trimmed = nextPath.trim();
-    if (trimmed) {
-      window.localStorage.setItem(DEFAULT_EXPORT_DIRECTORY_STORAGE_KEY, trimmed);
-    } else {
-      window.localStorage.removeItem(DEFAULT_EXPORT_DIRECTORY_STORAGE_KEY);
-    }
-  } catch {
-    // ignore localStorage failures in browser preview
-  }
-}
-
-function loadBrowserUploadSettings(): {uploadParallelFiles: number; uploadPartThreads: number} {
-  try {
-    const uploadParallelFiles = Number(window.localStorage.getItem(UPLOAD_PARALLEL_FILES_STORAGE_KEY) || 2);
-    const uploadPartThreads = Number(window.localStorage.getItem(UPLOAD_PART_THREADS_STORAGE_KEY) || 4);
-    return {
-      uploadParallelFiles: Number.isFinite(uploadParallelFiles) && uploadParallelFiles > 0 ? uploadParallelFiles : 2,
-      uploadPartThreads: Number.isFinite(uploadPartThreads) && uploadPartThreads > 0 ? uploadPartThreads : 4,
-    };
-  } catch {
-    return {uploadParallelFiles: 2, uploadPartThreads: 4};
-  }
-}
-
-function saveBrowserUploadSettings(uploadParallelFiles: number, uploadPartThreads: number): void {
-  try {
-    window.localStorage.setItem(UPLOAD_PARALLEL_FILES_STORAGE_KEY, String(Math.max(1, uploadParallelFiles)));
-    window.localStorage.setItem(UPLOAD_PART_THREADS_STORAGE_KEY, String(Math.max(1, uploadPartThreads)));
-  } catch {
-    // ignore localStorage failures in browser preview
-  }
-}
-
-function firstDisplayText(...values: Array<string | null | undefined>): string {
-  for (const value of values) {
-    const text = value?.trim();
-    if (text) return text;
-  }
-  return '';
-}
-
-function formatDuration(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--:--';
-  const totalSeconds = Math.max(0, Math.floor(value));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function formatBytes(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let size = Math.max(0, value);
-  let unitIndex = 0;
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex += 1;
-  }
-  const precision = unitIndex === 0 ? 0 : size >= 10 ? 1 : 2;
-  return `${size.toFixed(precision)} ${units[unitIndex]}`;
-}
-
-function formatSpeed(value?: number | null): string {
-  if (value == null || Number.isNaN(value) || value <= 0) return '--';
-  return `${formatBytes(value)}/s`;
-}
-
-function formatClock(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--:--:--';
-  const totalSeconds = Math.max(0, value);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${seconds.toFixed(1).padStart(4, '0')}`;
-}
-
-function toUploadItem(value: unknown): ExportUploadItem | null {
-  if (!value || typeof value !== 'object') return null;
-  const item = value as Record<string, unknown>;
-  const clipId = String(item.clip_id || '').trim();
-  const fileName = String(item.file_name || '').trim();
-  if (!clipId || !fileName) return null;
-  return {
-    clip_id: clipId,
-    file_name: fileName,
-    stage: String(item.stage || '').trim(),
-    bytes_sent: Number(item.bytes_sent || 0),
-    total_bytes: Number(item.total_bytes || 0),
-    percent: Number(item.percent || 0),
-    speed_bps: Number(item.speed_bps || 0),
-    error_message: item.error_message == null ? null : String(item.error_message),
-  };
-}
-
-function getJobUploadItems(job: AppJob | null): ExportUploadItem[] {
-  if (!job) return [];
-  const rawItems = (job.progress as Record<string, unknown>).upload_items;
-  if (!Array.isArray(rawItems)) return [];
-  return rawItems
-    .map((item) => toUploadItem(item))
-    .filter((item): item is ExportUploadItem => item != null);
-}
-
-function getClipUploadItem(job: AppJob | null, clipId: string): ExportUploadItem | null {
-  return getJobUploadItems(job).find((item) => item.clip_id === clipId) ?? null;
-}
-
-function getJobTargetClipIds(job: AppJob | null): string[] {
-  if (!job) return [];
-  const rawTargetClipIds = (job.progress as Record<string, unknown>).target_clip_ids;
-  if (!Array.isArray(rawTargetClipIds)) return [];
-  return rawTargetClipIds
-    .map((item) => String(item || '').trim())
-    .filter((item) => item.length > 0);
-}
-
-function getExportQueueStatusLabel(job: AppJob | null): string {
-  const operation = String(job?.progress.operation || 'export_and_upload') as ExportOperation;
-  return operation === 'upload_only' ? '上传队列中' : '导出队列中';
-}
-
-function statusLabel(status: ClipStatus | VideoStatus): string {
-  switch (status) {
-    case 'pending':
-      return '待审';
-    case 'kept':
-      return '保留';
-    case 'deleted':
-      return '已删';
-    case 'exported':
-      return '已导出';
-    case 'queued':
-      return '待处理';
-    case 'detecting':
-      return '检测中';
-    case 'no_candidates':
-      return '无候选';
-    case 'ready_for_review':
-      return '待审核';
-    case 'reviewing':
-      return '审核中';
-    case 'done':
-      return '已完成';
-    case 'error':
-      return '异常';
-    default:
-      return status;
-  }
-}
-
-function clipBadgeClass(status: ClipStatus): string {
-  switch (status) {
-    case 'kept':
-      return 'bg-green-50 text-green-700 border-green-200';
-    case 'deleted':
-      return 'bg-red-50 text-red-700 border-red-200';
-    case 'exported':
-      return 'bg-sky-50 text-sky-700 border-sky-200';
-    case 'pending':
-    default:
-      return 'bg-amber-50 text-amber-700 border-amber-200';
-  }
-}
-
-function videoStatusClass(status: VideoStatus, sourceKind: SourceKind = 'full_video'): string {
-  if (sourceKind === 'direct_clip') {
-    switch (status) {
-      case 'error':
-        return 'text-red-500';
-      case 'done':
-      case 'reviewing':
-        return 'text-green-600';
-      default:
-        return 'text-sky-500';
-    }
-  }
-  switch (status) {
-    case 'detecting':
-      return 'text-orange-500';
-    case 'error':
-      return 'text-red-500';
-    case 'no_candidates':
-      return 'text-slate-500';
-    case 'done':
-      return 'text-green-600';
-    default:
-      return 'text-red-500';
-  }
-}
-
-function videoStatusLabel(video: ProjectState['videos'][number]): string {
-  if (video.source_kind === 'direct_clip') {
-    if (video.status === 'error') return '异常';
-    if (video.status === 'done') return '已完成';
-    return '已就绪';
-  }
-  return statusLabel(video.status);
-}
-
-function categoryLabel(value: string | null | undefined): string {
-  if (!value) return '未选择';
-  return CATEGORY_OPTIONS.find((item) => item.value === value)?.label ?? value;
-}
-
-function compactJoin(values: string[], maxVisible: number = 2): string {
-  const filtered = values.filter((value) => value.trim().length > 0);
-  if (filtered.length <= maxVisible) {
-    return filtered.join(' / ');
-  }
-  return `${filtered.slice(0, maxVisible).join(' / ')} 等 ${filtered.length} 项`;
-}
-
-function formatScopeFolderLabel(scope: PlatformScope | null): string {
-  if (!scope) return '已有片段';
-  const matchNames = Array.from(
-    new Set(scope.query_groups.map((query) => query.match_name).filter((value) => value.trim().length > 0)),
-  );
-  const venues = Array.from(
-    new Set(scope.query_groups.flatMap((query) => query.venues).filter((value) => value.trim().length > 0)),
-  );
-  const matchText = matchNames.length > 0 ? compactJoin(matchNames, 1) : '已有片段';
-  const venueText = venues.length > 0 ? compactJoin(venues, 2) : '';
-  return venueText ? `${matchText} · ${venueText}` : matchText;
-}
-
-function normalizeCategory(value: string | null | undefined): PlatformCategory | '' {
-  if (value === 'EF' || value === 'AA' || value === 'TF' || value === 'QF') {
-    return value;
-  }
-  return '';
-}
-
-function formatSportItemLabel(id: number | null | undefined, sex?: number | null): string {
-  if (id == null) return '--';
-  const base = SPORT_ITEM_LABELS[id] ?? String(id);
-  if (sex === 1) return `男子${base}`;
-  if (sex === 2) return `女子${base}`;
-  return base;
-}
-
-function stripFileExtension(fileName: string): string {
-  return fileName.replace(/\.[^.]+$/, '');
-}
-
-function createPendingImportVideo(file: File | DesktopImportSource): PendingImportVideo {
-  const isBrowserFile = file instanceof File;
-  return {
-    clientFileId: `import_${crypto.randomUUID()}`,
-    file: isBrowserFile ? file : null,
-    path: isBrowserFile ? null : file.path,
-    name: isBrowserFile ? file.name : file.name,
-    sizeBytes: isBrowserFile ? file.size : file.size,
-    matchId: null,
-    selectedFrequencies: [],
-    manualSportKeys: [],
-  };
-}
-
-function createPendingDirectClipFile(file: File | DesktopImportSource): PendingDirectClipFile {
-  const isBrowserFile = file instanceof File;
-  return {
-    clientFileId: `clip_${crypto.randomUUID()}`,
-    file: isBrowserFile ? file : null,
-    path: isBrowserFile ? null : file.path,
-    name: isBrowserFile ? file.name : file.name,
-    sizeBytes: isBrowserFile ? file.size : file.size,
-  };
-}
-
-function isDesktopImportSource(entry: File | DesktopImportSource): entry is DesktopImportSource {
-  return !(entry instanceof File);
-}
-
-function sportKey(sex: number, sportItemId: number): string {
-  return `${sex}:${sportItemId}`;
-}
-
-function parseSportKey(value: string): {sex: number; sportItemId: number} | null {
-  const [rawSex, rawSportItemId] = value.split(':');
-  const sex = Number(rawSex);
-  const sportItemId = Number(rawSportItemId);
-  if (![1, 2].includes(sex) || Number.isNaN(sportItemId)) return null;
-  return {sex, sportItemId};
-}
-
-function toggleSportKey(current: string[], next: string): string[] {
-  return current.includes(next)
-    ? current.filter((item) => item !== next)
-    : [...current, next];
-}
-
-function normalizeVenueText(value: string | null | undefined): string {
-  return (value ?? '').replace(/\s+/g, '');
-}
-
-function deriveSelectionFromVenue(venue: string): VenueDerivedSelection {
-  const normalized = normalizeVenueText(venue);
-  const sex = normalized.includes('男子') ? 1 : normalized.includes('女子') ? 2 : null;
-  const mapping: Array<{sportItemId: number; labels: string[]}> = [
-    {sportItemId: 0, labels: ['自由体操', '自由操']},
-    {sportItemId: 1, labels: ['鞍马']},
-    {sportItemId: 2, labels: ['吊环']},
-    {sportItemId: 3, labels: ['跳马']},
-    {sportItemId: 4, labels: ['双杠']},
-    {sportItemId: 5, labels: ['单杠']},
-    {sportItemId: 6, labels: ['高低杠', '高低双杠']},
-    {sportItemId: 7, labels: ['平衡木']},
-  ];
-  for (const item of mapping) {
-    if (item.labels.some((label) => normalized.includes(label))) {
-      return {sex, sportItemId: item.sportItemId};
-    }
-  }
-  return {sex, sportItemId: null};
-}
-
-function firstNonEmptyScore(...values: Array<unknown>): string | null {
-  for (const value of values) {
-    if (value == null) continue;
-    const text = String(value).trim();
-    if (text) return text;
-  }
-  return null;
-}
-
-function parseNumericScore(value: unknown): number | null {
-  if (value == null) return null;
-  const text = String(value).trim();
-  if (!text) return null;
-  const direct = Number(text);
-  if (Number.isFinite(direct)) return direct;
-  const match = text.match(/[+-]?\d+(?:\.\d+)?/);
-  if (!match) return null;
-  const parsed = Number(match[0]);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatScoreValue(value: string | null | undefined): string {
-  const text = value?.trim();
-  if (!text) return '--';
-  const numeric = parseNumericScore(text);
-  if (!Number.isFinite(numeric)) return '--';
-  return numeric.toFixed(3);
-}
-
-function deriveDisplayedScore(record: PlatformRecord): string {
-  if (record.sport_item_id === 3) {
-    const singleScore = parseNumericScore(record.single_score);
-    if (singleScore != null) return singleScore.toFixed(3);
-    const difficulty = parseNumericScore(record.difficulty_score);
-    const execution = parseNumericScore(record.execution_score);
-    if (difficulty != null && execution != null) {
-      const bonus = parseNumericScore(record.bonus_score) ?? 0;
-      const penalty = parseNumericScore(record.penalty_score) ?? 0;
-      return (difficulty + execution + bonus + penalty).toFixed(3);
-    }
-    return '--';
-  }
-  const totalScore = parseNumericScore(record.total_score);
-  if (totalScore != null) return totalScore.toFixed(3);
-  const singleScore = parseNumericScore(record.single_score);
-  if (singleScore != null) return singleScore.toFixed(3);
-  return '--';
-}
-
-function formatScoreExpression(values: string[]): string {
-  return values.reduce((result, value, index) => {
-    if (index === 0) return value;
-    return /^[+-]/.test(value) ? `${result}${value}` : `${result}+${value}`;
-  }, '');
-}
-
-function isZeroScore(value: string): boolean {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric === 0;
-}
-
-function scoreFormulaLabel(record: PlatformRecord): string {
-  const rawRecord = (record.raw_record ?? {}) as Record<string, unknown>;
-  const d = firstNonEmptyScore(record.difficulty_score, rawRecord.difficultyScore, rawRecord.difficulty_score) ?? '0';
-  const e = firstNonEmptyScore(record.execution_score, rawRecord.executionScore, rawRecord.execution_score) ?? '0';
-  const b = firstNonEmptyScore(record.bonus_score, rawRecord.bscore, rawRecord.bonusScore, rawRecord.bonus_score) ?? '0';
-  const p = firstNonEmptyScore(record.penalty_score, rawRecord.penaltyScore, rawRecord.penalty_score) ?? '0';
-  const total = deriveDisplayedScore(record);
-  const parts = [d, e];
-  if (!isZeroScore(b)) {
-    parts.push(b);
-  }
-  if (!isZeroScore(p)) {
-    parts.push(p);
-  }
-  return `${formatScoreExpression(parts.map((value) => formatScoreValue(value)))}=${formatScoreValue(total)}`;
-}
-
-function primaryScoreValue(record: PlatformRecord): string {
-  return deriveDisplayedScore(record);
-}
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
-  }
-  return hash;
-}
-
-function bindingTheme(recordId: string) {
-  const hue = hashString(recordId) % 360;
-  return {
-    accent: `hsl(${hue} 72% 46%)`,
-    accentSoft: `hsla(${hue}, 85%, 94%, 1)`,
-    accentStrong: `hsla(${hue}, 90%, 90%, 1)`,
-    border: `hsla(${hue}, 62%, 72%, 1)`,
-    text: `hsl(${hue} 55% 32%)`,
-  };
-}
-
-function orderedSegments(clip: CandidateClip): ClipSegment[] {
-  return [...clip.segments].sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
-}
-
-function clipEffectiveDuration(clip: CandidateClip): number {
-  return orderedSegments(clip).reduce((total, segment) => total + Math.max(0, segment.end - segment.start), 0);
-}
-
-function isClipExportSelectable(status: ClipStatus): boolean {
-  return status === 'kept' || status === 'exported';
-}
-
-function isDirectSourceUploadEligible(
-  clip: CandidateClip,
-  video?: ProjectState['videos'][number] | null,
-): boolean {
-  if (!video || video.source_kind !== 'direct_clip' || video.duration == null) return false;
-  const segments = orderedSegments(clip);
-  if (segments.length !== 1) return false;
-  const tolerance = 0.05;
-  const duration = Number(video.duration);
-  return (
-    Math.abs(segments[0].start - 0) <= tolerance
-    && Math.abs(segments[0].end - duration) <= tolerance
-    && Math.abs(clip.review_start - 0) <= tolerance
-    && Math.abs(clip.review_end - duration) <= tolerance
-    && Math.abs(clip.candidate_start - 0) <= tolerance
-    && Math.abs(clip.candidate_end - duration) <= tolerance
-  );
-}
-
-function getUploadOnlySourceMode(
-  clip: CandidateClip,
-  video?: ProjectState['videos'][number] | null,
-): 'exported_file' | 'direct_source' | 'invalid' {
-  if (clip.exported_path) return 'exported_file';
-  if (isDirectSourceUploadEligible(clip, video)) return 'direct_source';
-  return 'invalid';
-}
-
-function getClipDisplayName(
-  clip: CandidateClip,
-  linkedRecord?: PlatformRecord | null,
-  video?: ProjectState['videos'][number] | null,
-): string {
-  return firstDisplayText(
-    linkedRecord?.english_name,
-    linkedRecord?.user_name,
-    clip.athlete_name,
-    video?.source_kind === 'direct_clip' ? stripFileExtension(video.file_name) : '',
-  ) || '未识别';
-}
-
-function getClipDisplayCountry(clip: CandidateClip, linkedRecord?: PlatformRecord | null): string {
-  return firstDisplayText(linkedRecord?.country, clip.country) || '--';
-}
-
-function coerceRecordSex(value: unknown): number | null {
-  if (value === 1 || value === 2) return value;
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (trimmed === '1' || trimmed === '男' || trimmed === '男子' || trimmed.toUpperCase() === 'M') return 1;
-    if (trimmed === '2' || trimmed === '女' || trimmed === '女子' || trimmed.toUpperCase() === 'W') return 2;
-  }
-  return null;
-}
-
-function deriveSexFromText(...values: Array<string | null | undefined>): number | null {
-  const merged = values.join('');
-  if (merged.includes('男子') || merged.includes('男')) return 1;
-  if (merged.includes('女子') || merged.includes('女')) return 2;
-  return null;
-}
-
-function deriveSexFromSelectionKeys(selectionKeys: string[], sportItemId: number | null | undefined): number | null {
-  if (sportItemId == null) return null;
-  const matched = new Set<number>();
-  selectionKeys.forEach((key) => {
-    const parsed = parseSportKey(key);
-    if (!parsed || parsed.sportItemId !== sportItemId) return;
-    matched.add(parsed.sex);
-  });
-  if (matched.size === 1) return Array.from(matched)[0];
-  return null;
-}
-
-function deriveSexFromSportItemId(sportItemId: number | null | undefined): number | null {
-  if (sportItemId == null) return null;
-  if ([1, 2, 4, 5].includes(sportItemId)) return 1;
-  if ([6, 7].includes(sportItemId)) return 2;
-  return null;
-}
-
-function getResolvedPlatformRecordSex(
-  record: PlatformRecord,
-  video?: ProjectState['videos'][number] | null,
-): number | null {
-  const explicitSex = coerceRecordSex(record.sex) ?? coerceRecordSex(record.raw_record?.sex) ?? coerceRecordSex(video?.sex);
-  if (explicitSex != null) return explicitSex;
-  const fromSelection = deriveSexFromSelectionKeys(video?.sport_selection_keys ?? [], record.sport_item_id);
-  if (fromSelection != null) return fromSelection;
-  const fromText = deriveSexFromText(
-    record.venue,
-    typeof record.raw_record?.venue === 'string' ? record.raw_record.venue : '',
-    video?.venue ?? '',
-    ...(video?.venues ?? []),
-  );
-  if (fromText != null) return fromText;
-  return deriveSexFromSportItemId(record.sport_item_id);
-}
-
-function getClipSearchText(
-  clip: CandidateClip,
-  linkedRecord?: PlatformRecord | null,
-  video?: ProjectState['videos'][number] | null,
-): string {
-  return [
-    getClipDisplayName(clip, linkedRecord, video),
-    linkedRecord?.english_name ?? '',
-    linkedRecord?.user_name ?? '',
-    clip.athlete_name,
-    getClipDisplayCountry(clip, linkedRecord),
-    clip.country,
-    video?.file_name ?? '',
-    video ? stripFileExtension(video.file_name) : '',
-  ]
-    .join(' ')
-    .toLowerCase();
-}
-
-function getClipFailureStage(clip: CandidateClip): 'export' | 'oss' | 'platform' | null {
-  if (clip.platform_sync_status !== 'failed') return null;
-  if (!clip.exported_path) return 'export';
-  if (clip.uploaded_url) return 'platform';
-  if (clip.linked_platform_record_id) return 'oss';
-  return 'export';
-}
-
-function pipelineToneClass(tone: PipelineTone): string {
-  switch (tone) {
-    case 'success':
-      return 'bg-green-50 text-green-700 border-green-200';
-    case 'warning':
-      return 'bg-amber-50 text-amber-700 border-amber-200';
-    case 'danger':
-      return 'bg-red-50 text-red-700 border-red-200';
-    case 'muted':
-      return 'bg-slate-100 text-slate-500 border-slate-200';
-    case 'neutral':
-    default:
-      return 'bg-gray-100 text-gray-600 border-gray-200';
-  }
-}
-
-function getClipPipelineBadges(
-  clip: CandidateClip,
-  options: {
-    linkedRecord: PlatformRecord | null;
-    activeExportJob: AppJob | null;
-    lockedExportClipIdSet: ReadonlySet<string>;
-  },
-): ClipPipelineBadgeItem[] {
-  const {activeExportJob, lockedExportClipIdSet} = options;
-  const uploadItem = getClipUploadItem(activeExportJob, clip.id);
-  const activeJobClipId = String(activeExportJob?.progress.clip_id || '');
-  const activeStage = activeJobClipId === clip.id ? String(activeExportJob?.progress.stage || '') : '';
-  if (activeStage === 'local_export') {
-    return [
-      {key: 'export', text: '导出中', tone: 'warning'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (uploadItem?.stage === 'oss_upload' || activeStage === 'oss_upload') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {
-        key: 'oss',
-        text: uploadItem && uploadItem.percent > 0 ? `OSS ${Math.round(uploadItem.percent)}%` : 'OSS 上传中',
-        tone: 'warning',
-      },
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (uploadItem?.stage === 'platform_callback' || activeStage === 'platform_callback') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 上传中', tone: 'warning'},
-    ];
-  }
-  if (uploadItem?.stage === 'queued') {
-    return [
-      {key: 'export', text: clip.exported_path ? '已导出' : getExportQueueStatusLabel(activeExportJob), tone: clip.exported_path ? 'success' : 'warning'},
-      {key: 'oss', text: 'OSS 排队中', tone: 'warning'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (lockedExportClipIdSet.has(clip.id)) {
-    return [
-      {key: 'export', text: getExportQueueStatusLabel(activeExportJob), tone: 'warning'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  const failureStage = getClipFailureStage(clip);
-  if (failureStage === 'export') {
-    return [
-      {key: 'export', text: '导出失败', tone: 'danger'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (!clip.exported_path) {
-    return [
-      {key: 'export', text: '未导出', tone: 'neutral'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (failureStage === 'oss') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 上传失败', tone: 'danger'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (failureStage === 'platform') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 上传失败', tone: 'danger'},
-    ];
-  }
-
-  if (clip.platform_sync_status === 'synced') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 已上传', tone: 'success'},
-    ];
-  }
-
-  if (clip.uploaded_url || clip.platform_sync_status === 'uploading_done') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  return [
-    {key: 'export', text: '已导出', tone: 'success'},
-    {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-    {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-  ];
-}
-
-function getClipRuntimeStatusText(
-  clip: CandidateClip,
-  activeExportJob: AppJob | null,
-  lockedExportClipIdSet: ReadonlySet<string>,
-): string | null {
-  const uploadItem = getClipUploadItem(activeExportJob, clip.id);
-  const activeJobClipId = String(activeExportJob?.progress.clip_id || '');
-  const activeStage = activeJobClipId === clip.id ? String(activeExportJob?.progress.stage || '') : '';
-  if (activeStage === 'local_export') {
-    return '本地导出中';
-  }
-  if (!uploadItem) {
-    return lockedExportClipIdSet.has(clip.id) ? `${getExportQueueStatusLabel(activeExportJob)}（只读）` : null;
-  }
-  if (uploadItem.stage === 'oss_upload') {
-    if (uploadItem.bytes_sent <= 0 || uploadItem.percent <= 0 || uploadItem.speed_bps <= 0) {
-      return '等待上传';
-    }
-    return `OSS ${Math.round(uploadItem.percent)}% · ${formatSpeed(uploadItem.speed_bps)}`;
-  }
-  if (uploadItem.stage === 'platform_callback') {
-    return '平台回写中';
-  }
-  if (uploadItem.stage === 'failed') {
-    return uploadItem.error_message || '上传失败';
-  }
-  if (uploadItem.stage === 'completed') {
-    return '上传完成';
-  }
-  if (uploadItem.stage === 'queued') {
-    return '等待上传（只读）';
-  }
-  return null;
-}
-
-function normalizeSegments(
-  _clip: CandidateClip,
-  segments: ClipSegment[],
-): ClipSegment[] {
-  const sorted = [...segments]
-    .map((segment) => ({
-      ...segment,
-      start: Number(segment.start.toFixed(3)),
-      end: Number(segment.end.toFixed(3)),
-    }))
-    .sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
-
-  let previousEnd: number | null = null;
-  return sorted.map((segment) => {
-    const start = Math.max(previousEnd ?? 0, segment.start);
-    const end = Math.max(start + CLIP_STEP, segment.end);
-    previousEnd = end;
-    return {
-      ...segment,
-      start: Number(start.toFixed(3)),
-      end: Number(end.toFixed(3)),
-    };
-  });
-}
-
-function firstEditableSegment(clip: CandidateClip): ClipSegment | null {
-  return orderedSegments(clip)[0] ?? null;
-}
-
-function cloneCandidateClips(clips: CandidateClip[]): CandidateClip[] {
-  return clips.map((clip) => ({
-    ...clip,
-    segments: clip.segments.map((segment) => ({...segment})),
-  }));
-}
-
-function selectionSummaryLabel(selectionKeys: string[]): string {
-  if (selectionKeys.length === 0) return '未选择项目';
-  return selectionKeys
-    .map((key) => parseSportKey(key))
-    .filter((item): item is {sex: number; sportItemId: number} => item != null)
-    .map((item) => formatSportItemLabel(item.sportItemId, item.sex))
-    .join(' / ');
-}
-
-function StatusBadge({
-  status,
-  size = 'sm',
-}: {
-  status: ClipStatus;
-  size?: 'sm' | 'lg';
-}) {
-  const sizeClass = size === 'lg' ? 'text-sm px-3 py-1.5 min-w-[5rem]' : 'text-[11px] px-2.5 py-1 min-w-[3.5rem]';
-  return (
-    <span className={`inline-flex items-center justify-center whitespace-nowrap leading-none rounded-full border font-medium shrink-0 ${sizeClass} ${clipBadgeClass(status)}`}>
-      {statusLabel(status)}
-    </span>
-  );
-}
-
-function TriStateCheckboxButton({
-  state,
-  disabled = false,
-  onClick,
-  title,
-}: {
-  state: 'checked' | 'indeterminate' | 'unchecked';
-  disabled?: boolean;
-  onClick: () => void;
-  title: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className={`flex h-4 w-4 items-center justify-center rounded border transition-colors ${
-        disabled
-          ? 'cursor-not-allowed border-gray-200 bg-gray-100 text-gray-300'
-          : state === 'unchecked'
-            ? 'border-gray-300 bg-white text-gray-500 hover:border-gray-400'
-            : 'border-red-200 bg-red-50 text-red-600 hover:border-red-300'
-      }`}
-    >
-      {state === 'checked' && <Check size={11} strokeWidth={3} />}
-      {state === 'indeterminate' && <Minus size={11} strokeWidth={3} />}
-    </button>
-  );
-}
-
-function ScoreFilterDropdown({
-  id,
-  placeholder,
-  allLabel,
-  value,
-  options,
-  openFilter,
-  onToggle,
-  onChange,
-}: {
-  id: ScoreFilterMenu;
-  placeholder: string;
-  allLabel: string;
-  value: string;
-  options: ScoreFilterOption[];
-  openFilter: ScoreFilterMenu | null;
-  onToggle: (next: ScoreFilterMenu | null) => void;
-  onChange: (nextValue: string) => void;
-}) {
-  const isOpen = openFilter === id;
-  const selectedLabel = value === 'all'
-    ? placeholder
-    : options.find((option) => option.value === value)?.label ?? placeholder;
-
-  return (
-    <div data-score-filter-root className="relative">
-      <button
-        type="button"
-        onClick={() => onToggle(isOpen ? null : id)}
-        className="flex w-full min-w-[5.8rem] items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm transition-colors hover:border-gray-300"
-      >
-        <span className="truncate">{selectedLabel}</span>
-        <ChevronDown size={14} className={`shrink-0 text-gray-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
-      </button>
-      {isOpen && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-xl">
-          <div className="max-h-64 overflow-y-auto py-1">
-            <button
-              type="button"
-              onClick={() => {
-                onChange('all');
-                onToggle(null);
-              }}
-              className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors ${
-                value === 'all' ? 'bg-red-50 text-red-600' : 'text-gray-700 hover:bg-gray-50'
-              }`}
-            >
-              {allLabel}
-            </button>
-            {options.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => {
-                  onChange(option.value);
-                  onToggle(null);
-                }}
-                className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors ${
-                  value === option.value ? 'bg-red-50 text-red-600' : 'text-gray-700 hover:bg-gray-50'
-                }`}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function emptyLocalCardForm(): LocalCardFormState {
-  return {
-    user_name: '',
-    english_name: '',
-    country: '',
-    sport_item_id: '',
-    difficulty_score: '',
-    execution_score: '',
-    bonus_score: '',
-    penalty_score: '',
-    total_score: '',
-    total_overridden: false,
-  };
-}
-
-function localCardRecordToForm(record: PlatformRecord): LocalCardFormState {
-  return {
-    user_name: record.user_name || '',
-    english_name: record.english_name || '',
-    country: record.country || '',
-    sport_item_id: record.sport_item_id != null ? String(record.sport_item_id) : '',
-    difficulty_score: record.difficulty_score || '',
-    execution_score: record.execution_score || '',
-    bonus_score: record.bonus_score || '',
-    penalty_score: record.penalty_score || '',
-    total_score: record.total_score || '',
-    total_overridden: true,
-  };
-}
-
-function parseScoreNumber(value: string): number {
-  const parsed = Number(String(value).trim());
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function computeLocalCardAutoTotal(form: LocalCardFormState): string {
-  const total =
-    parseScoreNumber(form.difficulty_score) +
-    parseScoreNumber(form.execution_score) +
-    parseScoreNumber(form.bonus_score) -
-    parseScoreNumber(form.penalty_score);
-  return total.toFixed(3).replace(/\.?0+$/, '') || '0';
-}
-
-const LOCAL_CARD_SPORT_OPTIONS: Array<{value: string; label: string}> = Object.entries(SPORT_ITEM_LABELS).map(
-  ([id, label]) => ({value: id, label: `${label} (${id})`}),
-);
-
-function stopFormShortcutPropagation(event: React.KeyboardEvent<HTMLElement>) {
-  event.stopPropagation();
-}
-
-type LocalCardInlineFormProps = {
-  form: LocalCardFormState;
-  setForm: (updater: (prev: LocalCardFormState) => LocalCardFormState) => void;
-  onSave: () => void;
-  onCancel: () => void;
-  saving: boolean;
-  title: string;
-  onDelete?: () => void;
-  nameSuggestions?: string[];
-};
-
-const LOCAL_CARD_NAME_DATALIST_ID = 'local-card-name-suggestions';
-
-function LocalCardInlineForm({
-  form,
-  setForm,
-  onSave,
-  onCancel,
-  saving,
-  title,
-  onDelete,
-  nameSuggestions,
-}: LocalCardInlineFormProps) {
-  const autoTotal = computeLocalCardAutoTotal(form);
-  const totalDisplay = form.total_overridden && form.total_score.trim() !== '' ? form.total_score : autoTotal;
-  return (
-    <div
-      className="rounded-2xl border border-amber-300 bg-amber-50/70 p-3 shadow-sm space-y-2.5"
-      onKeyDown={stopFormShortcutPropagation}
-    >
-      {nameSuggestions && nameSuggestions.length > 0 && (
-        <datalist id={LOCAL_CARD_NAME_DATALIST_ID}>
-          {nameSuggestions.map((name) => (
-            <option key={name} value={name} />
-          ))}
-        </datalist>
-      )}
-      <div className="flex items-center justify-between">
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-200/70 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
-          本地补录
-        </span>
-        <span className="text-[11px] text-amber-700">{title}</span>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <label className="block text-[11px] text-amber-900">
-          姓名 *
-          <input
-            type="text"
-            value={form.user_name}
-            onChange={(event) => setForm((prev) => ({...prev, user_name: event.target.value}))}
-            list={nameSuggestions && nameSuggestions.length > 0 ? LOCAL_CARD_NAME_DATALIST_ID : undefined}
-            autoComplete="off"
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          英文名
-          <input
-            type="text"
-            value={form.english_name}
-            onChange={(event) => setForm((prev) => ({...prev, english_name: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          国家
-          <input
-            type="text"
-            value={form.country}
-            onChange={(event) => setForm((prev) => ({...prev, country: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          项目 *
-          <select
-            value={form.sport_item_id}
-            onChange={(event) => setForm((prev) => ({...prev, sport_item_id: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          >
-            <option value="">-- 选择 --</option>
-            {LOCAL_CARD_SPORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="grid grid-cols-4 gap-2">
-        <label className="block text-[11px] text-amber-900">
-          难度 D
-          <input
-            type="number"
-            step="0.1"
-            value={form.difficulty_score}
-            onChange={(event) => setForm((prev) => ({...prev, difficulty_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          执行 E
-          <input
-            type="number"
-            step="0.1"
-            value={form.execution_score}
-            onChange={(event) => setForm((prev) => ({...prev, execution_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          加点
-          <input
-            type="number"
-            step="0.1"
-            value={form.bonus_score}
-            onChange={(event) => setForm((prev) => ({...prev, bonus_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          扣分
-          <input
-            type="number"
-            step="0.1"
-            value={form.penalty_score}
-            onChange={(event) => setForm((prev) => ({...prev, penalty_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-      </div>
-      <label className="block text-[11px] text-amber-900">
-        总分 {!form.total_overridden && <span className="text-[10px] text-amber-700">(自动 = D + E + 加点 − 扣分)</span>}
-        <div className="mt-0.5 flex items-center gap-2">
-          <input
-            type="number"
-            step="0.001"
-            value={totalDisplay}
-            onChange={(event) => setForm((prev) => ({...prev, total_score: event.target.value, total_overridden: true}))}
-            className="w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm font-semibold text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-          {form.total_overridden && (
-            <button
-              type="button"
-              onClick={() => setForm((prev) => ({...prev, total_score: '', total_overridden: false}))}
-              className="text-[11px] text-amber-700 underline hover:text-amber-900"
-            >
-              恢复自动
-            </button>
-          )}
-        </div>
-      </label>
-      <div className="flex items-center justify-end gap-2 pt-1">
-        {onDelete && (
-          <button
-            type="button"
-            onClick={onDelete}
-            disabled={saving}
-            className="mr-auto inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-[12px] text-red-600 hover:bg-red-50 disabled:opacity-50"
-          >
-            删除
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onCancel}
-          disabled={saving}
-          className="rounded-md border border-gray-200 bg-white px-3 py-1 text-[12px] text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-        >
-          取消
-        </button>
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving}
-          className="rounded-md border border-amber-600 bg-amber-600 px-3 py-1 text-[12px] font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
-        >
-          {saving ? '保存中...' : '保存'}
-        </button>
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
   const [project, setProject] = useState<ProjectState | null>(null);
@@ -1506,8 +297,8 @@ export default function App() {
   const [ossAccessKeyId, setOssAccessKeyId] = useState('');
   const [ossAccessKeySecret, setOssAccessKeySecret] = useState('');
   const [isPersistingOssCredentials, setIsPersistingOssCredentials] = useState(false);
-  const [selectedVideoIds, setSelectedVideoIds] = useState<string[]>([]);
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const selectedVideoIds = useStore((s) => s.selectedVideoIds);
+  const selectedClipIds = useStore((s) => s.selectedClipIds);
   const [isBatchDetecting, setIsBatchDetecting] = useState(false);
   const [collapsedClipGroupIds, setCollapsedClipGroupIds] = useState<string[]>([]);
   const [collapsedVideoFolderIds, setCollapsedVideoFolderIds] = useState<string[]>([]);
@@ -2021,7 +812,8 @@ export default function App() {
     platformMatches,
   ]);
 
-  const selectedClipIdSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+  // selectedClipIds is already a Set in the zustand store; keep the alias for call-site stability.
+  const selectedClipIdSet = selectedClipIds;
   const exportTargetClipIds = useMemo(
     () =>
       clips
@@ -2186,7 +978,8 @@ export default function App() {
     return true;
   }
 
-  const selectedVideoIdSet = useMemo(() => new Set(selectedVideoIds), [selectedVideoIds]);
+  // selectedVideoIds is already a Set in the zustand store; keep the alias for call-site stability.
+  const selectedVideoIdSet = selectedVideoIds;
   const selectedVideos = useMemo(
     () => videos.filter((video) => selectedVideoIdSet.has(video.id)),
     [videos, selectedVideoIdSet],
@@ -2220,7 +1013,7 @@ export default function App() {
   const activeDetectCancelRequested = activeDetectJob
     ? String(activeDetectJob.progress.stage || '') === 'cancel_requested'
     : false;
-  const shouldUseSelectedVideosForDetect = selectedVideoIds.length > 0;
+  const shouldUseSelectedVideosForDetect = selectedVideoIds.size > 0;
   const startDetectCount = shouldUseSelectedVideosForDetect ? selectedStartableVideos.length : 0;
   const hasAnyFullVideo = videos.some((video) => video.source_kind === 'full_video');
   const shouldShowDetectControls = Boolean(activeDetectJob) || hasAnyFullVideo;
@@ -2646,7 +1439,14 @@ export default function App() {
 
   useEffect(() => {
     const validVideoIds = new Set(videos.map((video) => video.id));
-    setSelectedVideoIds((current) => current.filter((videoId) => validVideoIds.has(videoId)));
+    const current = useStore.getState().selectedVideoIds;
+    const next = new Set<string>();
+    current.forEach((videoId) => {
+      if (validVideoIds.has(videoId)) next.add(videoId);
+    });
+    if (next.size !== current.size) {
+      useStore.getState().setSelectedVideoIds(next);
+    }
   }, [videos]);
 
   useEffect(() => {
@@ -2655,7 +1455,14 @@ export default function App() {
         .filter((clip) => isClipExportSelectable(clip.status))
         .map((clip) => clip.id),
     );
-    setSelectedClipIds((current) => current.filter((clipId) => validClipIds.has(clipId)));
+    const current = useStore.getState().selectedClipIds;
+    const next = new Set<string>();
+    current.forEach((clipId) => {
+      if (validClipIds.has(clipId)) next.add(clipId);
+    });
+    if (next.size !== current.size) {
+      useStore.getState().setSelectedClipIds(next);
+    }
   }, [clips]);
 
   useEffect(() => {
@@ -3441,34 +2248,25 @@ export default function App() {
   }
 
   function toggleVideoSelection(videoId: string) {
-    setSelectedVideoIds((current) =>
-      current.includes(videoId)
-        ? current.filter((id) => id !== videoId)
-        : [...current, videoId],
-    );
+    useStore.getState().toggleSelectedVideoId(videoId);
   }
 
   function toggleClipSelection(clipId: string) {
-    setSelectedClipIds((current) =>
-      current.includes(clipId)
-        ? current.filter((id) => id !== clipId)
-        : [...current, clipId],
-    );
+    useStore.getState().toggleSelectedClipId(clipId);
   }
 
   function setClipSelectionBatch(clipIds: string[], shouldSelect: boolean) {
     if (clipIds.length === 0) return;
-    setSelectedClipIds((current) => {
-      const next = new Set(current);
-      clipIds.forEach((clipId) => {
-        if (shouldSelect) {
-          next.add(clipId);
-        } else {
-          next.delete(clipId);
-        }
-      });
-      return Array.from(next);
+    const current = useStore.getState().selectedClipIds;
+    const next = new Set(current);
+    clipIds.forEach((clipId) => {
+      if (shouldSelect) {
+        next.add(clipId);
+      } else {
+        next.delete(clipId);
+      }
     });
+    useStore.getState().setSelectedClipIds(next);
   }
 
   function getClipGroupSelectionState(clipIds: string[]): 'checked' | 'indeterminate' | 'unchecked' {
@@ -3497,7 +2295,7 @@ export default function App() {
   }
 
   function clearVideoSelection() {
-    setSelectedVideoIds([]);
+    useStore.getState().clearSelectedVideoIds();
   }
 
   function toggleClipGroup(videoId: string) {
@@ -3527,25 +2325,24 @@ export default function App() {
   function toggleSelectAllVideosInFolder(videoIds: string[]) {
     if (videoIds.length === 0) return;
     const selectionState = getVideoFolderSelectionState(videoIds);
-    setSelectedVideoIds((current) => {
-      const next = new Set(current);
-      videoIds.forEach((videoId) => {
-        if (selectionState === 'checked') {
-          next.delete(videoId);
-        } else {
-          next.add(videoId);
-        }
-      });
-      return Array.from(next);
+    const current = useStore.getState().selectedVideoIds;
+    const next = new Set(current);
+    videoIds.forEach((videoId) => {
+      if (selectionState === 'checked') {
+        next.delete(videoId);
+      } else {
+        next.add(videoId);
+      }
     });
+    useStore.getState().setSelectedVideoIds(next);
   }
 
   function toggleSelectAllVideos() {
-    if (selectedVideoIds.length === videos.length) {
+    if (selectedVideoIds.size === videos.length) {
       clearVideoSelection();
       return;
     }
-    setSelectedVideoIds(videos.map((video) => video.id));
+    useStore.getState().setSelectedVideoIds(new Set(videos.map((video) => video.id)));
   }
 
   function updateTrimRange(nextStart: number, nextEnd: number, syncTarget: 'start' | 'end' | null = null) {
@@ -4276,9 +3073,14 @@ export default function App() {
           ...queuedJobs,
           ...current.filter((job) => !queuedJobs.some((queuedJob) => queuedJob.id === job.id)),
         ]);
-        setSelectedVideoIds((current) =>
-          current.filter((videoId) => !queuedJobs.some((job) => job.video_id === videoId)),
-        );
+        const currentSelected = useStore.getState().selectedVideoIds;
+        const nextSelected = new Set<string>();
+        currentSelected.forEach((videoId) => {
+          if (!queuedJobs.some((job) => job.video_id === videoId)) {
+            nextSelected.add(videoId);
+          }
+        });
+        useStore.getState().setSelectedVideoIds(nextSelected);
       }
 
       if (failedVideos.length > 0) {
@@ -5137,8 +3939,8 @@ export default function App() {
                 <>
                   <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">视频任务 ({videos.length})</h2>
                   <div className="flex items-center gap-2">
-                    {selectedVideoIds.length > 0 && (
-                      <span className="text-[11px] font-medium text-gray-500">已选 {selectedVideoIds.length}</span>
+                    {selectedVideoIds.size > 0 && (
+                      <span className="text-[11px] font-medium text-gray-500">已选 {selectedVideoIds.size}</span>
                     )}
                     <button
                       onClick={() => setIsVideoSidebarCollapsed(true)}
@@ -5166,7 +3968,7 @@ export default function App() {
                   className="min-w-0 flex-1 px-2 py-1 text-[11px] rounded-lg bg-white border border-gray-200 text-gray-600 hover:border-gray-300 hover:text-gray-900 transition-colors disabled:opacity-50"
                   disabled={videos.length === 0}
                 >
-                  {selectedVideoIds.length === videos.length ? '取消全选' : '全选'}
+                  {selectedVideoIds.size === videos.length ? '取消全选' : '全选'}
                 </button>
                 <button
                   onClick={() => void handleCancelSelectedVideos()}
