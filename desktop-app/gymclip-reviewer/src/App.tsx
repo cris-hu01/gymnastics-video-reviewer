@@ -2978,15 +2978,18 @@ export default function App() {
     const nextSegment = firstEditableSegment(activeClip);
     skipTrimSyncRef.current = true;
     setActiveSegmentId(nextSegment?.id ?? null);
-    const s = nextSegment?.start ?? activeClip.review_start;
-    const e = nextSegment?.end ?? activeClip.review_end;
+    const rawStart = nextSegment?.start ?? activeClip.review_start;
+    const rawEnd = nextSegment?.end ?? activeClip.review_end;
+    const videoDuration = activeVideo?.duration ?? null;
+    const s = Math.max(0, videoDuration != null ? Math.min(rawStart, videoDuration) : rawStart);
+    const e = Math.max(s, videoDuration != null ? Math.min(rawEnd, videoDuration) : rawEnd);
     setTrimStart(s);
     setTrimEnd(e);
     trimStartRef.current = s;
     trimEndRef.current = e;
     setPlayhead(s);
     setIsPlaying(false);
-  }, [activeClip?.id]);
+  }, [activeClip?.id, activeVideo?.duration]);
 
   useEffect(() => {
     if (!activeClip) return;
@@ -3002,11 +3005,20 @@ export default function App() {
   useEffect(() => {
     if (!activeClip || !activeSegment) return;
     skipTrimSyncRef.current = true;
-    setTrimStart(activeSegment.start);
-    setTrimEnd(activeSegment.end);
-    trimStartRef.current = activeSegment.start;
-    trimEndRef.current = activeSegment.end;
-    setPlayhead((current) => Math.min(Math.max(current, activeSegment.start), activeSegment.end));
+    const videoDuration = activeVideo?.duration ?? null;
+    const clampedStart = Math.max(
+      0,
+      videoDuration != null ? Math.min(activeSegment.start, videoDuration) : activeSegment.start,
+    );
+    const clampedEnd = Math.max(
+      clampedStart,
+      videoDuration != null ? Math.min(activeSegment.end, videoDuration) : activeSegment.end,
+    );
+    setTrimStart(clampedStart);
+    setTrimEnd(clampedEnd);
+    trimStartRef.current = clampedStart;
+    trimEndRef.current = clampedEnd;
+    setPlayhead((current) => Math.min(Math.max(current, clampedStart), clampedEnd));
   }, [activeClip?.id, activeSegment?.id, activeSegment?.start, activeSegment?.end]);
 
   useEffect(() => {
@@ -3542,8 +3554,8 @@ export default function App() {
     const safeStart = Math.max(0, Math.min(nextStart, nextEnd - CLIP_STEP));
     const safeEnd = Math.max(safeStart + CLIP_STEP, Math.min(nextEnd, videoDuration));
 
-    const nextTrimStart = Number(safeStart.toFixed(2));
-    const nextTrimEnd = Number(safeEnd.toFixed(2));
+    const nextTrimStart = Math.floor(safeStart * 100) / 100;
+    const nextTrimEnd = Math.floor(safeEnd * 100) / 100;
     setTrimStart(nextTrimStart);
     setTrimEnd(nextTrimEnd);
     trimStartRef.current = nextTrimStart;
