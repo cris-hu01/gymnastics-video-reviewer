@@ -140,6 +140,95 @@ def update_video_progress(state: ProjectState, video_id: str, progress: dict[str
     state.touch()
 
 
+def apply_detect_progress(
+    state: ProjectState,
+    video_id: str,
+    progress: dict[str, Any],
+) -> None:
+    """Translate a DetectionService progress event into ProjectState mutations.
+
+    Dispatches based on `progress['stage']`. Extracted from the detect-video
+    runner closure so the router stays small.
+    """
+    current_stage = progress.get("stage")
+    if current_stage == "start":
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "start",
+                "message": "准备开始检测",
+                "completed": 0,
+                "total": 0,
+            },
+        )
+    elif current_stage == "extracting":
+        completed = int(progress.get("completed", 0))
+        total = int(progress.get("total", 0))
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "extracting",
+                "message": "正在采样视频帧",
+                "completed": completed,
+                "total": total,
+            },
+        )
+    elif current_stage == "precheck_complete":
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "precheck_complete",
+                "message": "预检查完成",
+                "completed": progress.get("precheck_passed", 0),
+                "total": progress.get("precheck_passed", 0),
+                "total_samples": progress.get("total_samples", 0),
+                "precheck_passed": progress.get("precheck_passed", 0),
+            },
+        )
+    elif current_stage == "detecting":
+        current_name = progress.get("current_name") or "处理中"
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "detecting",
+                "message": f"AI 检测中: {current_name}",
+                "completed": progress.get("completed", 0),
+                "total": progress.get("total", 0),
+                "current_name": progress.get("current_name"),
+                "matched": progress.get("matched", False),
+            },
+        )
+    elif current_stage == "completed":
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "completed",
+                "message": "检测完成",
+                "final_count": progress.get("final_count"),
+            },
+        )
+    elif current_stage == "error":
+        update_video_progress(
+            state,
+            video_id,
+            {
+                "stage": "error",
+                "message": progress.get("message", "检测失败"),
+            },
+        )
+    elif current_stage == "cancelled":
+        restore_video_after_detection_cancel(
+            state,
+            video_id,
+            str(progress.get("message") or "检测已取消"),
+        )
+
+
 def restore_video_after_detection_cancel(
     state: ProjectState, video_id: str, message: str
 ) -> None:
