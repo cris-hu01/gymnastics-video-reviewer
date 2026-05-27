@@ -50,6 +50,12 @@ def main() -> None:
         "anthropic",
         "--collect-all",
         "zhipuai",
+        # Bundle sentry-sdk including its lazily-loaded integrations
+        # (sentry_sdk.integrations.fastapi / .logging / .stdlib / ...).
+        # Without --collect-all PyInstaller's static analysis misses these
+        # lazy imports and init_sentry() degrades silently in packaged builds.
+        "--collect-all",
+        "sentry_sdk",
         "--hidden-import",
         "python_multipart",
     ]

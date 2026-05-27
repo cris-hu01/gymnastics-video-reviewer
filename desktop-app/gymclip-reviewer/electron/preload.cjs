@@ -18,4 +18,7 @@ contextBridge.exposeInMainWorld('gymclipDesktop', {
   selectDirectory: (initialPath) => ipcRenderer.invoke('dialog:select-directory', initialPath),
   selectImportSources: (initialPath) => ipcRenderer.invoke('dialog:select-import-sources', initialPath),
   showSystemNotification: (payload) => ipcRenderer.invoke('notification:show', payload),
+  // === Telemetry / Sentry consent (C-5) ===
+  getTelemetryConfig: () => ipcRenderer.invoke('telemetry:get-config'),
+  setTelemetryConsent: (enabled) => ipcRenderer.invoke('telemetry:set-consent', !!enabled),
 });

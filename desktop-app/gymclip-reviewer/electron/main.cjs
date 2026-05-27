@@ -3,11 +3,167 @@ const { spawn } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 // Ensure hardware-accelerated video decode for smooth scrubbing
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-accelerated-video-decode');
 app.commandLine.appendSwitch('enable-zero-copy');
+
+// === Telemetry consent (C-5) ===
+// 持久化匿名 UUID + 用户上报开关到 userData/telemetry.json。
+// 首次启动会在 whenReady 之后弹原生 dialog；用户选择前不写盘。
+// 后端通过 spawn env (GYMCLIP_USER_ID / GYMCLIP_TELEMETRY_ENABLED) 共享同一 user.id。
+let _telemetryCache = null;
+
+function _telemetryFilePath() {
+  return path.join(app.getPath('userData'), 'telemetry.json');
+}
+
+function _loadTelemetry() {
+  if (_telemetryCache) return _telemetryCache;
+  const filePath = _telemetryFilePath();
+  try {
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      if (data && typeof data.userId === 'string' && data.userId.length > 0) {
+        _telemetryCache = data;
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn('[telemetry] read failed:', e?.message || e);
+  }
+  return null; // 首次启动或文件损坏
+}
+
+function _saveTelemetry(obj) {
+  try {
+    fs.mkdirSync(path.dirname(_telemetryFilePath()), { recursive: true });
+    fs.writeFileSync(_telemetryFilePath(), JSON.stringify(obj, null, 2), 'utf-8');
+    _telemetryCache = obj;
+  } catch (e) {
+    console.error('[telemetry] write failed:', e?.message || e);
+  }
+}
+
+function _bootstrapTelemetry() {
+  // 返回 {userId, telemetryEnabled, consentVersion, decidedAt, firstRun}
+  // 注意：本函数不写盘 — 由 consent dialog 决定后再写。
+  const cfg = _loadTelemetry();
+  if (cfg) {
+    return { ...cfg, firstRun: false };
+  }
+  return {
+    userId: crypto.randomUUID(),
+    telemetryEnabled: true,
+    consentVersion: 1,
+    decidedAt: null,
+    firstRun: true,
+  };
+}
+
+function getTelemetryConfig() {
+  // 暴露给 IPC / Sentry init / spawn env 使用。
+  // 注意：本函数依赖 app.getPath('userData')，必须在 whenReady 之后调用。
+  const cfg = _loadTelemetry() || _bootstrapTelemetry();
+  return {
+    userId: cfg.userId,
+    telemetryEnabled: cfg.telemetryEnabled !== false,
+  };
+}
+
+function setTelemetryConsent(enabled) {
+  const cfg = _loadTelemetry() || _bootstrapTelemetry();
+  const next = {
+    userId: cfg.userId,
+    telemetryEnabled: !!enabled,
+    consentVersion: 1,
+    decidedAt: new Date().toISOString(),
+  };
+  _saveTelemetry(next);
+  // 用户禁用 → 立即停 Sentry（main process）。
+  // 用户启用 → 不重新 init（需要重启），避免重复 init 造成异常。
+  if (!enabled) {
+    try {
+      const Sentry = require('@sentry/electron/main');
+      if (typeof Sentry.close === 'function') {
+        Sentry.close(2000);
+      }
+      global.__sentryCaptureException = null;
+    } catch (_) { /* Sentry 可能没 init，忽略 */ }
+  }
+  return { userId: next.userId, telemetryEnabled: next.telemetryEnabled };
+}
+
+async function _maybeShowConsentDialog() {
+  // 仅在首次启动（telemetry.json 不存在或非法）时弹原生 dialog。
+  // 必须在 whenReady 之后、Sentry init 之前调用。
+  const cfg = _loadTelemetry();
+  if (cfg) return; // 已决定过，不再打扰
+
+  let response = 0; // 默认允许
+  try {
+    const choice = await dialog.showMessageBox({
+      type: 'info',
+      title: '匿名错误上报',
+      message: '开启匿名错误上报？',
+      detail:
+        'GymClip Reviewer 可以在出错时把异常堆栈和应用版本上报给开发者，帮助快速定位 bug。\n\n' +
+        '上报内容不包含：视频文件、文件路径、OSS 密钥、个人信息。\n' +
+        '上报匿名 ID 与本设备绑定，不能反查到您。\n\n' +
+        '您可以稍后在设置中随时关闭。',
+      buttons: ['允许（推荐）', '不允许'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    response = choice.response;
+  } catch (e) {
+    console.warn('[telemetry] consent dialog failed, default to enabled:', e?.message || e);
+  }
+
+  const enabled = response === 0;
+  const boot = _bootstrapTelemetry();
+  _saveTelemetry({
+    userId: boot.userId,
+    telemetryEnabled: enabled,
+    consentVersion: 1,
+    decidedAt: new Date().toISOString(),
+  });
+}
+// === end Telemetry consent ===
+
+// === Sentry error hooks (C-3) ===
+// 必须在 app.whenReady() 之前注册，避免启动早期异常丢失。
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(`Unhandled rejection: ${String(reason)}`);
+  console.error('[unhandledRejection]', err);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+app.on('render-process-gone', (event, webContents, details) => {
+  const err = new Error(`render-process-gone: reason=${details.reason} exitCode=${details.exitCode}`);
+  console.error('[render-process-gone]', details);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+app.on('child-process-gone', (event, details) => {
+  const err = new Error(`child-process-gone: type=${details.type} reason=${details.reason} exitCode=${details.exitCode} name=${details.name}`);
+  console.error('[child-process-gone]', details);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+// === end Sentry hooks ===
 
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = process.env.GYMCLIP_BACKEND_PORT || '8000';
@@ -478,6 +634,8 @@ async function startBackend() {
   const backendRoot = resolveBackendRoot();
   const backendWorkspace = path.join(app.getPath('userData'), 'workspace');
   const backendCommand = resolveBackendCommand();
+  // 共享 telemetry config 到 backend：三端 user.id 一致 + 用户禁用时后端不 init Sentry
+  const tcfg = getTelemetryConfig();
 
   backendProcess = spawn(backendCommand.command, backendCommand.args, {
     cwd: backendRoot,
@@ -493,6 +651,8 @@ async function startBackend() {
       GYMCLIP_FFMPEG_PATH: resolveMediaToolPath('ffmpeg'),
       GYMCLIP_FFPROBE_PATH: resolveMediaToolPath('ffprobe'),
       GYMCLIP_OSSUTIL_PATH: resolveOssToolPath(),
+      GYMCLIP_USER_ID: tcfg.userId,
+      GYMCLIP_TELEMETRY_ENABLED: tcfg.telemetryEnabled ? '1' : '0',
     },
   });
 
@@ -548,6 +708,56 @@ function openMainWindow() {
   });
 }
 
+function _initSentryMain() {
+  // Sentry init for main process. 必须在 whenReady() 之后调用 — 依赖 telemetry config，
+  // 而 telemetry config 又依赖 app.getPath('userData')。
+  // 重复调用 idempotent：如果已 init 过，会被 try/catch 兜底。
+  try {
+    const tcfg = getTelemetryConfig();
+    if (!tcfg.telemetryEnabled) {
+      console.info('[sentry] electron main: telemetry opt-out, skip init');
+      return;
+    }
+    const { init: initSentryMain, captureException, setUser } = require('@sentry/electron/main');
+    const dsn = process.env.SENTRY_DSN_ELECTRON;
+    if (!dsn) {
+      console.info('[sentry] SENTRY_DSN_ELECTRON empty, skipping init');
+      return;
+    }
+    initSentryMain({
+      dsn,
+      release: process.env.SENTRY_RELEASE || `gymclip-reviewer@${require('../package.json').version}`,
+      environment: process.env.SENTRY_ENVIRONMENT || (app.isPackaged ? 'production' : 'development'),
+      // beforeSend 占位：脱敏可能含密钥的字段
+      // TODO(C-5): 完善 PII filtering（视频绝对路径、OSS access key 等）
+      beforeSend(event) {
+        try {
+          const json = JSON.stringify(event);
+          if (/(accessKey|secret|password|token)/i.test(json)) {
+            // 简单粗暴：把所有 vars/extra 中疑似敏感字段值替换为 [Filtered]
+            const filter = (obj) => {
+              if (!obj || typeof obj !== 'object') return;
+              for (const k of Object.keys(obj)) {
+                if (/(accessKey|secret|password|token)/i.test(k)) obj[k] = '[Filtered]';
+                else if (typeof obj[k] === 'object') filter(obj[k]);
+              }
+            };
+            filter(event);
+          }
+        } catch (_) { /* 不让脱敏失败影响上报 */ }
+        return event;
+      },
+    });
+    setUser({ id: tcfg.userId });
+    global.__sentryCaptureException = captureException;
+    console.log('[sentry] electron main initialized for user', `${tcfg.userId.slice(0, 8)}...`);
+  } catch (e) {
+    console.error('[sentry] init failed (degraded gracefully):', e?.message || e);
+  }
+}
+
+ipcMain.handle('telemetry:get-config', () => getTelemetryConfig());
+ipcMain.handle('telemetry:set-consent', (_event, enabled) => setTelemetryConsent(enabled));
 ipcMain.handle('settings:load-api-key', () => loadSavedApiKey());
 ipcMain.handle('settings:save-api-key', (_event, apiKey) => saveApiKey(apiKey));
 ipcMain.handle('settings:clear-api-key', () => clearSavedApiKey());
@@ -563,7 +773,17 @@ ipcMain.handle('dialog:select-directory', (_event, initialPath) => selectDirecto
 ipcMain.handle('dialog:select-import-sources', (_event, initialPath) => selectImportSources(initialPath));
 ipcMain.handle('notification:show', (_event, payload) => showSystemNotification(payload));
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // 1) 首次启动弹 consent dialog；非首次直接读 telemetry.json。
+  // 2) Sentry main init —— 必须放在 whenReady 内部（依赖 userData 路径）且在 consent 之后。
+  // 3) 进入主窗口流程。
+  try {
+    await _maybeShowConsentDialog();
+  } catch (e) {
+    console.warn('[telemetry] consent flow failed:', e?.message || e);
+  }
+  _initSentryMain();
+
   void openMainWindow();
 
   app.on('activate', () => {
