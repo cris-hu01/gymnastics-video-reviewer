@@ -13,6 +13,8 @@ function StatusBadgeComponent({status, size = 'sm'}: StatusBadgeProps) {
     size === 'lg' ? 'text-sm px-3 py-1.5 min-w-[5rem]' : 'text-[11px] px-2.5 py-1 min-w-[3.5rem]';
   return (
     <span
+      data-testid="clip-status-badge"
+      data-clip-status={status}
       className={`inline-flex items-center justify-center whitespace-nowrap leading-none rounded-full border font-medium shrink-0 ${sizeClass} ${clipBadgeClass(status)}`}
     >
       {statusLabel(status)}

@@ -81,11 +81,11 @@ export const ExportDialog = React.memo(function ExportDialog(props: ExportDialog
   if (!showExport) return null;
 
   return (
-    <div className="fixed inset-0 z-40 bg-gray-900/40 backdrop-blur-sm flex items-center justify-center">
+    <div data-testid="export-dialog" className="fixed inset-0 z-40 bg-gray-900/40 backdrop-blur-sm flex items-center justify-center">
       <div className="w-[520px] max-h-[min(92vh,920px)] bg-white border border-gray-100 rounded-3xl shadow-2xl flex flex-col overflow-hidden">
         <div className="shrink-0 p-5 border-b border-gray-100 flex items-center justify-between bg-white">
           <h3 className="text-lg font-semibold text-gray-900">导出与上传</h3>
-          <button onClick={() => setShowExport(false)} className="text-gray-400 hover:text-gray-600 transition-colors">
+          <button data-testid="export-close" onClick={() => setShowExport(false)} className="text-gray-400 hover:text-gray-600 transition-colors">
             <XCircle size={22} />
           </button>
         </div>
@@ -205,6 +205,7 @@ export const ExportDialog = React.memo(function ExportDialog(props: ExportDialog
             <div className="space-y-3">
               <label className="text-sm font-semibold text-gray-700">默认导出目录</label>
               <input
+                data-testid="export-output-dir"
                 type="text"
                 value={outputDir}
                 onChange={(event) => setOutputDir(event.target.value)}
@@ -363,6 +364,7 @@ export const ExportDialog = React.memo(function ExportDialog(props: ExportDialog
               关闭
             </button>
             <button
+              data-testid="export-confirm"
               onClick={onExport}
               disabled={exportTargetClipsCount === 0 || Boolean(activeExportJob)}
               className="px-5 py-2.5 rounded-xl bg-red-500 hover:bg-red-600 text-white font-medium text-sm transition-colors shadow-sm disabled:opacity-50"

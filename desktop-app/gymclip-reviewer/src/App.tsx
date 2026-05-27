@@ -2675,6 +2675,7 @@ export default function App() {
 
           <input
             ref={fileInputRef}
+            data-testid="import-file-input"
             type="file"
             accept="video/*,.mp4,.mov,.mkv,.avi,.flv,.wmv"
             multiple
@@ -2689,6 +2690,7 @@ export default function App() {
 
           <input
             ref={directClipFileInputRef}
+            data-testid="import-file-input-direct-clip"
             type="file"
             accept="video/*,.mp4,.mov,.mkv,.avi,.flv,.wmv"
             multiple
@@ -2702,6 +2704,7 @@ export default function App() {
           />
 
           <button
+            data-testid="import-trigger"
             onClick={() => void openImportSourcePicker('full_video')}
             className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium flex items-center justify-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
             disabled={isImporting}
@@ -2710,6 +2713,7 @@ export default function App() {
             {isImporting && importMode === 'full_video' ? '导入中...' : '导入原视频'}
           </button>
           <button
+            data-testid="import-trigger-direct-clip"
             onClick={() => void openImportSourcePicker('direct_clip')}
             className="w-36 h-10 px-3 py-1.5 text-sm rounded-lg bg-white hover:bg-gray-50 text-gray-700 font-medium flex items-center justify-center gap-2 whitespace-nowrap transition-colors border border-gray-200 disabled:opacity-50"
             disabled={isImporting}
@@ -2749,6 +2753,7 @@ export default function App() {
             </div>
           )}
           <button
+            data-testid="export-trigger"
             onClick={() => {
               exportApi.setExportOperation('export_and_upload');
               exportApi.setIsOssCredentialsExpanded(!hasOssCredentials);
@@ -2913,6 +2918,7 @@ export default function App() {
                         return (
                           <div
                             key={video.id}
+                            data-testid={`video-item-${video.id}`}
                             onClick={() => setActiveVideoId(video.id)}
                             onContextMenu={(event) => {
                               event.preventDefault();
@@ -2931,6 +2937,7 @@ export default function App() {
                                 title="选择该视频"
                               >
                                 <input
+                                  data-testid={`video-select-${video.id}`}
                                   type="checkbox"
                                   checked={isSelected}
                                   onClick={(event) => event.stopPropagation()}
@@ -3129,6 +3136,7 @@ export default function App() {
                           return (
                             <button
                               key={clip.id}
+                              data-testid={`clip-item-${clip.id}`}
                               onClick={(event) => handleClipCardClick(clip, event)}
                               className={`relative w-full text-left p-2.5 rounded-xl border transition-all flex gap-3 ${
                                 activeClipId === clip.id
@@ -3305,6 +3313,7 @@ export default function App() {
                     <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-6 pointer-events-none">
                       <div className="flex items-center gap-4">
                         <button
+                          data-testid="player-play-toggle"
                           onClick={togglePlayPause}
                           className="w-12 h-12 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center text-white backdrop-blur-md transition-colors pointer-events-auto"
                         >
@@ -3420,6 +3429,7 @@ export default function App() {
                             <>
                               <div
                                 data-handle-edge="left"
+                                data-testid="trim-handle-start"
                                 className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
                                 title="拖动调整起点"
                                 onPointerDown={(e) => {
@@ -3449,6 +3459,7 @@ export default function App() {
                               </div>
                               <div
                                 data-handle-edge="right"
+                                data-testid="trim-handle-end"
                                 className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
                                 title="拖动调整终点"
                                 onPointerDown={(e) => {
@@ -3510,6 +3521,7 @@ export default function App() {
                 <div className="flex items-center justify-between mb-5">
                   <div className="flex items-center gap-4">
                     <button
+                      data-testid="player-play-toggle-trim"
                       type="button"
                       onClick={() => {
                         const video = videoRef.current;
