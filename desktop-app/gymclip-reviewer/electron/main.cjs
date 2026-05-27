@@ -9,6 +9,79 @@ app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-accelerated-video-decode');
 app.commandLine.appendSwitch('enable-zero-copy');
 
+// === Sentry main-process error reporting (C-3) ===
+// DSN from env (SENTRY_DSN_ELECTRON). Empty DSN → skip init silently.
+// Init 自身失败必须降级，绝不让 Sentry 挂掉影响主应用启动。
+try {
+  const { init: initSentry, captureException } = require('@sentry/electron/main');
+  const dsn = process.env.SENTRY_DSN_ELECTRON;
+  if (dsn) {
+    initSentry({
+      dsn,
+      release: process.env.SENTRY_RELEASE || `gymclip-reviewer@${require('../package.json').version}`,
+      environment: process.env.SENTRY_ENVIRONMENT || (app.isPackaged ? 'production' : 'development'),
+      // beforeSend 占位：脱敏可能含密钥的字段
+      // TODO(C-5): 完善 PII filtering（视频绝对路径、OSS access key 等）
+      beforeSend(event) {
+        try {
+          const json = JSON.stringify(event);
+          if (/(accessKey|secret|password|token)/i.test(json)) {
+            // 简单粗暴：把所有 vars/extra 中疑似敏感字段值替换为 [Filtered]
+            const filter = (obj) => {
+              if (!obj || typeof obj !== 'object') return;
+              for (const k of Object.keys(obj)) {
+                if (/(accessKey|secret|password|token)/i.test(k)) obj[k] = '[Filtered]';
+                else if (typeof obj[k] === 'object') filter(obj[k]);
+              }
+            };
+            filter(event);
+          }
+        } catch (_) { /* 不让脱敏失败影响上报 */ }
+        return event;
+      },
+    });
+    console.log('[sentry] electron main initialized');
+    // 把全局 captureException 暴露，方便后续模块调用
+    global.__sentryCaptureException = captureException;
+  } else {
+    console.info('[sentry] SENTRY_DSN_ELECTRON empty, skipping init');
+  }
+} catch (e) {
+  console.error('[sentry] init failed (degraded gracefully):', e?.message || e);
+}
+// === end Sentry init ===
+
+// === Sentry error hooks (C-3) ===
+// 必须在 app.whenReady() 之前注册，避免启动早期异常丢失。
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(`Unhandled rejection: ${String(reason)}`);
+  console.error('[unhandledRejection]', err);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+app.on('render-process-gone', (event, webContents, details) => {
+  const err = new Error(`render-process-gone: reason=${details.reason} exitCode=${details.exitCode}`);
+  console.error('[render-process-gone]', details);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+app.on('child-process-gone', (event, details) => {
+  const err = new Error(`child-process-gone: type=${details.type} reason=${details.reason} exitCode=${details.exitCode} name=${details.name}`);
+  console.error('[child-process-gone]', details);
+  if (global.__sentryCaptureException) {
+    try { global.__sentryCaptureException(err); } catch (_) {}
+  }
+});
+// === end Sentry hooks ===
+
 const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = process.env.GYMCLIP_BACKEND_PORT || '8000';
 const RENDERER_URL = process.env.ELECTRON_RENDERER_URL || null;
