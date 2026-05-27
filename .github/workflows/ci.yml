@@ -49,3 +49,23 @@ jobs:
             desktop-app/backend/main.py \
             desktop-app/backend/video_review_backend/*.py \
             desktop-app/backend/scripts/*.py
+
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install backend deps
+        working-directory: desktop-app/backend
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run pytest
+        working-directory: desktop-app/backend
+        # Gate is intentionally below the 50% goal because routers/* and
+        # platform_client are still uncovered (D-frontend will land e2e).
+        # Bump to 50 once those land. See planning/D-coverage-followup.md.
+        run: python -m pytest tests/ --cov=video_review_backend --cov-report=term --cov-fail-under=45
