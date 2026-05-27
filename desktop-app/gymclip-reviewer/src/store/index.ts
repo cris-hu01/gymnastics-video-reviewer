@@ -23,6 +23,7 @@
  *   later, use the key `gymclip-store-v1.3.0` and bump the version on every
  *   schema change.
  */
+import { createActiveSlice, type ActiveSlice } from './active';
 import { createSelectionSlice, type SelectionSlice } from './selection';
 import { create } from 'zustand';
 
@@ -33,10 +34,11 @@ import { create } from 'zustand';
  *
  * As we migrate more state in A3/A4, add new slice types here.
  */
-export type AppStore = SelectionSlice;
+export type AppStore = SelectionSlice & ActiveSlice;
 
 export const useStore = create<AppStore>()((set, get, store) => ({
   ...createSelectionSlice(set, get, store),
+  ...createActiveSlice(set, get, store),
 }));
 
 /**

@@ -187,8 +187,13 @@ export default function App() {
   const [isToastVisible, setIsToastVisible] = useState(false);
   const [jobs, setJobs] = useState<AppJob[]>([]);
 
-  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
-  const [activeClipId, setActiveClipId] = useState<string | null>(null);
+  // A3: activeVideoId / activeClipId migrated to zustand store (see store/active.ts).
+  // Subscribe via selectors to keep referential equality with the prior useState
+  // behavior; setters come from the store directly so they're stable across renders.
+  const activeVideoId = useStore((s) => s.activeVideoId);
+  const activeClipId = useStore((s) => s.activeClipId);
+  const setActiveVideoId = useStore((s) => s.setActiveVideoId);
+  const setActiveClipId = useStore((s) => s.setActiveClipId);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
