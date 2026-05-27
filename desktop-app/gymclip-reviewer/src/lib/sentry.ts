@@ -54,10 +54,13 @@ function scrubEvent(event: Sentry.ErrorEvent): Sentry.ErrorEvent {
  * - `release` / `environment` come from `VITE_SENTRY_RELEASE` /
  *   `VITE_SENTRY_ENVIRONMENT`, with safe fallbacks.
  * - `beforeSend` invokes the placeholder PII scrubber (see `scrubEvent`).
- * - `anonymousUserId` cross-tier correlation is intentionally deferred to
- *   C-5: the Electron preload bridge (`window.gymclipDesktop`) does not yet
- *   expose an `anonymousUserId`, so we set the user context to undefined now
- *   and will wire it through in C-5.
+ * - Anonymous `userId` wiring (C-5): init runs synchronously (so it's in
+ *   place before `ReactDOM.createRoot`), then we fire-and-forget query the
+ *   Electron preload bridge for the persisted `{userId, telemetryEnabled}`.
+ *   - If `telemetryEnabled === false`, we immediately `Sentry.close()` to
+ *     respect the user's opt-out without delaying React mount.
+ *   - Otherwise we attach `Sentry.setUser({ id: userId })` so renderer
+ *     events share the same anonymous identity as main + backend.
  */
 export function initSentry(): void {
   try {
@@ -87,9 +90,31 @@ export function initSentry(): void {
       beforeSend: (event) => scrubEvent(event as Sentry.ErrorEvent),
     });
 
-    // anonymousUserId wiring is deferred to C-5; the Electron preload bridge
-    // does not yet expose it. When that lands, call Sentry.setUser({ id }).
-    Sentry.setUser(null);
+    // Cross-tier anonymous user.id (C-5): fire-and-forget — never block React.
+    // 在 Electron 环境下通过 preload bridge 拿持久化的 telemetry config；
+    // 在浏览器环境下 (`window.gymclipDesktop` 不存在) 直接保持匿名。
+    if (typeof window !== 'undefined' && window.gymclipDesktop?.getTelemetryConfig) {
+      window.gymclipDesktop
+        .getTelemetryConfig()
+        .then((cfg) => {
+          if (!cfg.telemetryEnabled) {
+            // eslint-disable-next-line no-console
+            console.info('[sentry] renderer: telemetry opt-out, closing client.');
+            Sentry.close(2000);
+            return;
+          }
+          if (cfg.userId) {
+            Sentry.setUser({ id: cfg.userId });
+          }
+        })
+        .catch(() => {
+          // 静默：preload bridge 读取失败不应影响应用主流程，
+          // 保持匿名上报降级即可。
+        });
+    } else {
+      // 浏览器环境（无 Electron bridge）：保持匿名。
+      Sentry.setUser(null);
+    }
   } catch (err) {
     // Sentry initialization must never crash the host app — swallow and log.
     // eslint-disable-next-line no-console

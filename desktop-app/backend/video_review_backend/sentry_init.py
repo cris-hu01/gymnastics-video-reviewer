@@ -43,6 +43,15 @@ def _filter_sensitive(event: dict[str, Any], _hint: dict[str, Any]) -> dict[str,
 
 
 def init_sentry() -> None:
+    # C-5: 用户在 Electron 端选择不上报时，Electron spawn 会传入
+    # GYMCLIP_TELEMETRY_ENABLED=0；后端在此尊重该选择，直接跳过 init。
+    telemetry_enabled = os.environ.get("GYMCLIP_TELEMETRY_ENABLED", "1") != "0"
+    if not telemetry_enabled:
+        logger.info(
+            "[sentry] backend: telemetry opt-out (GYMCLIP_TELEMETRY_ENABLED=0), skip init"
+        )
+        return
+
     dsn = os.environ.get("SENTRY_DSN_BACKEND", "").strip()
     if not dsn:
         logger.info("[sentry] SENTRY_DSN_BACKEND empty, skipping init")
@@ -64,10 +73,15 @@ def init_sentry() -> None:
             # 不开 traces / profiling，先只做错误捕获
             traces_sample_rate=0.0,
         )
+        # C-5: 三端共享同一匿名 user.id —— Electron 主进程通过 spawn env 注入
+        user_id = os.environ.get("GYMCLIP_USER_ID", "").strip()
+        if user_id:
+            sentry_sdk.set_user({"id": user_id})
         logger.info(
-            "[sentry] backend initialized (release=%s, env=%s)",
+            "[sentry] backend initialized (release=%s, env=%s, user=%s)",
             os.environ.get("SENTRY_RELEASE") or "unknown",
             os.environ.get("SENTRY_ENVIRONMENT") or "development",
+            (user_id[:8] + "...") if user_id else "anonymous",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[sentry] init failed (degraded gracefully): %s", exc)

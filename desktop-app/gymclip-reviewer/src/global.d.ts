@@ -17,6 +17,9 @@ declare global {
       selectDirectory: (initialPath?: string) => Promise<string | null>;
       selectImportSources: (initialPath?: string) => Promise<Array<{ path: string; name: string; size: number }>>;
       showSystemNotification: (payload: { title: string; subtitle?: string; body?: string }) => Promise<{ shown: boolean; reason?: string }>;
+      // === Telemetry / Sentry consent (C-5) ===
+      getTelemetryConfig: () => Promise<{ userId: string; telemetryEnabled: boolean }>;
+      setTelemetryConsent: (enabled: boolean) => Promise<{ userId: string; telemetryEnabled: boolean }>;
     };
   }
 }
