@@ -66,6 +66,31 @@ import type {
   ThumbnailFrame,
   VideoStatus,
 } from './types';
+import {
+  categoryLabel,
+  clipBadgeClass,
+  extractOutputDirectoryLabel,
+  firstDisplayText,
+  formatClock,
+  formatDuration,
+  formatNotificationCount,
+  formatNotificationResultSummary,
+  formatNotificationTargetCount,
+  formatScopeFolderLabel,
+  formatScoreValue,
+  formatSpeed,
+  formatSportItemLabel,
+  getExportQueueStatusLabel,
+  hashString,
+  parseSportKey,
+  pipelineToneClass,
+  primaryScoreValue,
+  scoreFormulaLabel,
+  statusLabel,
+  truncateNotificationText,
+  videoStatusClass,
+  videoStatusLabel,
+} from './lib/format';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
@@ -265,40 +290,6 @@ function summarizeExportJob(job: AppJob, fallbackOutputDir: string): ExportJobSu
   };
 }
 
-function formatNotificationCount(label: string, completed: number, total: number): string {
-  if (total > 0) {
-    return `${label}：${completed}/${total}`;
-  }
-  return `${label}：${completed}`;
-}
-
-function truncateNotificationText(value: string, maxLength = 96): string {
-  const trimmed = value.trim();
-  if (trimmed.length <= maxLength) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-}
-
-function formatNotificationTargetCount(count: number): string {
-  return `目标片段：${count}`;
-}
-
-function formatNotificationResultSummary(summary: ExportJobSummary): string {
-  if (summary.failed > 0) {
-    return `部分完成，失败 ${summary.failed}`;
-  }
-  return '全部完成';
-}
-
-function extractOutputDirectoryLabel(outputDirectory: string): string {
-  const trimmed = outputDirectory.trim().replace(/[\\/]+$/, '');
-  if (!trimmed) return '';
-  const segments = trimmed.split(/[\\/]/).filter(Boolean);
-  const folderName = segments[segments.length - 1] || trimmed;
-  return truncateNotificationText(folderName, 28);
-}
-
 function buildExportCompletedNotification(summary: ExportJobSummary): DesktopNotificationPayload {
   const title = summary.failed > 0
     ? `${EXPORT_OPERATION_DETAILS[summary.operation].label}完成（部分失败）`
@@ -380,53 +371,6 @@ function saveBrowserUploadSettings(uploadParallelFiles: number, uploadPartThread
   }
 }
 
-function firstDisplayText(...values: Array<string | null | undefined>): string {
-  for (const value of values) {
-    const text = value?.trim();
-    if (text) return text;
-  }
-  return '';
-}
-
-function formatDuration(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--:--';
-  const totalSeconds = Math.max(0, Math.floor(value));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {
-    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-  }
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function formatBytes(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let size = Math.max(0, value);
-  let unitIndex = 0;
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex += 1;
-  }
-  const precision = unitIndex === 0 ? 0 : size >= 10 ? 1 : 2;
-  return `${size.toFixed(precision)} ${units[unitIndex]}`;
-}
-
-function formatSpeed(value?: number | null): string {
-  if (value == null || Number.isNaN(value) || value <= 0) return '--';
-  return `${formatBytes(value)}/s`;
-}
-
-function formatClock(value?: number | null): string {
-  if (value == null || Number.isNaN(value)) return '--:--:--';
-  const totalSeconds = Math.max(0, value);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${seconds.toFixed(1).padStart(4, '0')}`;
-}
-
 function toUploadItem(value: unknown): ExportUploadItem | null {
   if (!value || typeof value !== 'object') return null;
   const item = value as Record<string, unknown>;
@@ -467,128 +411,11 @@ function getJobTargetClipIds(job: AppJob | null): string[] {
     .filter((item) => item.length > 0);
 }
 
-function getExportQueueStatusLabel(job: AppJob | null): string {
-  const operation = String(job?.progress.operation || 'export_and_upload') as ExportOperation;
-  return operation === 'upload_only' ? '上传队列中' : '导出队列中';
-}
-
-function statusLabel(status: ClipStatus | VideoStatus): string {
-  switch (status) {
-    case 'pending':
-      return '待审';
-    case 'kept':
-      return '保留';
-    case 'deleted':
-      return '已删';
-    case 'exported':
-      return '已导出';
-    case 'queued':
-      return '待处理';
-    case 'detecting':
-      return '检测中';
-    case 'no_candidates':
-      return '无候选';
-    case 'ready_for_review':
-      return '待审核';
-    case 'reviewing':
-      return '审核中';
-    case 'done':
-      return '已完成';
-    case 'error':
-      return '异常';
-    default:
-      return status;
-  }
-}
-
-function clipBadgeClass(status: ClipStatus): string {
-  switch (status) {
-    case 'kept':
-      return 'bg-green-50 text-green-700 border-green-200';
-    case 'deleted':
-      return 'bg-red-50 text-red-700 border-red-200';
-    case 'exported':
-      return 'bg-sky-50 text-sky-700 border-sky-200';
-    case 'pending':
-    default:
-      return 'bg-amber-50 text-amber-700 border-amber-200';
-  }
-}
-
-function videoStatusClass(status: VideoStatus, sourceKind: SourceKind = 'full_video'): string {
-  if (sourceKind === 'direct_clip') {
-    switch (status) {
-      case 'error':
-        return 'text-red-500';
-      case 'done':
-      case 'reviewing':
-        return 'text-green-600';
-      default:
-        return 'text-sky-500';
-    }
-  }
-  switch (status) {
-    case 'detecting':
-      return 'text-orange-500';
-    case 'error':
-      return 'text-red-500';
-    case 'no_candidates':
-      return 'text-slate-500';
-    case 'done':
-      return 'text-green-600';
-    default:
-      return 'text-red-500';
-  }
-}
-
-function videoStatusLabel(video: ProjectState['videos'][number]): string {
-  if (video.source_kind === 'direct_clip') {
-    if (video.status === 'error') return '异常';
-    if (video.status === 'done') return '已完成';
-    return '已就绪';
-  }
-  return statusLabel(video.status);
-}
-
-function categoryLabel(value: string | null | undefined): string {
-  if (!value) return '未选择';
-  return CATEGORY_OPTIONS.find((item) => item.value === value)?.label ?? value;
-}
-
-function compactJoin(values: string[], maxVisible: number = 2): string {
-  const filtered = values.filter((value) => value.trim().length > 0);
-  if (filtered.length <= maxVisible) {
-    return filtered.join(' / ');
-  }
-  return `${filtered.slice(0, maxVisible).join(' / ')} 等 ${filtered.length} 项`;
-}
-
-function formatScopeFolderLabel(scope: PlatformScope | null): string {
-  if (!scope) return '已有片段';
-  const matchNames = Array.from(
-    new Set(scope.query_groups.map((query) => query.match_name).filter((value) => value.trim().length > 0)),
-  );
-  const venues = Array.from(
-    new Set(scope.query_groups.flatMap((query) => query.venues).filter((value) => value.trim().length > 0)),
-  );
-  const matchText = matchNames.length > 0 ? compactJoin(matchNames, 1) : '已有片段';
-  const venueText = venues.length > 0 ? compactJoin(venues, 2) : '';
-  return venueText ? `${matchText} · ${venueText}` : matchText;
-}
-
 function normalizeCategory(value: string | null | undefined): PlatformCategory | '' {
   if (value === 'EF' || value === 'AA' || value === 'TF' || value === 'QF') {
     return value;
   }
   return '';
-}
-
-function formatSportItemLabel(id: number | null | undefined, sex?: number | null): string {
-  if (id == null) return '--';
-  const base = SPORT_ITEM_LABELS[id] ?? String(id);
-  if (sex === 1) return `男子${base}`;
-  if (sex === 2) return `女子${base}`;
-  return base;
 }
 
 function stripFileExtension(fileName: string): string {
@@ -628,14 +455,6 @@ function sportKey(sex: number, sportItemId: number): string {
   return `${sex}:${sportItemId}`;
 }
 
-function parseSportKey(value: string): {sex: number; sportItemId: number} | null {
-  const [rawSex, rawSportItemId] = value.split(':');
-  const sex = Number(rawSex);
-  const sportItemId = Number(rawSportItemId);
-  if (![1, 2].includes(sex) || Number.isNaN(sportItemId)) return null;
-  return {sex, sportItemId};
-}
-
 function toggleSportKey(current: string[], next: string): string[] {
   return current.includes(next)
     ? current.filter((item) => item !== next)
@@ -665,96 +484,6 @@ function deriveSelectionFromVenue(venue: string): VenueDerivedSelection {
     }
   }
   return {sex, sportItemId: null};
-}
-
-function firstNonEmptyScore(...values: Array<unknown>): string | null {
-  for (const value of values) {
-    if (value == null) continue;
-    const text = String(value).trim();
-    if (text) return text;
-  }
-  return null;
-}
-
-function parseNumericScore(value: unknown): number | null {
-  if (value == null) return null;
-  const text = String(value).trim();
-  if (!text) return null;
-  const direct = Number(text);
-  if (Number.isFinite(direct)) return direct;
-  const match = text.match(/[+-]?\d+(?:\.\d+)?/);
-  if (!match) return null;
-  const parsed = Number(match[0]);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatScoreValue(value: string | null | undefined): string {
-  const text = value?.trim();
-  if (!text) return '--';
-  const numeric = parseNumericScore(text);
-  if (!Number.isFinite(numeric)) return '--';
-  return numeric.toFixed(3);
-}
-
-function deriveDisplayedScore(record: PlatformRecord): string {
-  if (record.sport_item_id === 3) {
-    const singleScore = parseNumericScore(record.single_score);
-    if (singleScore != null) return singleScore.toFixed(3);
-    const difficulty = parseNumericScore(record.difficulty_score);
-    const execution = parseNumericScore(record.execution_score);
-    if (difficulty != null && execution != null) {
-      const bonus = parseNumericScore(record.bonus_score) ?? 0;
-      const penalty = parseNumericScore(record.penalty_score) ?? 0;
-      return (difficulty + execution + bonus + penalty).toFixed(3);
-    }
-    return '--';
-  }
-  const totalScore = parseNumericScore(record.total_score);
-  if (totalScore != null) return totalScore.toFixed(3);
-  const singleScore = parseNumericScore(record.single_score);
-  if (singleScore != null) return singleScore.toFixed(3);
-  return '--';
-}
-
-function formatScoreExpression(values: string[]): string {
-  return values.reduce((result, value, index) => {
-    if (index === 0) return value;
-    return /^[+-]/.test(value) ? `${result}${value}` : `${result}+${value}`;
-  }, '');
-}
-
-function isZeroScore(value: string): boolean {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric === 0;
-}
-
-function scoreFormulaLabel(record: PlatformRecord): string {
-  const rawRecord = (record.raw_record ?? {}) as Record<string, unknown>;
-  const d = firstNonEmptyScore(record.difficulty_score, rawRecord.difficultyScore, rawRecord.difficulty_score) ?? '0';
-  const e = firstNonEmptyScore(record.execution_score, rawRecord.executionScore, rawRecord.execution_score) ?? '0';
-  const b = firstNonEmptyScore(record.bonus_score, rawRecord.bscore, rawRecord.bonusScore, rawRecord.bonus_score) ?? '0';
-  const p = firstNonEmptyScore(record.penalty_score, rawRecord.penaltyScore, rawRecord.penalty_score) ?? '0';
-  const total = deriveDisplayedScore(record);
-  const parts = [d, e];
-  if (!isZeroScore(b)) {
-    parts.push(b);
-  }
-  if (!isZeroScore(p)) {
-    parts.push(p);
-  }
-  return `${formatScoreExpression(parts.map((value) => formatScoreValue(value)))}=${formatScoreValue(total)}`;
-}
-
-function primaryScoreValue(record: PlatformRecord): string {
-  return deriveDisplayedScore(record);
-}
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
-  }
-  return hash;
 }
 
 function bindingTheme(recordId: string) {
@@ -904,22 +633,6 @@ function getClipFailureStage(clip: CandidateClip): 'export' | 'oss' | 'platform'
   if (clip.uploaded_url) return 'platform';
   if (clip.linked_platform_record_id) return 'oss';
   return 'export';
-}
-
-function pipelineToneClass(tone: PipelineTone): string {
-  switch (tone) {
-    case 'success':
-      return 'bg-green-50 text-green-700 border-green-200';
-    case 'warning':
-      return 'bg-amber-50 text-amber-700 border-amber-200';
-    case 'danger':
-      return 'bg-red-50 text-red-700 border-red-200';
-    case 'muted':
-      return 'bg-slate-100 text-slate-500 border-slate-200';
-    case 'neutral':
-    default:
-      return 'bg-gray-100 text-gray-600 border-gray-200';
-  }
 }
 
 function getClipPipelineBadges(
@@ -1099,15 +812,6 @@ function cloneCandidateClips(clips: CandidateClip[]): CandidateClip[] {
     ...clip,
     segments: clip.segments.map((segment) => ({...segment})),
   }));
-}
-
-function selectionSummaryLabel(selectionKeys: string[]): string {
-  if (selectionKeys.length === 0) return '未选择项目';
-  return selectionKeys
-    .map((key) => parseSportKey(key))
-    .filter((item): item is {sex: number; sportItemId: number} => item != null)
-    .map((item) => formatSportItemLabel(item.sportItemId, item.sex))
-    .join(' / ');
 }
 
 function StatusBadge({
