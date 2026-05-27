@@ -91,6 +91,24 @@ import {
   videoStatusClass,
   videoStatusLabel,
 } from './lib/format';
+import {
+  bindingTheme,
+  coerceRecordSex,
+  deriveSexFromSelectionKeys,
+  deriveSexFromSportItemId,
+  deriveSexFromText,
+  getClipDisplayCountry,
+  getClipDisplayName,
+  getClipFailureStage,
+  getClipPipelineBadges,
+  getClipRuntimeStatusText,
+  getClipSearchText,
+  getClipUploadItem,
+  getJobTargetClipIds,
+  getJobUploadItems,
+  getResolvedPlatformRecordSex,
+  isClipExportSelectable,
+} from './lib/filters';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
@@ -389,28 +407,6 @@ function toUploadItem(value: unknown): ExportUploadItem | null {
   };
 }
 
-function getJobUploadItems(job: AppJob | null): ExportUploadItem[] {
-  if (!job) return [];
-  const rawItems = (job.progress as Record<string, unknown>).upload_items;
-  if (!Array.isArray(rawItems)) return [];
-  return rawItems
-    .map((item) => toUploadItem(item))
-    .filter((item): item is ExportUploadItem => item != null);
-}
-
-function getClipUploadItem(job: AppJob | null, clipId: string): ExportUploadItem | null {
-  return getJobUploadItems(job).find((item) => item.clip_id === clipId) ?? null;
-}
-
-function getJobTargetClipIds(job: AppJob | null): string[] {
-  if (!job) return [];
-  const rawTargetClipIds = (job.progress as Record<string, unknown>).target_clip_ids;
-  if (!Array.isArray(rawTargetClipIds)) return [];
-  return rawTargetClipIds
-    .map((item) => String(item || '').trim())
-    .filter((item) => item.length > 0);
-}
-
 function normalizeCategory(value: string | null | undefined): PlatformCategory | '' {
   if (value === 'EF' || value === 'AA' || value === 'TF' || value === 'QF') {
     return value;
@@ -486,27 +482,12 @@ function deriveSelectionFromVenue(venue: string): VenueDerivedSelection {
   return {sex, sportItemId: null};
 }
 
-function bindingTheme(recordId: string) {
-  const hue = hashString(recordId) % 360;
-  return {
-    accent: `hsl(${hue} 72% 46%)`,
-    accentSoft: `hsla(${hue}, 85%, 94%, 1)`,
-    accentStrong: `hsla(${hue}, 90%, 90%, 1)`,
-    border: `hsla(${hue}, 62%, 72%, 1)`,
-    text: `hsl(${hue} 55% 32%)`,
-  };
-}
-
 function orderedSegments(clip: CandidateClip): ClipSegment[] {
   return [...clip.segments].sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
 }
 
 function clipEffectiveDuration(clip: CandidateClip): number {
   return orderedSegments(clip).reduce((total, segment) => total + Math.max(0, segment.end - segment.start), 0);
-}
-
-function isClipExportSelectable(status: ClipStatus): boolean {
-  return status === 'kept' || status === 'exported';
 }
 
 function isDirectSourceUploadEligible(
@@ -535,247 +516,6 @@ function getUploadOnlySourceMode(
   if (clip.exported_path) return 'exported_file';
   if (isDirectSourceUploadEligible(clip, video)) return 'direct_source';
   return 'invalid';
-}
-
-function getClipDisplayName(
-  clip: CandidateClip,
-  linkedRecord?: PlatformRecord | null,
-  video?: ProjectState['videos'][number] | null,
-): string {
-  return firstDisplayText(
-    linkedRecord?.english_name,
-    linkedRecord?.user_name,
-    clip.athlete_name,
-    video?.source_kind === 'direct_clip' ? stripFileExtension(video.file_name) : '',
-  ) || '未识别';
-}
-
-function getClipDisplayCountry(clip: CandidateClip, linkedRecord?: PlatformRecord | null): string {
-  return firstDisplayText(linkedRecord?.country, clip.country) || '--';
-}
-
-function coerceRecordSex(value: unknown): number | null {
-  if (value === 1 || value === 2) return value;
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (trimmed === '1' || trimmed === '男' || trimmed === '男子' || trimmed.toUpperCase() === 'M') return 1;
-    if (trimmed === '2' || trimmed === '女' || trimmed === '女子' || trimmed.toUpperCase() === 'W') return 2;
-  }
-  return null;
-}
-
-function deriveSexFromText(...values: Array<string | null | undefined>): number | null {
-  const merged = values.join('');
-  if (merged.includes('男子') || merged.includes('男')) return 1;
-  if (merged.includes('女子') || merged.includes('女')) return 2;
-  return null;
-}
-
-function deriveSexFromSelectionKeys(selectionKeys: string[], sportItemId: number | null | undefined): number | null {
-  if (sportItemId == null) return null;
-  const matched = new Set<number>();
-  selectionKeys.forEach((key) => {
-    const parsed = parseSportKey(key);
-    if (!parsed || parsed.sportItemId !== sportItemId) return;
-    matched.add(parsed.sex);
-  });
-  if (matched.size === 1) return Array.from(matched)[0];
-  return null;
-}
-
-function deriveSexFromSportItemId(sportItemId: number | null | undefined): number | null {
-  if (sportItemId == null) return null;
-  if ([1, 2, 4, 5].includes(sportItemId)) return 1;
-  if ([6, 7].includes(sportItemId)) return 2;
-  return null;
-}
-
-function getResolvedPlatformRecordSex(
-  record: PlatformRecord,
-  video?: ProjectState['videos'][number] | null,
-): number | null {
-  const explicitSex = coerceRecordSex(record.sex) ?? coerceRecordSex(record.raw_record?.sex) ?? coerceRecordSex(video?.sex);
-  if (explicitSex != null) return explicitSex;
-  const fromSelection = deriveSexFromSelectionKeys(video?.sport_selection_keys ?? [], record.sport_item_id);
-  if (fromSelection != null) return fromSelection;
-  const fromText = deriveSexFromText(
-    record.venue,
-    typeof record.raw_record?.venue === 'string' ? record.raw_record.venue : '',
-    video?.venue ?? '',
-    ...(video?.venues ?? []),
-  );
-  if (fromText != null) return fromText;
-  return deriveSexFromSportItemId(record.sport_item_id);
-}
-
-function getClipSearchText(
-  clip: CandidateClip,
-  linkedRecord?: PlatformRecord | null,
-  video?: ProjectState['videos'][number] | null,
-): string {
-  return [
-    getClipDisplayName(clip, linkedRecord, video),
-    linkedRecord?.english_name ?? '',
-    linkedRecord?.user_name ?? '',
-    clip.athlete_name,
-    getClipDisplayCountry(clip, linkedRecord),
-    clip.country,
-    video?.file_name ?? '',
-    video ? stripFileExtension(video.file_name) : '',
-  ]
-    .join(' ')
-    .toLowerCase();
-}
-
-function getClipFailureStage(clip: CandidateClip): 'export' | 'oss' | 'platform' | null {
-  if (clip.platform_sync_status !== 'failed') return null;
-  if (!clip.exported_path) return 'export';
-  if (clip.uploaded_url) return 'platform';
-  if (clip.linked_platform_record_id) return 'oss';
-  return 'export';
-}
-
-function getClipPipelineBadges(
-  clip: CandidateClip,
-  options: {
-    linkedRecord: PlatformRecord | null;
-    activeExportJob: AppJob | null;
-    lockedExportClipIdSet: ReadonlySet<string>;
-  },
-): ClipPipelineBadgeItem[] {
-  const {activeExportJob, lockedExportClipIdSet} = options;
-  const uploadItem = getClipUploadItem(activeExportJob, clip.id);
-  const activeJobClipId = String(activeExportJob?.progress.clip_id || '');
-  const activeStage = activeJobClipId === clip.id ? String(activeExportJob?.progress.stage || '') : '';
-  if (activeStage === 'local_export') {
-    return [
-      {key: 'export', text: '导出中', tone: 'warning'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (uploadItem?.stage === 'oss_upload' || activeStage === 'oss_upload') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {
-        key: 'oss',
-        text: uploadItem && uploadItem.percent > 0 ? `OSS ${Math.round(uploadItem.percent)}%` : 'OSS 上传中',
-        tone: 'warning',
-      },
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (uploadItem?.stage === 'platform_callback' || activeStage === 'platform_callback') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 上传中', tone: 'warning'},
-    ];
-  }
-  if (uploadItem?.stage === 'queued') {
-    return [
-      {key: 'export', text: clip.exported_path ? '已导出' : getExportQueueStatusLabel(activeExportJob), tone: clip.exported_path ? 'success' : 'warning'},
-      {key: 'oss', text: 'OSS 排队中', tone: 'warning'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-  if (lockedExportClipIdSet.has(clip.id)) {
-    return [
-      {key: 'export', text: getExportQueueStatusLabel(activeExportJob), tone: 'warning'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  const failureStage = getClipFailureStage(clip);
-  if (failureStage === 'export') {
-    return [
-      {key: 'export', text: '导出失败', tone: 'danger'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (!clip.exported_path) {
-    return [
-      {key: 'export', text: '未导出', tone: 'neutral'},
-      {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (failureStage === 'oss') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 上传失败', tone: 'danger'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  if (failureStage === 'platform') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 上传失败', tone: 'danger'},
-    ];
-  }
-
-  if (clip.platform_sync_status === 'synced') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 已上传', tone: 'success'},
-    ];
-  }
-
-  if (clip.uploaded_url || clip.platform_sync_status === 'uploading_done') {
-    return [
-      {key: 'export', text: '已导出', tone: 'success'},
-      {key: 'oss', text: 'OSS 已上传', tone: 'success'},
-      {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-    ];
-  }
-
-  return [
-    {key: 'export', text: '已导出', tone: 'success'},
-    {key: 'oss', text: 'OSS 未上传', tone: 'neutral'},
-    {key: 'platform', text: '平台 未上传', tone: 'neutral'},
-  ];
-}
-
-function getClipRuntimeStatusText(
-  clip: CandidateClip,
-  activeExportJob: AppJob | null,
-  lockedExportClipIdSet: ReadonlySet<string>,
-): string | null {
-  const uploadItem = getClipUploadItem(activeExportJob, clip.id);
-  const activeJobClipId = String(activeExportJob?.progress.clip_id || '');
-  const activeStage = activeJobClipId === clip.id ? String(activeExportJob?.progress.stage || '') : '';
-  if (activeStage === 'local_export') {
-    return '本地导出中';
-  }
-  if (!uploadItem) {
-    return lockedExportClipIdSet.has(clip.id) ? `${getExportQueueStatusLabel(activeExportJob)}（只读）` : null;
-  }
-  if (uploadItem.stage === 'oss_upload') {
-    if (uploadItem.bytes_sent <= 0 || uploadItem.percent <= 0 || uploadItem.speed_bps <= 0) {
-      return '等待上传';
-    }
-    return `OSS ${Math.round(uploadItem.percent)}% · ${formatSpeed(uploadItem.speed_bps)}`;
-  }
-  if (uploadItem.stage === 'platform_callback') {
-    return '平台回写中';
-  }
-  if (uploadItem.stage === 'failed') {
-    return uploadItem.error_message || '上传失败';
-  }
-  if (uploadItem.stage === 'completed') {
-    return '上传完成';
-  }
-  if (uploadItem.stage === 'queued') {
-    return '等待上传（只读）';
-  }
-  return null;
 }
 
 function normalizeSegments(
