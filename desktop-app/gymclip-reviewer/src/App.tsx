@@ -13,7 +13,6 @@ import {
   Filter,
   FolderOpen,
   Key,
-  Minus,
   Pause,
   Play,
   RefreshCw,
@@ -68,7 +67,6 @@ import type {
 } from './types';
 import {
   categoryLabel,
-  clipBadgeClass,
   extractOutputDirectoryLabel,
   firstDisplayText,
   formatClock,
@@ -139,7 +137,6 @@ import {
   saveBrowserDefaultExportDirectory,
   saveBrowserUploadSettings,
   sportKey,
-  stopFormShortcutPropagation,
   stripFileExtension,
   toggleSportKey,
 } from './lib/utils';
@@ -152,6 +149,11 @@ import type {
   PendingImportVideo,
 } from './lib/utils';
 import { useStore } from './store';
+import { StatusBadge } from './components/StatusBadge';
+import { TriStateCheckboxButton } from './components/TriStateCheckboxButton';
+import { ScoreFilterDropdown } from './components/ScoreFilterDropdown';
+import type { ScoreFilterMenu } from './components/ScoreFilterDropdown';
+import { LocalCardInlineForm } from './components/LocalCardInlineForm';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
@@ -174,11 +176,6 @@ type ApparatusOption = {
   label: string;
 };
 
-type ScoreFilterMenu = 'apparatus' | 'sex' | 'country';
-type ScoreFilterOption = {
-  value: string;
-  label: string;
-};
 type PipelineTone = 'neutral' | 'muted' | 'success' | 'warning' | 'danger';
 type ClipPipelineBadgeItem = {
   key: 'export' | 'oss' | 'platform';
@@ -255,309 +252,6 @@ const EXPORT_MODE_DETAILS: Record<ExportMode, {label: string; description: strin
     description: '更快导出，但压缩效率更低，文件通常更大。',
   },
 };
-function StatusBadge({
-  status,
-  size = 'sm',
-}: {
-  status: ClipStatus;
-  size?: 'sm' | 'lg';
-}) {
-  const sizeClass = size === 'lg' ? 'text-sm px-3 py-1.5 min-w-[5rem]' : 'text-[11px] px-2.5 py-1 min-w-[3.5rem]';
-  return (
-    <span className={`inline-flex items-center justify-center whitespace-nowrap leading-none rounded-full border font-medium shrink-0 ${sizeClass} ${clipBadgeClass(status)}`}>
-      {statusLabel(status)}
-    </span>
-  );
-}
-
-function TriStateCheckboxButton({
-  state,
-  disabled = false,
-  onClick,
-  title,
-}: {
-  state: 'checked' | 'indeterminate' | 'unchecked';
-  disabled?: boolean;
-  onClick: () => void;
-  title: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className={`flex h-4 w-4 items-center justify-center rounded border transition-colors ${
-        disabled
-          ? 'cursor-not-allowed border-gray-200 bg-gray-100 text-gray-300'
-          : state === 'unchecked'
-            ? 'border-gray-300 bg-white text-gray-500 hover:border-gray-400'
-            : 'border-red-200 bg-red-50 text-red-600 hover:border-red-300'
-      }`}
-    >
-      {state === 'checked' && <Check size={11} strokeWidth={3} />}
-      {state === 'indeterminate' && <Minus size={11} strokeWidth={3} />}
-    </button>
-  );
-}
-
-function ScoreFilterDropdown({
-  id,
-  placeholder,
-  allLabel,
-  value,
-  options,
-  openFilter,
-  onToggle,
-  onChange,
-}: {
-  id: ScoreFilterMenu;
-  placeholder: string;
-  allLabel: string;
-  value: string;
-  options: ScoreFilterOption[];
-  openFilter: ScoreFilterMenu | null;
-  onToggle: (next: ScoreFilterMenu | null) => void;
-  onChange: (nextValue: string) => void;
-}) {
-  const isOpen = openFilter === id;
-  const selectedLabel = value === 'all'
-    ? placeholder
-    : options.find((option) => option.value === value)?.label ?? placeholder;
-
-  return (
-    <div data-score-filter-root className="relative">
-      <button
-        type="button"
-        onClick={() => onToggle(isOpen ? null : id)}
-        className="flex w-full min-w-[5.8rem] items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm transition-colors hover:border-gray-300"
-      >
-        <span className="truncate">{selectedLabel}</span>
-        <ChevronDown size={14} className={`shrink-0 text-gray-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
-      </button>
-      {isOpen && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-xl">
-          <div className="max-h-64 overflow-y-auto py-1">
-            <button
-              type="button"
-              onClick={() => {
-                onChange('all');
-                onToggle(null);
-              }}
-              className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors ${
-                value === 'all' ? 'bg-red-50 text-red-600' : 'text-gray-700 hover:bg-gray-50'
-              }`}
-            >
-              {allLabel}
-            </button>
-            {options.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => {
-                  onChange(option.value);
-                  onToggle(null);
-                }}
-                className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors ${
-                  value === option.value ? 'bg-red-50 text-red-600' : 'text-gray-700 hover:bg-gray-50'
-                }`}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-const LOCAL_CARD_SPORT_OPTIONS: Array<{value: string; label: string}> = Object.entries(SPORT_ITEM_LABELS).map(
-  ([id, label]) => ({value: id, label: `${label} (${id})`}),
-);
-
-type LocalCardInlineFormProps = {
-  form: LocalCardFormState;
-  setForm: (updater: (prev: LocalCardFormState) => LocalCardFormState) => void;
-  onSave: () => void;
-  onCancel: () => void;
-  saving: boolean;
-  title: string;
-  onDelete?: () => void;
-  nameSuggestions?: string[];
-};
-
-const LOCAL_CARD_NAME_DATALIST_ID = 'local-card-name-suggestions';
-
-function LocalCardInlineForm({
-  form,
-  setForm,
-  onSave,
-  onCancel,
-  saving,
-  title,
-  onDelete,
-  nameSuggestions,
-}: LocalCardInlineFormProps) {
-  const autoTotal = computeLocalCardAutoTotal(form);
-  const totalDisplay = form.total_overridden && form.total_score.trim() !== '' ? form.total_score : autoTotal;
-  return (
-    <div
-      className="rounded-2xl border border-amber-300 bg-amber-50/70 p-3 shadow-sm space-y-2.5"
-      onKeyDown={stopFormShortcutPropagation}
-    >
-      {nameSuggestions && nameSuggestions.length > 0 && (
-        <datalist id={LOCAL_CARD_NAME_DATALIST_ID}>
-          {nameSuggestions.map((name) => (
-            <option key={name} value={name} />
-          ))}
-        </datalist>
-      )}
-      <div className="flex items-center justify-between">
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-200/70 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
-          本地补录
-        </span>
-        <span className="text-[11px] text-amber-700">{title}</span>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <label className="block text-[11px] text-amber-900">
-          姓名 *
-          <input
-            type="text"
-            value={form.user_name}
-            onChange={(event) => setForm((prev) => ({...prev, user_name: event.target.value}))}
-            list={nameSuggestions && nameSuggestions.length > 0 ? LOCAL_CARD_NAME_DATALIST_ID : undefined}
-            autoComplete="off"
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          英文名
-          <input
-            type="text"
-            value={form.english_name}
-            onChange={(event) => setForm((prev) => ({...prev, english_name: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          国家
-          <input
-            type="text"
-            value={form.country}
-            onChange={(event) => setForm((prev) => ({...prev, country: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          项目 *
-          <select
-            value={form.sport_item_id}
-            onChange={(event) => setForm((prev) => ({...prev, sport_item_id: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          >
-            <option value="">-- 选择 --</option>
-            {LOCAL_CARD_SPORT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="grid grid-cols-4 gap-2">
-        <label className="block text-[11px] text-amber-900">
-          难度 D
-          <input
-            type="number"
-            step="0.1"
-            value={form.difficulty_score}
-            onChange={(event) => setForm((prev) => ({...prev, difficulty_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          执行 E
-          <input
-            type="number"
-            step="0.1"
-            value={form.execution_score}
-            onChange={(event) => setForm((prev) => ({...prev, execution_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          加点
-          <input
-            type="number"
-            step="0.1"
-            value={form.bonus_score}
-            onChange={(event) => setForm((prev) => ({...prev, bonus_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-        <label className="block text-[11px] text-amber-900">
-          扣分
-          <input
-            type="number"
-            step="0.1"
-            value={form.penalty_score}
-            onChange={(event) => setForm((prev) => ({...prev, penalty_score: event.target.value}))}
-            className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-        </label>
-      </div>
-      <label className="block text-[11px] text-amber-900">
-        总分 {!form.total_overridden && <span className="text-[10px] text-amber-700">(自动 = D + E + 加点 − 扣分)</span>}
-        <div className="mt-0.5 flex items-center gap-2">
-          <input
-            type="number"
-            step="0.001"
-            value={totalDisplay}
-            onChange={(event) => setForm((prev) => ({...prev, total_score: event.target.value, total_overridden: true}))}
-            className="w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm font-semibold text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
-          />
-          {form.total_overridden && (
-            <button
-              type="button"
-              onClick={() => setForm((prev) => ({...prev, total_score: '', total_overridden: false}))}
-              className="text-[11px] text-amber-700 underline hover:text-amber-900"
-            >
-              恢复自动
-            </button>
-          )}
-        </div>
-      </label>
-      <div className="flex items-center justify-end gap-2 pt-1">
-        {onDelete && (
-          <button
-            type="button"
-            onClick={onDelete}
-            disabled={saving}
-            className="mr-auto inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-[12px] text-red-600 hover:bg-red-50 disabled:opacity-50"
-          >
-            删除
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onCancel}
-          disabled={saving}
-          className="rounded-md border border-gray-200 bg-white px-3 py-1 text-[12px] text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-        >
-          取消
-        </button>
-        <button
-          type="button"
-          onClick={onSave}
-          disabled={saving}
-          className="rounded-md border border-amber-600 bg-amber-600 px-3 py-1 text-[12px] font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
-        >
-          {saving ? '保存中...' : '保存'}
-        </button>
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
   const [project, setProject] = useState<ProjectState | null>(null);
