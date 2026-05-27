@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .export_service import ExportService
 from .jobs import AppJob, JobCancelledError, JobManager
@@ -81,6 +82,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_api_logger = logging.getLogger("gymclip.api.exception_handler")
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all for un-handled non-HTTP exceptions.
+    HTTPException is handled by FastAPI's built-in handler, so 4xx is preserved.
+    Sentry capture is automatic via sentry-sdk FastAPI integration if initialized.
+    """
+    _api_logger.exception(
+        "Unhandled %s on %s %s",
+        type(exc).__name__,
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error_type": type(exc).__name__,
+        },
+    )
 
 
 def load_state() -> ProjectState:
