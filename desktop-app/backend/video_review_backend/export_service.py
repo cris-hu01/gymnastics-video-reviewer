@@ -64,6 +64,13 @@ def _is_zero_score(value: str) -> bool:
         return False
 
 
+def _format_score_precision(raw: str, decimals: int) -> str:
+    try:
+        return f"{float(str(raw).strip()):.{decimals}f}"
+    except (TypeError, ValueError):
+        return str(raw).strip() or "0"
+
+
 def _coerce_sex(value: object) -> int | None:
     if value in (None, ""):
         return None
@@ -898,12 +905,15 @@ class ExportService:
         bonus = _first_non_empty(record.bonus_score, raw_record.get("bscore"), raw_record.get("bonusScore"), raw_record.get("bonus_score")) or "0"
         penalty = _first_non_empty(record.penalty_score, raw_record.get("penaltyScore"), raw_record.get("penalty_score")) or "0"
         total = _first_non_empty(record.total_score, raw_record.get("totalScore"), raw_record.get("total_score")) or "0"
-        parts = [difficulty, execution]
+        parts = [
+            _format_score_precision(difficulty, 1),
+            _format_score_precision(execution, 3),
+        ]
         if not _is_zero_score(bonus):
-            parts.append(bonus)
+            parts.append(_format_score_precision(bonus, 1))
         if not _is_zero_score(penalty):
-            parts.append(penalty)
-        return f"{_format_score_expression(parts)}={total}"
+            parts.append(_format_score_precision(penalty, 1))
+        return f"{_format_score_expression(parts)}={_format_score_precision(total, 3)}"
 
     def _build_oss_object_key(self, video: VideoTask, record: PlatformRecord, file_name: str) -> str:
         match_name = _clean_path_component(record.match_name or video.match_name or "未命名比赛")

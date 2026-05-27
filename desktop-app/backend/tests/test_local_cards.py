@@ -216,7 +216,7 @@ def test_build_output_file_redirects_local_to_subfolder(tmp_path: Path):
     assert out_file.parent == output_dir / "本地补录"
     assert out_file.name.endswith(".mp4")
     assert "张三" in out_file.name
-    assert "5.6+8.1=13.7" in out_file.name
+    assert "5.6+8.100=13.700" in out_file.name
     assert out_file.parent.exists()
 
 
@@ -238,6 +238,7 @@ def test_build_output_file_keeps_platform_card_in_root(tmp_path: Path):
     )
     assert out_file.parent == output_dir
     assert "王五" in out_file.name
+    assert "5.4+8.500=13.900" in out_file.name
 
 
 def test_retry_oss_stage_rejects_local_card(tmp_path: Path):

@@ -1287,7 +1287,10 @@ type LocalCardInlineFormProps = {
   saving: boolean;
   title: string;
   onDelete?: () => void;
+  nameSuggestions?: string[];
 };
+
+const LOCAL_CARD_NAME_DATALIST_ID = 'local-card-name-suggestions';
 
 function LocalCardInlineForm({
   form,
@@ -1297,6 +1300,7 @@ function LocalCardInlineForm({
   saving,
   title,
   onDelete,
+  nameSuggestions,
 }: LocalCardInlineFormProps) {
   const autoTotal = computeLocalCardAutoTotal(form);
   const totalDisplay = form.total_overridden && form.total_score.trim() !== '' ? form.total_score : autoTotal;
@@ -1305,6 +1309,13 @@ function LocalCardInlineForm({
       className="rounded-2xl border border-amber-300 bg-amber-50/70 p-3 shadow-sm space-y-2.5"
       onKeyDown={stopFormShortcutPropagation}
     >
+      {nameSuggestions && nameSuggestions.length > 0 && (
+        <datalist id={LOCAL_CARD_NAME_DATALIST_ID}>
+          {nameSuggestions.map((name) => (
+            <option key={name} value={name} />
+          ))}
+        </datalist>
+      )}
       <div className="flex items-center justify-between">
         <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-200/70 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
           本地补录
@@ -1318,6 +1329,8 @@ function LocalCardInlineForm({
             type="text"
             value={form.user_name}
             onChange={(event) => setForm((prev) => ({...prev, user_name: event.target.value}))}
+            list={nameSuggestions && nameSuggestions.length > 0 ? LOCAL_CARD_NAME_DATALIST_ID : undefined}
+            autoComplete="off"
             className="mt-0.5 w-full rounded-md border border-amber-200 bg-white px-2 py-1 text-sm text-gray-900 focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-300"
           />
         </label>
@@ -2243,6 +2256,10 @@ export default function App() {
     const query = scoreSearchQuery.trim().toLowerCase();
     return videoScopedPlatformRecords.filter((entry) => {
       if (!entry.is_local) return false;
+      const matchesApparatus =
+        scoreApparatusFilter === 'all' ||
+        String(entry.sport_item_id ?? '') === scoreApparatusFilter;
+      if (!matchesApparatus) return false;
       if (!query) return true;
       return (
         entry.user_name.toLowerCase().includes(query) ||
@@ -2250,7 +2267,26 @@ export default function App() {
         entry.country.toLowerCase().includes(query)
       );
     });
-  }, [videoScopedPlatformRecords, scoreSearchQuery]);
+  }, [videoScopedPlatformRecords, scoreSearchQuery, scoreApparatusFilter]);
+  const localCardNameSuggestions = useMemo(() => {
+    const seen = new Set<string>();
+    const sorted = [...platformRecords]
+      .filter((r) => r.is_local && r.user_name.trim())
+      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+    const result: string[] = [];
+    for (const record of sorted) {
+      if (seen.has(record.user_name)) continue;
+      seen.add(record.user_name);
+      result.push(record.user_name);
+    }
+    return result;
+  }, [platformRecords]);
+  const lastUsedLocalSportItemId = useMemo(() => {
+    const recent = [...platformRecords]
+      .filter((r) => r.is_local && r.sport_item_id != null)
+      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))[0];
+    return recent ? String(recent.sport_item_id) : '';
+  }, [platformRecords]);
   const groupedPlatformRecords = useMemo(() => {
     const groups: Array<{
       matchName: string;
@@ -4113,6 +4149,10 @@ export default function App() {
       const response = await createLocalCard(activeVideo.id, buildLocalCardPayload(localCardDraft));
       setProjectState(response.project);
       setLocalCardDraft(null);
+      const newSportItemId = response.record.sport_item_id;
+      if (newSportItemId != null && scoreApparatusFilter !== 'all' && scoreApparatusFilter !== String(newSportItemId)) {
+        setScoreApparatusFilter(String(newSportItemId));
+      }
       setErrorMessage(null);
       setSuccessMessage('已创建本地补录卡片');
     } catch (error) {
@@ -5915,7 +5955,9 @@ export default function App() {
                       onClick={() => {
                         setEditingLocalCardId(null);
                         setEditingLocalCardForm(null);
-                        setLocalCardDraft((current) => (current ? current : emptyLocalCardForm()));
+                        setLocalCardDraft((current) =>
+                          current ?? {...emptyLocalCardForm(), sport_item_id: lastUsedLocalSportItemId},
+                        );
                       }}
                       disabled={localCardDraft != null}
                       title="新增本地补录卡片"
@@ -5995,6 +6037,7 @@ export default function App() {
                     onCancel={() => setLocalCardDraft(null)}
                     saving={localCardSaving}
                     title="新建本地补录卡片"
+                    nameSuggestions={localCardNameSuggestions}
                   />
                 )}
                 {activeVideo && localPlatformRecords.length > 0 && (
@@ -6031,6 +6074,7 @@ export default function App() {
                               saving={localCardSaving}
                               title="编辑本地补录卡片"
                               onDelete={() => void handleDeleteLocalCardClick(entry.id)}
+                              nameSuggestions={localCardNameSuggestions}
                             />
                           </React.Fragment>
                         );
