@@ -2,22 +2,73 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import re
-import shutil
 import time
-import hashlib
 from dataclasses import asdict
 from pathlib import Path
-from threading import RLock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from .export_service import ExportService
-from .jobs import AppJob, JobCancelledError, JobManager
+from .deps.constants import ALLOWED_CATEGORIES, MAG_SPORT_ITEM_IDS, WAG_SPORT_ITEM_IDS
+from .deps.finders import find_video_or_404
+from .deps.paths import (
+    BACKEND_ROOT,
+    EXPORTS_DIR,
+    PROJECT_FILE,
+    THUMBNAILS_DIR,
+    UPLOADS_DIR,
+    WORKSPACE_ROOT,
+    ensure_workspace_dirs,
+)
+from .deps.scope_cache import (
+    load_preview_scope_cache,
+    prune_preview_scope_cache,
+    store_preview_scope_cache,
+)
+from .deps.services import (
+    detect_job_manager,
+    export_job_manager,
+    get_detection_service,
+    get_export_service,
+    get_platform_client,
+    get_thumbnail_service,
+    get_job_by_id,
+    has_active_job,
+    list_all_jobs,
+    review_service,
+)
+from .deps.state import load_state, persist_state, project_state_lock
+from .deps.state_helpers import (
+    jobs_payload,
+    merge_detect_video_state,
+    merge_export_state,
+    project_payload,
+    reconcile_runtime_state,
+    restore_video_after_detection_cancel,
+    update_video_progress,
+)
+from .deps.validators import (
+    _as_str_list,
+    _coerce_int,
+    _coerce_str,
+    _normalize_venue_text,
+    build_direct_clip_inputs,
+    build_import_inputs,
+    build_preview_video,
+    build_scope_query_signature,
+    format_platform_record_preview,
+    parse_contexts_json,
+    parse_json_body,
+    parse_scope_queries_payload,
+    persist_uploaded_file,
+    resolve_frequency_context,
+    validate_platform_context,
+    validate_sport_item_ids,
+    validate_sport_selection_keys,
+)
+from .jobs import JobCancelledError
 from .models import (
     CandidateClip,
     PlatformRecord,
@@ -28,16 +79,7 @@ from .models import (
     new_id,
     utc_now_iso,
 )
-from .platform_client import PlatformApiError, PlatformClient, SPORT_ITEM_LABELS
-from .review_service import ReviewService
-from .storage import (
-    ensure_project_dir,
-    load_project_state,
-    project_state_lock,
-    resolve_project_file,
-    save_project_state,
-)
-from .thumbnail_service import ThumbnailService
+from .platform_client import PlatformApiError, SPORT_ITEM_LABELS
 from .video_import import (
     build_full_video_clip,
     import_direct_clips_into_project,
@@ -46,34 +88,8 @@ from .video_import import (
 )
 
 
-BACKEND_ROOT = Path(
-    os.environ.get("GYMCLIP_BACKEND_ROOT", Path(__file__).resolve().parents[1])
-).resolve()
-WORKSPACE_ROOT = Path(
-    os.environ.get("GYMCLIP_WORKSPACE_ROOT", BACKEND_ROOT / "workspace")
-).resolve()
-UPLOADS_DIR = WORKSPACE_ROOT / "uploads"
-EXPORTS_DIR = WORKSPACE_ROOT / "exports"
-THUMBNAILS_DIR = WORKSPACE_ROOT / "thumbnails"
-PROJECT_FILE = resolve_project_file(WORKSPACE_ROOT)
+ensure_workspace_dirs()
 
-ensure_project_dir(WORKSPACE_ROOT)
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
-
-MAG_SPORT_ITEM_IDS = {0, 1, 2, 3, 4, 5}
-WAG_SPORT_ITEM_IDS = {0, 3, 6, 7}
-ALLOWED_CATEGORIES = {"EF", "AA", "TF", "QF"}
-
-review_service = ReviewService()
-_detection_service = None
-_export_service = None
-_thumbnail_service = None
-_platform_client = None
-_preview_scope_cache_lock = RLock()
-_preview_scope_cache: dict[str, dict[str, Any]] = {}
-PREVIEW_SCOPE_CACHE_TTL_SECONDS = 600
 
 app = FastAPI(title="GymClip Reviewer API", version="1.2.1")
 app.add_middleware(
@@ -108,697 +124,6 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
-
-def load_state() -> ProjectState:
-    return load_project_state(PROJECT_FILE)
-
-
-def persist_state(state: ProjectState) -> None:
-    save_project_state(PROJECT_FILE, state)
-
-
-def project_payload(state: ProjectState) -> dict[str, Any]:
-    return state.to_dict()
-
-
-def jobs_payload() -> list[dict[str, Any]]:
-    return [job.to_dict() for job in list_all_jobs()]
-
-
-def resolve_detect_parallelism() -> int:
-    return 1
-
-
-detect_job_manager = JobManager(max_workers=resolve_detect_parallelism())
-export_job_manager = JobManager(max_workers=1)
-
-
-def list_all_jobs() -> list[AppJob]:
-    jobs = [
-        *detect_job_manager.list_jobs(),
-        *export_job_manager.list_jobs(),
-    ]
-    return sorted(jobs, key=lambda job: (job.created_at, job.id), reverse=True)
-
-
-def get_job_by_id(job_id: str) -> AppJob | None:
-    for manager in (detect_job_manager, export_job_manager):
-        job = manager.get_job(job_id)
-        if job is not None:
-            return job
-    return None
-
-
-def has_active_job(kind: str | None = None, video_id: str | None = None) -> bool:
-    managers = []
-    if kind == "detect":
-        managers = [detect_job_manager]
-    elif kind == "export":
-        managers = [export_job_manager]
-    else:
-        managers = [detect_job_manager, export_job_manager]
-    return any(manager.has_active_job(kind=kind, video_id=video_id) for manager in managers)
-
-
-def get_detection_service():
-    global _detection_service
-    if _detection_service is None:
-        from .detection_service import DetectionService
-
-        _detection_service = DetectionService()
-    return _detection_service
-
-
-def get_export_service() -> ExportService:
-    global _export_service
-    if _export_service is None:
-        _export_service = ExportService()
-    return _export_service
-
-
-def get_thumbnail_service() -> ThumbnailService:
-    global _thumbnail_service
-    if _thumbnail_service is None:
-        _thumbnail_service = ThumbnailService(THUMBNAILS_DIR)
-    return _thumbnail_service
-
-
-def get_platform_client() -> PlatformClient:
-    global _platform_client
-    if _platform_client is None:
-        _platform_client = PlatformClient()
-    return _platform_client
-
-
-def reconcile_video_sources(state: ProjectState) -> bool:
-    changed = False
-    for video in state.videos:
-        path = Path(video.file_path)
-        if path.exists():
-            if video.error_message == "源视频文件不存在":
-                video.error_message = None
-                if video.status == "error":
-                    video.status = "queued" if video.total_candidates == 0 else "ready_for_review"
-                video.updated_at = utc_now_iso()
-                changed = True
-            continue
-
-        if video.error_message != "源视频文件不存在" or video.status != "error":
-            video.error_message = "源视频文件不存在"
-            video.status = "error"
-            video.updated_at = utc_now_iso()
-            changed = True
-
-    if changed:
-        state.touch()
-    return changed
-
-
-def restore_video_after_interrupted_detection(state: ProjectState, video_id: str, message: str) -> None:
-    video = state.get_video(video_id)
-    if video is None:
-        return
-
-    clips = state.get_video_clips(video_id)
-    total = len(clips)
-    reviewed = sum(1 for clip in clips if clip.status != "pending")
-    pending = sum(1 for clip in clips if clip.status == "pending")
-    kept = sum(1 for clip in clips if clip.status == "kept")
-    exported = sum(1 for clip in clips if clip.status == "exported")
-
-    video.total_candidates = total
-    video.reviewed_candidates = reviewed
-    video.error_message = None
-    video.detection_progress = {
-        "stage": "interrupted",
-        "message": message,
-    }
-    if total == 0:
-        video.status = "queued"
-    elif pending == total:
-        video.status = "ready_for_review"
-    elif pending > 0 or kept > 0:
-        video.status = "reviewing"
-    elif exported > 0 and exported == total:
-        video.status = "done"
-    else:
-        video.status = "done"
-    video.updated_at = utc_now_iso()
-    state.touch()
-
-
-def reconcile_stale_detection_state(state: ProjectState) -> bool:
-    active_detect_video_ids = {
-        job.video_id
-        for job in detect_job_manager.list_jobs()
-        if job.kind == "detect" and job.status in {"queued", "running"} and job.video_id
-    }
-    recoverable_stages = {"start", "precheck_complete", "detecting", "cancel_requested"}
-    changed = False
-
-    for video in state.videos:
-        stage = str(video.detection_progress.get("stage") or "")
-        if video.id in active_detect_video_ids:
-            continue
-        if video.status != "detecting" and stage not in recoverable_stages:
-            continue
-
-        restore_video_after_interrupted_detection(
-            state,
-            video.id,
-            "检测任务因应用异常退出而中断，请重新开始",
-        )
-        changed = True
-
-    return changed
-
-
-def reconcile_runtime_state(state: ProjectState) -> bool:
-    changed = reconcile_video_sources(state)
-    if reconcile_stale_detection_state(state):
-        changed = True
-    return changed
-
-
-def update_video_progress(state: ProjectState, video_id: str, progress: dict[str, Any]) -> None:
-    video = state.get_video(video_id)
-    if video is None:
-        return
-    video.detection_progress = {
-        **video.detection_progress,
-        **progress,
-    }
-    if progress.get("stage") == "start":
-        video.status = "detecting"
-    video.updated_at = utc_now_iso()
-    state.touch()
-
-
-def restore_video_after_detection_cancel(state: ProjectState, video_id: str, message: str) -> None:
-    video = state.get_video(video_id)
-    if video is None:
-        return
-
-    clips = state.get_video_clips(video_id)
-    total = len(clips)
-    reviewed = sum(1 for clip in clips if clip.status != "pending")
-    pending = sum(1 for clip in clips if clip.status == "pending")
-    kept = sum(1 for clip in clips if clip.status == "kept")
-    exported = sum(1 for clip in clips if clip.status == "exported")
-
-    video.total_candidates = total
-    video.reviewed_candidates = reviewed
-    video.error_message = None
-    video.detection_progress = {
-        "stage": "cancelled",
-        "message": message,
-    }
-    if total == 0:
-        video.status = "queued"
-    elif pending == total:
-        video.status = "ready_for_review"
-    elif pending > 0 or kept > 0:
-        video.status = "reviewing"
-    elif exported > 0 and exported == total:
-        video.status = "done"
-    else:
-        video.status = "done"
-    video.updated_at = utc_now_iso()
-    state.touch()
-
-
-def merge_detect_video_state(latest_state: ProjectState, working_state: ProjectState, video_id: str) -> ProjectState:
-    latest_video = latest_state.get_video(video_id)
-    working_video = working_state.get_video(video_id)
-    if latest_video is None or working_video is None:
-        return latest_state
-
-    latest_state.detection_blocks = [
-        block for block in latest_state.detection_blocks if block.video_id != video_id
-    ]
-    latest_state.candidate_clips = [
-        clip for clip in latest_state.candidate_clips if clip.video_id != video_id
-    ]
-    latest_video.file_path = working_video.file_path
-    latest_video.file_name = working_video.file_name
-    latest_video.source_kind = working_video.source_kind
-    latest_video.platform_scope_id = working_video.platform_scope_id
-    latest_video.match_id = working_video.match_id
-    latest_video.match_name = working_video.match_name
-    latest_video.frequency_info_id = working_video.frequency_info_id
-    latest_video.frequency_info_ids = list(working_video.frequency_info_ids)
-    latest_video.venue = working_video.venue
-    latest_video.venues = list(working_video.venues)
-    latest_video.category = working_video.category
-    latest_video.sex = working_video.sex
-    latest_video.sport_selection_keys = list(working_video.sport_selection_keys)
-    latest_video.sport_item_ids = list(working_video.sport_item_ids)
-    latest_video.team_country = working_video.team_country
-    latest_video.duration = working_video.duration
-    latest_video.resolution = working_video.resolution
-    latest_video.status = working_video.status
-    latest_video.total_candidates = working_video.total_candidates
-    latest_video.reviewed_candidates = working_video.reviewed_candidates
-    latest_video.error_message = working_video.error_message
-    latest_video.detection_stats = dict(working_video.detection_stats)
-    latest_video.detection_progress = dict(working_video.detection_progress)
-    latest_video.updated_at = working_video.updated_at
-    latest_state.upsert_platform_query_context(latest_video)
-
-    latest_state.detection_blocks.extend(
-        [block for block in working_state.detection_blocks if block.video_id == video_id]
-    )
-    latest_state.candidate_clips.extend(
-        [clip for clip in working_state.candidate_clips if clip.video_id == video_id]
-    )
-    latest_state.rebuild_platform_record_links()
-    latest_state.touch()
-    return latest_state
-
-
-def merge_export_state(latest_state: ProjectState, working_state: ProjectState, clip_ids: set[str]) -> ProjectState:
-    if not clip_ids:
-        return latest_state
-
-    working_clips = {
-        clip.id: clip
-        for clip in working_state.candidate_clips
-        if clip.id in clip_ids
-    }
-    if not working_clips:
-        return latest_state
-
-    for clip in latest_state.candidate_clips:
-        working_clip = working_clips.get(clip.id)
-        if working_clip is None:
-            continue
-        clip.status = working_clip.status
-        clip.exported_path = working_clip.exported_path
-        clip.export_error_message = working_clip.export_error_message
-        clip.uploaded_object_key = working_clip.uploaded_object_key
-        clip.uploaded_url = working_clip.uploaded_url
-        clip.platform_sync_status = working_clip.platform_sync_status
-        clip.platform_sync_error_message = working_clip.platform_sync_error_message
-        clip.updated_at = working_clip.updated_at
-
-    touched_video_ids = {clip.video_id for clip in working_clips.values()}
-    for video_id in touched_video_ids:
-        latest_video = latest_state.get_video(video_id)
-        working_video = working_state.get_video(video_id)
-        if latest_video is None or working_video is None:
-            continue
-        latest_video.file_path = working_video.file_path
-        latest_video.file_name = working_video.file_name
-        latest_video.status = working_video.status
-        latest_video.error_message = working_video.error_message
-        latest_video.total_candidates = working_video.total_candidates
-        latest_video.reviewed_candidates = working_video.reviewed_candidates
-        latest_video.detection_progress = dict(working_video.detection_progress)
-        latest_video.updated_at = working_video.updated_at
-
-    latest_state.rebuild_platform_record_links()
-    latest_state.touch()
-    return latest_state
-
-
-def find_video_or_404(state: ProjectState, video_id: str) -> VideoTask:
-    video = state.get_video(video_id)
-    if video is None:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return video
-
-
-def parse_json_body(body: bytes) -> dict[str, Any]:
-    if not body:
-        return {}
-    try:
-        return json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {error}")
-
-
-def persist_uploaded_file(
-    file: UploadFile,
-    target_dir: Path = UPLOADS_DIR,
-    *,
-    overwrite: bool = False,
-) -> str:
-    original_name = file.filename or "upload.mp4"
-    safe_name = re.sub(r"[^\w.\- ]", "_", original_name).strip() or "upload.mp4"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / safe_name
-    if target.exists():
-        if overwrite:
-            target.unlink()
-        else:
-            return str(target.resolve())
-    with target.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
-    return str(target.resolve())
-
-
-def _coerce_int(value: Any) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_str(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _as_str_list(values: Any) -> list[str]:
-    result: list[str] = []
-    for value in values or []:
-        text = str(value or "").strip()
-        if text:
-            result.append(text)
-    return result
-
-
-def _normalize_venue_text(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip())
-
-
-def validate_sport_selection_keys(values: list[Any]) -> list[str]:
-    cleaned: list[str] = []
-    for value in values:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        if not re.fullmatch(r"(1|2):([0-7])", text):
-            raise HTTPException(status_code=400, detail=f"无效的项目选择键: {text}")
-        cleaned.append(text)
-    return sorted(set(cleaned))
-
-
-def validate_sport_item_ids(sport_item_ids: list[Any]) -> list[int]:
-    cleaned = []
-    for value in sport_item_ids:
-        if value in (None, ""):
-            continue
-        try:
-            cleaned.append(int(value))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"无效的项目键值: {value}")
-
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="请至少选择一个项目")
-
-    invalid = [value for value in cleaned if value not in MAG_SPORT_ITEM_IDS.union(WAG_SPORT_ITEM_IDS)]
-    if invalid:
-        raise HTTPException(status_code=400, detail=f"无效的项目键值: {', '.join(map(str, invalid))}")
-    return sorted(set(cleaned))
-
-
-def validate_platform_context(payload: dict[str, Any]) -> dict[str, Any]:
-    category = str(payload.get("category") or "").strip().upper()
-    if category not in ALLOWED_CATEGORIES:
-        raise HTTPException(status_code=400, detail="比赛类型必须是 EF / AA / TF / QF")
-
-    sport_selection_keys = validate_sport_selection_keys(payload.get("sport_selection_keys", []))
-    sport_item_ids = validate_sport_item_ids(payload.get("sport_item_ids", []))
-    match_name = str(payload.get("match_name") or "").strip()
-    if not match_name:
-        raise HTTPException(status_code=400, detail="缺少赛事名称")
-
-    frequency_info_ids = _as_str_list(payload.get("frequency_info_ids"))
-    venues = _as_str_list(payload.get("venues"))
-    if not frequency_info_ids:
-        single_frequency_info_id = _coerce_str(payload.get("frequency_info_id"))
-        if single_frequency_info_id:
-            frequency_info_ids = [single_frequency_info_id]
-    if not venues:
-        single_venue = str(payload.get("venue") or "").strip()
-        if single_venue:
-            venues = [single_venue]
-
-    if not venues:
-        raise HTTPException(status_code=400, detail="缺少场次信息")
-
-    return {
-        "match_id": _coerce_str(payload.get("match_id")),
-        "match_name": match_name,
-        "frequency_info_id": frequency_info_ids[0] if frequency_info_ids else None,
-        "frequency_info_ids": frequency_info_ids,
-        "venue": venues[0],
-        "venues": venues,
-        "category": category,
-        "sex": _coerce_int(payload.get("sex")),
-        "sport_selection_keys": sport_selection_keys,
-        "sport_item_ids": sport_item_ids,
-        "team_country": str(payload.get("team_country") or "").strip() or None,
-    }
-
-
-def resolve_frequency_context(context: dict[str, Any]) -> dict[str, Any]:
-    frequency_info_ids = list(context.get("frequency_info_ids") or [])
-    venues = list(context.get("venues") or [])
-    if frequency_info_ids and len(frequency_info_ids) == len(venues):
-        return context
-    if not venues:
-        raise HTTPException(status_code=400, detail="缺少场次信息")
-
-    try:
-        available_frequencies = get_platform_client().fetch_frequencies(
-            match_id=context.get("match_id"),
-            match_name=context.get("match_name"),
-            category=context.get("category"),
-        )
-    except PlatformApiError as error:
-        raise HTTPException(status_code=502, detail=str(error))
-
-    resolved_frequency_ids: list[str] = []
-    resolved_venues: list[str] = []
-    missing_venues: list[str] = []
-
-    for venue in venues:
-        normalized_venue = _normalize_venue_text(venue)
-        matched = next(
-            (
-                frequency
-                for frequency in available_frequencies
-                if _normalize_venue_text(frequency.get("venue")) == normalized_venue
-            ),
-            None,
-        )
-        if matched is None:
-            matched = next(
-                (
-                    frequency
-                    for frequency in available_frequencies
-                    if normalized_venue in _normalize_venue_text(frequency.get("venue"))
-                    or _normalize_venue_text(frequency.get("venue")) in normalized_venue
-                ),
-                None,
-            )
-        if matched is None:
-            missing_venues.append(str(venue))
-            continue
-        resolved_frequency_ids.append(str(matched.get("id")))
-        resolved_venues.append(str(matched.get("venue") or venue))
-
-    if missing_venues:
-        raise HTTPException(
-            status_code=400,
-            detail=f"未找到场次对应ID: {' / '.join(missing_venues)}",
-        )
-
-    if not resolved_frequency_ids:
-        raise HTTPException(status_code=400, detail="缺少场次 ID")
-
-    return {
-        **context,
-        "frequency_info_id": resolved_frequency_ids[0],
-        "frequency_info_ids": resolved_frequency_ids,
-        "venue": resolved_venues[0],
-        "venues": resolved_venues,
-    }
-
-
-def parse_contexts_json(raw_value: str | None) -> dict[str, dict[str, Any]]:
-    if not raw_value:
-        return {}
-    try:
-        data = json.loads(raw_value)
-    except json.JSONDecodeError as error:
-        raise HTTPException(status_code=400, detail=f"Invalid contexts_json: {error}")
-
-    if not isinstance(data, list):
-        raise HTTPException(status_code=400, detail="contexts_json 必须是数组")
-
-    parsed: dict[str, dict[str, Any]] = {}
-    for item in data:
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=400, detail="contexts_json 项必须是对象")
-        client_file_id = str(item.get("client_file_id") or "").strip()
-        if not client_file_id:
-            raise HTTPException(status_code=400, detail="contexts_json 缺少 client_file_id")
-        parsed[client_file_id] = {
-            "client_file_id": client_file_id,
-            **validate_platform_context(item),
-        }
-    return parsed
-
-
-def parse_scope_queries_payload(raw_value: Any) -> list[dict[str, Any]]:
-    data = raw_value
-    if isinstance(raw_value, str):
-        try:
-            data = json.loads(raw_value)
-        except json.JSONDecodeError as error:
-            raise HTTPException(status_code=400, detail=f"Invalid scope_queries payload: {error}")
-
-    if not isinstance(data, list):
-        raise HTTPException(status_code=400, detail="scope_queries 必须是数组")
-
-    resolved_queries: list[dict[str, Any]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            raise HTTPException(status_code=400, detail="scope_queries 项必须是对象")
-        resolved_queries.append(resolve_frequency_context(validate_platform_context(item)))
-
-    if not resolved_queries:
-        raise HTTPException(status_code=400, detail="至少提供一组 scope_queries")
-    return resolved_queries
-
-
-def build_import_inputs(
-    files: list[UploadFile],
-    client_ids: list[str],
-    contexts_by_client_id: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if len(files) != len(client_ids):
-        raise HTTPException(status_code=400, detail="files 与 file_client_ids 数量不一致")
-
-    import_inputs: list[dict[str, Any]] = []
-    for file, client_id in zip(files, client_ids):
-        context = contexts_by_client_id.get(client_id)
-        if context is None:
-            raise HTTPException(status_code=400, detail=f"缺少文件上下文: {client_id}")
-        context = resolve_frequency_context(context)
-        import_inputs.append(
-            {
-                "path": persist_uploaded_file(file),
-                "match_id": context["match_id"],
-                "match_name": context["match_name"],
-                "frequency_info_id": context["frequency_info_id"],
-                "frequency_info_ids": context["frequency_info_ids"],
-                "venue": context["venue"],
-                "venues": context["venues"],
-                "category": context["category"],
-                "sport_selection_keys": context["sport_selection_keys"],
-                "sport_item_ids": context["sport_item_ids"],
-            }
-        )
-    return import_inputs
-
-
-def build_direct_clip_inputs(files: list[UploadFile]) -> list[dict[str, Any]]:
-    return [
-        {"path": persist_uploaded_file(file)}
-        for file in files
-        if hasattr(file, "filename") and hasattr(file, "file")
-    ]
-
-
-def build_preview_video(query: dict[str, Any]) -> VideoTask:
-    return VideoTask(
-        id="preview_video",
-        file_path="",
-        file_name="预览查询",
-        match_id=query["match_id"],
-        match_name=query["match_name"],
-        frequency_info_id=query["frequency_info_id"],
-        frequency_info_ids=list(query["frequency_info_ids"]),
-        venue=query["venue"],
-        venues=list(query["venues"]),
-        category=query["category"],
-        sex=query["sex"],
-        sport_selection_keys=list(query["sport_selection_keys"]),
-        sport_item_ids=list(query["sport_item_ids"]),
-        team_country=query["team_country"],
-    )
-
-
-def format_platform_record_preview(record: PlatformRecord) -> dict[str, Any]:
-    return record.to_dict()
-
-
-def _normalize_scope_query_for_signature(query: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "match_id": _coerce_str(query.get("match_id")),
-        "match_name": str(query.get("match_name") or "").strip(),
-        "frequency_info_ids": sorted(_as_str_list(query.get("frequency_info_ids"))),
-        "venues": _as_str_list(query.get("venues")),
-        "category": str(query.get("category") or "").strip().upper(),
-        "sport_selection_keys": sorted(validate_sport_selection_keys(query.get("sport_selection_keys", []))),
-        "sport_item_ids": sorted(validate_sport_item_ids(query.get("sport_item_ids", []))),
-        "team_country": str(query.get("team_country") or "").strip() or None,
-    }
-
-
-def build_scope_query_signature(queries: list[dict[str, Any]]) -> str:
-    normalized_queries = [
-        _normalize_scope_query_for_signature(query)
-        for query in queries
-    ]
-    normalized_queries.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
-    payload = json.dumps(normalized_queries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def prune_preview_scope_cache() -> None:
-    now = time.time()
-    with _preview_scope_cache_lock:
-        expired_keys = [
-            cache_key
-            for cache_key, entry in _preview_scope_cache.items()
-            if now - float(entry.get("created_at") or 0) > PREVIEW_SCOPE_CACHE_TTL_SECONDS
-        ]
-        for cache_key in expired_keys:
-            _preview_scope_cache.pop(cache_key, None)
-
-
-def store_preview_scope_cache(
-    cache_key: str,
-    signature: str,
-    records: list[PlatformRecord],
-) -> None:
-    prune_preview_scope_cache()
-    with _preview_scope_cache_lock:
-        _preview_scope_cache[cache_key] = {
-            "signature": signature,
-            "created_at": time.time(),
-            "records": [record.to_dict() for record in records],
-        }
-
-
-def load_preview_scope_cache(
-    cache_key: str | None,
-    signature: str,
-    *,
-    scope_id: str,
-) -> list[PlatformRecord] | None:
-    if not cache_key:
-        return None
-    prune_preview_scope_cache()
-    with _preview_scope_cache_lock:
-        entry = _preview_scope_cache.get(cache_key)
-    if entry is None or entry.get("signature") != signature:
-        return None
-    cached_records = [
-        PlatformRecord.from_dict(item)
-        for item in entry.get("records", [])
-        if isinstance(item, dict)
-    ]
-    return get_platform_client().clone_records_for_scope(scope_id, cached_records)
 
 
 @app.get("/api/health")
