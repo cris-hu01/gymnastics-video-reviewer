@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from .models import CandidateClip, ClipSegment, ProjectState, VideoTask, new_id, utc_now_iso
 from .video_metadata import probe_video_metadata
+
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv"}
@@ -133,6 +137,7 @@ def import_videos_into_project(
         imported.append(video)
 
     state.touch()
+    logger.info("import_videos_into_project imported=%d", len(imported))
     return imported
 
 

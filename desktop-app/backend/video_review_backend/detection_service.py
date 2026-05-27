@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import random
 import re
@@ -19,6 +20,9 @@ import numpy as np
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .models import CandidateClip, ClipSegment, DetectionBlock, ProjectState, VideoTask, new_id, utc_now_iso
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from zhipuai import ZhipuAI
@@ -100,6 +104,7 @@ class DetectionService:
         if video is None:
             raise ValueError(f"Video not found: {video_id}")
 
+        logger.info("detect_video start video=%s name=%s", video_id, video.file_name)
         settings = state.settings
         self._set_video_status(video, "detecting")
         video.detection_progress = {
@@ -224,8 +229,13 @@ class DetectionService:
                 video_id=video.id,
                 total_candidates=len(candidate_clips),
             )
+            logger.info(
+                "detect_video completed video=%s candidates=%d blocks=%d",
+                video_id, len(candidate_clips), len(detection_blocks),
+            )
             return result
         except DetectionCancelledError as e:
+            logger.info("detect_video cancelled video=%s reason=%s", video_id, e)
             self._restore_video_after_cancel(state, video, str(e))
             self._emit(
                 progress_callback,
@@ -235,6 +245,7 @@ class DetectionService:
             )
             raise
         except Exception as e:
+            logger.exception("detect_video failed video=%s", video_id)
             self._set_video_status(video, "error", str(e))
             video.detection_progress = {
                 "stage": "error",

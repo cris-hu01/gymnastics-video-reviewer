@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from video_review_backend import api
+from video_review_backend.deps import paths as deps_paths
+from video_review_backend.deps import services as deps_services
 from video_review_backend.export_service import ExportService
 from video_review_backend.models import (
     CandidateClip,
@@ -24,11 +26,12 @@ from video_review_backend.storage import save_project_state
 @pytest.fixture
 def client_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     project_file = tmp_path / "project_state.json"
-    monkeypatch.setattr(api, "PROJECT_FILE", project_file)
-    monkeypatch.setattr(api, "_platform_client", None)
-    monkeypatch.setattr(api, "_thumbnail_service", None)
-    monkeypatch.setattr(api, "_export_service", None)
-    monkeypatch.setattr(api, "_detection_service", None)
+    # B-12: monkeypatch deps modules where the singletons actually live now.
+    monkeypatch.setattr(deps_paths, "PROJECT_FILE", project_file)
+    monkeypatch.setattr(deps_services, "_platform_client", None)
+    monkeypatch.setattr(deps_services, "_thumbnail_service", None)
+    monkeypatch.setattr(deps_services, "_export_service", None)
+    monkeypatch.setattr(deps_services, "_detection_service", None)
     with TestClient(api.app) as client:
         yield client, project_file, tmp_path
 

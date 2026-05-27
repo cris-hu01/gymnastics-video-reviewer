@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import ssl
 import re
@@ -12,6 +13,9 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .models import PlatformRecord, PlatformScopeQuery, VideoTask, utc_now_iso
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import certifi
@@ -726,6 +730,8 @@ class PlatformClient:
                 headers[self.token_header] = self.token
 
         request = Request(url, data=data, method=method.upper(), headers=headers)
+        # Use debug to avoid noisy logs; only path + method, never token / params with secrets.
+        logger.debug("platform request %s %s", method.upper(), path)
         try:
             with urlopen(request, timeout=self.timeout_seconds, context=self._build_ssl_context()) as response:
                 payload = response.read().decode("utf-8")

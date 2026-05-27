@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 
 from .models import CandidateClip, ClipSegment, ProjectState, new_id, utc_now_iso
+
+
+logger = logging.getLogger(__name__)
 
 
 ALLOWED_CLIP_STATUSES = {"pending", "kept", "deleted", "exported"}
