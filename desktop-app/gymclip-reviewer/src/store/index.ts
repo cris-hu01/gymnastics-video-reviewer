@@ -25,8 +25,10 @@
  */
 import { createActiveSlice, type ActiveSlice } from './active';
 import { createJobsSlice, type JobsSlice } from './jobs';
+import { createPlaybackSlice, type PlaybackSlice } from './playback';
 import { createProjectSlice, type ProjectSlice } from './project';
 import { createSelectionSlice, type SelectionSlice } from './selection';
+import { createTrimSlice, type TrimSlice } from './trim';
 import { create } from 'zustand';
 
 /**
@@ -34,15 +36,26 @@ import { create } from 'zustand';
  * adds its own state + actions; this aggregator keeps the call sites
  * (`useStore(s => s.foo)`) flat.
  *
- * As we migrate more state in A3/A4, add new slice types here.
+ * As of A4 the playback + trim slices are present in the store but the
+ * App.tsx render path has not yet been switched over. PlayerSurface,
+ * TimelineSurface, and TrimHandles (extracted in subsequent A4 commits)
+ * are the first real consumers.
  */
-export type AppStore = SelectionSlice & ActiveSlice & ProjectSlice & JobsSlice;
+export type AppStore =
+  & SelectionSlice
+  & ActiveSlice
+  & ProjectSlice
+  & JobsSlice
+  & PlaybackSlice
+  & TrimSlice;
 
 export const useStore = create<AppStore>()((set, get, store) => ({
   ...createSelectionSlice(set, get, store),
   ...createActiveSlice(set, get, store),
   ...createProjectSlice(set, get, store),
   ...createJobsSlice(set, get, store),
+  ...createPlaybackSlice(set, get, store),
+  ...createTrimSlice(set, get, store),
 }));
 
 /**
