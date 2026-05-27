@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+
+# E2E synthetic fixture videos (regenerable via e2e/fixtures/generate.sh)
+e2e/fixtures/*.mp4
