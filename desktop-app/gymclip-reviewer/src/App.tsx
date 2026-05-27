@@ -151,6 +151,7 @@ import type {
   PendingDirectClipFile,
   PendingImportVideo,
 } from './lib/utils';
+import { useStore } from './store';
 
 type FilterStatus = ClipStatus | 'all';
 type ExportMode = 'standard' | 'fast';
@@ -602,8 +603,8 @@ export default function App() {
   const [ossAccessKeyId, setOssAccessKeyId] = useState('');
   const [ossAccessKeySecret, setOssAccessKeySecret] = useState('');
   const [isPersistingOssCredentials, setIsPersistingOssCredentials] = useState(false);
-  const [selectedVideoIds, setSelectedVideoIds] = useState<string[]>([]);
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const selectedVideoIds = useStore((s) => s.selectedVideoIds);
+  const selectedClipIds = useStore((s) => s.selectedClipIds);
   const [isBatchDetecting, setIsBatchDetecting] = useState(false);
   const [collapsedClipGroupIds, setCollapsedClipGroupIds] = useState<string[]>([]);
   const [collapsedVideoFolderIds, setCollapsedVideoFolderIds] = useState<string[]>([]);
@@ -1117,7 +1118,8 @@ export default function App() {
     platformMatches,
   ]);
 
-  const selectedClipIdSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+  // selectedClipIds is already a Set in the zustand store; keep the alias for call-site stability.
+  const selectedClipIdSet = selectedClipIds;
   const exportTargetClipIds = useMemo(
     () =>
       clips
@@ -1282,7 +1284,8 @@ export default function App() {
     return true;
   }
 
-  const selectedVideoIdSet = useMemo(() => new Set(selectedVideoIds), [selectedVideoIds]);
+  // selectedVideoIds is already a Set in the zustand store; keep the alias for call-site stability.
+  const selectedVideoIdSet = selectedVideoIds;
   const selectedVideos = useMemo(
     () => videos.filter((video) => selectedVideoIdSet.has(video.id)),
     [videos, selectedVideoIdSet],
@@ -1316,7 +1319,7 @@ export default function App() {
   const activeDetectCancelRequested = activeDetectJob
     ? String(activeDetectJob.progress.stage || '') === 'cancel_requested'
     : false;
-  const shouldUseSelectedVideosForDetect = selectedVideoIds.length > 0;
+  const shouldUseSelectedVideosForDetect = selectedVideoIds.size > 0;
   const startDetectCount = shouldUseSelectedVideosForDetect ? selectedStartableVideos.length : 0;
   const hasAnyFullVideo = videos.some((video) => video.source_kind === 'full_video');
   const shouldShowDetectControls = Boolean(activeDetectJob) || hasAnyFullVideo;
@@ -1742,7 +1745,14 @@ export default function App() {
 
   useEffect(() => {
     const validVideoIds = new Set(videos.map((video) => video.id));
-    setSelectedVideoIds((current) => current.filter((videoId) => validVideoIds.has(videoId)));
+    const current = useStore.getState().selectedVideoIds;
+    const next = new Set<string>();
+    current.forEach((videoId) => {
+      if (validVideoIds.has(videoId)) next.add(videoId);
+    });
+    if (next.size !== current.size) {
+      useStore.getState().setSelectedVideoIds(next);
+    }
   }, [videos]);
 
   useEffect(() => {
@@ -1751,7 +1761,14 @@ export default function App() {
         .filter((clip) => isClipExportSelectable(clip.status))
         .map((clip) => clip.id),
     );
-    setSelectedClipIds((current) => current.filter((clipId) => validClipIds.has(clipId)));
+    const current = useStore.getState().selectedClipIds;
+    const next = new Set<string>();
+    current.forEach((clipId) => {
+      if (validClipIds.has(clipId)) next.add(clipId);
+    });
+    if (next.size !== current.size) {
+      useStore.getState().setSelectedClipIds(next);
+    }
   }, [clips]);
 
   useEffect(() => {
@@ -2537,34 +2554,25 @@ export default function App() {
   }
 
   function toggleVideoSelection(videoId: string) {
-    setSelectedVideoIds((current) =>
-      current.includes(videoId)
-        ? current.filter((id) => id !== videoId)
-        : [...current, videoId],
-    );
+    useStore.getState().toggleSelectedVideoId(videoId);
   }
 
   function toggleClipSelection(clipId: string) {
-    setSelectedClipIds((current) =>
-      current.includes(clipId)
-        ? current.filter((id) => id !== clipId)
-        : [...current, clipId],
-    );
+    useStore.getState().toggleSelectedClipId(clipId);
   }
 
   function setClipSelectionBatch(clipIds: string[], shouldSelect: boolean) {
     if (clipIds.length === 0) return;
-    setSelectedClipIds((current) => {
-      const next = new Set(current);
-      clipIds.forEach((clipId) => {
-        if (shouldSelect) {
-          next.add(clipId);
-        } else {
-          next.delete(clipId);
-        }
-      });
-      return Array.from(next);
+    const current = useStore.getState().selectedClipIds;
+    const next = new Set(current);
+    clipIds.forEach((clipId) => {
+      if (shouldSelect) {
+        next.add(clipId);
+      } else {
+        next.delete(clipId);
+      }
     });
+    useStore.getState().setSelectedClipIds(next);
   }
 
   function getClipGroupSelectionState(clipIds: string[]): 'checked' | 'indeterminate' | 'unchecked' {
@@ -2593,7 +2601,7 @@ export default function App() {
   }
 
   function clearVideoSelection() {
-    setSelectedVideoIds([]);
+    useStore.getState().clearSelectedVideoIds();
   }
 
   function toggleClipGroup(videoId: string) {
@@ -2623,25 +2631,24 @@ export default function App() {
   function toggleSelectAllVideosInFolder(videoIds: string[]) {
     if (videoIds.length === 0) return;
     const selectionState = getVideoFolderSelectionState(videoIds);
-    setSelectedVideoIds((current) => {
-      const next = new Set(current);
-      videoIds.forEach((videoId) => {
-        if (selectionState === 'checked') {
-          next.delete(videoId);
-        } else {
-          next.add(videoId);
-        }
-      });
-      return Array.from(next);
+    const current = useStore.getState().selectedVideoIds;
+    const next = new Set(current);
+    videoIds.forEach((videoId) => {
+      if (selectionState === 'checked') {
+        next.delete(videoId);
+      } else {
+        next.add(videoId);
+      }
     });
+    useStore.getState().setSelectedVideoIds(next);
   }
 
   function toggleSelectAllVideos() {
-    if (selectedVideoIds.length === videos.length) {
+    if (selectedVideoIds.size === videos.length) {
       clearVideoSelection();
       return;
     }
-    setSelectedVideoIds(videos.map((video) => video.id));
+    useStore.getState().setSelectedVideoIds(new Set(videos.map((video) => video.id)));
   }
 
   function updateTrimRange(nextStart: number, nextEnd: number, syncTarget: 'start' | 'end' | null = null) {
@@ -3372,9 +3379,14 @@ export default function App() {
           ...queuedJobs,
           ...current.filter((job) => !queuedJobs.some((queuedJob) => queuedJob.id === job.id)),
         ]);
-        setSelectedVideoIds((current) =>
-          current.filter((videoId) => !queuedJobs.some((job) => job.video_id === videoId)),
-        );
+        const currentSelected = useStore.getState().selectedVideoIds;
+        const nextSelected = new Set<string>();
+        currentSelected.forEach((videoId) => {
+          if (!queuedJobs.some((job) => job.video_id === videoId)) {
+            nextSelected.add(videoId);
+          }
+        });
+        useStore.getState().setSelectedVideoIds(nextSelected);
       }
 
       if (failedVideos.length > 0) {
@@ -4233,8 +4245,8 @@ export default function App() {
                 <>
                   <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">视频任务 ({videos.length})</h2>
                   <div className="flex items-center gap-2">
-                    {selectedVideoIds.length > 0 && (
-                      <span className="text-[11px] font-medium text-gray-500">已选 {selectedVideoIds.length}</span>
+                    {selectedVideoIds.size > 0 && (
+                      <span className="text-[11px] font-medium text-gray-500">已选 {selectedVideoIds.size}</span>
                     )}
                     <button
                       onClick={() => setIsVideoSidebarCollapsed(true)}
@@ -4262,7 +4274,7 @@ export default function App() {
                   className="min-w-0 flex-1 px-2 py-1 text-[11px] rounded-lg bg-white border border-gray-200 text-gray-600 hover:border-gray-300 hover:text-gray-900 transition-colors disabled:opacity-50"
                   disabled={videos.length === 0}
                 >
-                  {selectedVideoIds.length === videos.length ? '取消全选' : '全选'}
+                  {selectedVideoIds.size === videos.length ? '取消全选' : '全选'}
                 </button>
                 <button
                   onClick={() => void handleCancelSelectedVideos()}
