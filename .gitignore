@@ -61,6 +61,8 @@ dist/
 build/
 .next/
 coverage/
+coverage_html/
+.coverage
 electron-dist/
 
 # GymClip Reviewer runtime
