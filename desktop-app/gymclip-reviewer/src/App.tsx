@@ -26,44 +26,28 @@ import {
   addVideoAsCandidate,
   bindClipPlatformRecord,
   cancelDetectVideo,
-  createLocalCard,
-  deleteLocalCard,
   deleteProjectVideo,
   deleteClipSegment,
   detectProjectVideo,
   exportProject,
   extractClipSegment,
-  fetchPlatformFrequencies,
-  fetchPlatformMatches,
-  fetchPlatformRecords,
   fetchJobs,
   fetchProject,
   fetchVideoThumbnails,
   getVideoStreamUrl,
-  importDirectClipFiles,
-  importProjectFiles,
-  previewScopePlatformRecords,
   restoreCandidateClips,
   retryClipStage,
   splitClipSegment,
   updateClip,
-  updateLocalCard,
 } from './api';
 import type {
   AppJob,
   CandidateClip,
   ClipSegment,
   ClipStatus,
-  PlatformCategory,
-  PlatformFrequency,
-  PlatformMatch,
   PlatformRecord,
-  PlatformScope,
-  PlatformScopeQuery,
   ProjectState,
-  SourceKind,
   ThumbnailFrame,
-  VideoStatus,
 } from './types';
 import {
   categoryLabel,
@@ -80,7 +64,6 @@ import {
   formatSportItemLabel,
   getExportQueueStatusLabel,
   hashString,
-  parseSportKey,
   pipelineToneClass,
   primaryScoreValue,
   scoreFormulaLabel,
@@ -110,7 +93,6 @@ import {
 import {
   cloneCandidateClips,
   clipEffectiveDuration,
-  computeLocalCardAutoTotal,
   deriveDisplayedScore,
   firstEditableSegment,
   firstNonEmptyScore,
@@ -118,46 +100,27 @@ import {
   normalizeSegments,
   orderedSegments,
   parseNumericScore,
-  summarizeExportJob,
   toUploadItem,
 } from './lib/clip-math';
 import {
   EXPORT_OPERATION_DETAILS,
-  buildExportCompletedNotification,
-  buildExportFailedNotification,
-  createPendingDirectClipFile,
-  createPendingImportVideo,
-  deriveSelectionFromVenue,
-  emptyLocalCardForm,
-  isDesktopImportSource,
-  loadBrowserDefaultExportDirectory,
-  loadBrowserUploadSettings,
-  localCardRecordToForm,
-  normalizeCategory,
-  saveBrowserDefaultExportDirectory,
-  saveBrowserUploadSettings,
-  sportKey,
   stripFileExtension,
-  toggleSportKey,
 } from './lib/utils';
 import type {
-  DesktopImportSource,
   ExportJobSummary,
   ExportOperation,
-  LocalCardFormState,
-  PendingDirectClipFile,
-  PendingImportVideo,
 } from './lib/utils';
 import { useStore } from './store';
 import { StatusBadge } from './components/StatusBadge';
 import { TriStateCheckboxButton } from './components/TriStateCheckboxButton';
 import { ScoreFilterDropdown } from './components/ScoreFilterDropdown';
 import type { ScoreFilterMenu } from './components/ScoreFilterDropdown';
-import { LocalCardInlineForm } from './components/LocalCardInlineForm';
+import { useVideoImport, VideoImportPanel } from './features/import';
+import type { ImportMode } from './features/import';
+import { useExportJobs, ExportDialog } from './features/export';
+import { useLocalCard, LocalCardPanel } from './features/local-card';
 
 type FilterStatus = ClipStatus | 'all';
-type ExportMode = 'standard' | 'fast';
-type ImportMode = 'full_video' | 'direct_clip';
 
 type ClipUndoSnapshot = {
   candidateClips: CandidateClip[];
@@ -169,11 +132,6 @@ type ActiveSegmentEditSnapshot = {
   clip: CandidateClip;
   segment: ClipSegment;
   playheadValue: number;
-};
-
-type ApparatusOption = {
-  id: number;
-  label: string;
 };
 
 type PipelineTone = 'neutral' | 'muted' | 'success' | 'warning' | 'danger';
@@ -199,22 +157,6 @@ type AppToast = {
   message: string;
 };
 
-const MAG_OPTIONS: ApparatusOption[] = [
-  {id: 0, label: 'FX'},
-  {id: 1, label: 'PH'},
-  {id: 2, label: 'SR'},
-  {id: 3, label: 'VT'},
-  {id: 4, label: 'PB'},
-  {id: 5, label: 'HB'},
-];
-
-const WAG_OPTIONS: ApparatusOption[] = [
-  {id: 3, label: 'VT'},
-  {id: 6, label: 'UB'},
-  {id: 7, label: 'BB'},
-  {id: 0, label: 'FX'},
-];
-
 const SPORT_ITEM_LABELS: Record<number, string> = {
   0: '自由体操',
   1: '鞍马',
@@ -226,13 +168,6 @@ const SPORT_ITEM_LABELS: Record<number, string> = {
   7: '平衡木',
 };
 
-const CATEGORY_OPTIONS: Array<{value: PlatformCategory; label: string}> = [
-  {value: 'EF', label: '单项决赛'},
-  {value: 'AA', label: '全能'},
-  {value: 'TF', label: '团体'},
-  {value: 'QF', label: '资格赛'},
-];
-
 const SEX_LABELS: Record<number, string> = {
   1: '男子',
   2: '女子',
@@ -242,16 +177,6 @@ const CLIP_STEP = 0.2;
 const MIN_SEGMENT_DURATION = 0.5;
 const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出完成前不可编辑';
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
-const EXPORT_MODE_DETAILS: Record<ExportMode, {label: string; description: string}> = {
-  standard: {
-    label: '标准',
-    description: '兼容性优先，默认模式。适合大多数导出场景。',
-  },
-  fast: {
-    label: '快速',
-    description: '更快导出，但压缩效率更低，文件通常更大。',
-  },
-};
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
   const [project, setProject] = useState<ProjectState | null>(null);
@@ -268,67 +193,68 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
 
   const [isDragging, setIsDragging] = useState(false);
-  const [isImporting, setIsImporting] = useState(false);
   const [videoContextMenu, setVideoContextMenu] = useState<{x: number; y: number; videoId: string} | null>(null);
-  const [showImportModal, setShowImportModal] = useState(false);
-  const [importMode, setImportMode] = useState<ImportMode>('full_video');
-  const [pendingImportVideos, setPendingImportVideos] = useState<PendingImportVideo[]>([]);
-  const [pendingDirectClipFiles, setPendingDirectClipFiles] = useState<PendingDirectClipFile[]>([]);
-  const [directClipSelectedMatchIds, setDirectClipSelectedMatchIds] = useState<string[]>([]);
-  const [directClipSelectedFrequenciesByMatchId, setDirectClipSelectedFrequenciesByMatchId] = useState<Record<string, PlatformFrequency[]>>({});
-  const [directClipManualSportKeys, setDirectClipManualSportKeys] = useState<string[]>([]);
-  const [directClipPreview, setDirectClipPreview] = useState<{count: number | null; loading: boolean; error: string | null; cacheKey: string | null}>({
-    count: null,
-    loading: false,
-    error: null,
-    cacheKey: null,
+
+  const importApi = useVideoImport({
+    desktopBridge,
+    onProjectUpdate: setProject,
+    onActiveVideoId: setActiveVideoId,
+    setErrorMessage,
+    setSuccessMessage,
   });
-  const [platformMatches, setPlatformMatches] = useState<PlatformMatch[]>([]);
-  const [isLoadingPlatformMatches, setIsLoadingPlatformMatches] = useState(false);
-  const [platformFrequenciesByMatchId, setPlatformFrequenciesByMatchId] = useState<Record<string, PlatformFrequency[]>>({});
-  const [loadingFrequencyMatchIds, setLoadingFrequencyMatchIds] = useState<Record<string, boolean>>({});
-  const [previewByImportId, setPreviewByImportId] = useState<Record<string, {count: number | null; loading: boolean; error: string | null}>>({});
-  const [showExport, setShowExport] = useState(false);
+  const {
+    isImporting,
+    importMode,
+    openImportSourcePicker,
+    handleImportFiles,
+    fileInputRef,
+    directClipFileInputRef,
+  } = importApi;
+
+  const [supportsSecureStorage, setSupportsSecureStorage] = useState(false);
+  const [isPersistingApiKey, setIsPersistingApiKey] = useState(false);
+  const apiKeyPersistenceReadyRef = useRef(false);
+  const exportApi = useExportJobs({
+    desktopBridge,
+    jobs,
+    setErrorMessage,
+    setSuccessMessage,
+    apiKeyPersistenceReadyRef,
+    supportsSecureStorage,
+  });
+  const {
+    showExport,
+    setShowExport,
+    outputDir,
+    setOutputDir,
+    savedOutputDir,
+    exportMode,
+    exportOperation,
+    uploadParallelFiles,
+    uploadPartThreads,
+    ossAccessKeyId,
+    ossAccessKeySecret,
+    exportSummary,
+    setExportSummary,
+    hasOssCredentials,
+    hasSavedOutputDir,
+    persistDefaultOutputDirectory,
+  } = exportApi;
+
   const [showApiKey, setShowApiKey] = useState(false);
   const [apiKey, setApiKey] = useState('');
   const [rememberApiKey, setRememberApiKey] = useState(false);
-  const [supportsSecureStorage, setSupportsSecureStorage] = useState(false);
-  const [isPersistingApiKey, setIsPersistingApiKey] = useState(false);
-  const [ossAccessKeyId, setOssAccessKeyId] = useState('');
-  const [ossAccessKeySecret, setOssAccessKeySecret] = useState('');
-  const [isPersistingOssCredentials, setIsPersistingOssCredentials] = useState(false);
   const selectedVideoIds = useStore((s) => s.selectedVideoIds);
   const selectedClipIds = useStore((s) => s.selectedClipIds);
   const [isBatchDetecting, setIsBatchDetecting] = useState(false);
   const [collapsedClipGroupIds, setCollapsedClipGroupIds] = useState<string[]>([]);
   const [collapsedVideoFolderIds, setCollapsedVideoFolderIds] = useState<string[]>([]);
   const [isVideoSidebarCollapsed, setIsVideoSidebarCollapsed] = useState(false);
-  const [outputDir, setOutputDir] = useState('');
-  const [savedOutputDir, setSavedOutputDir] = useState('');
-  const [exportMode, setExportMode] = useState<ExportMode>('standard');
-  const [exportOperation, setExportOperation] = useState<ExportOperation>('export_and_upload');
-  const [uploadParallelFiles, setUploadParallelFiles] = useState(2);
-  const [uploadPartThreads, setUploadPartThreads] = useState(4);
-  const [isUploadSettingsExpanded, setIsUploadSettingsExpanded] = useState(false);
   const [scoreSearchQuery, setScoreSearchQuery] = useState('');
   const [scoreApparatusFilter, setScoreApparatusFilter] = useState('all');
   const [scoreSexFilter, setScoreSexFilter] = useState('all');
   const [scoreCountryFilter, setScoreCountryFilter] = useState('all');
   const [openScoreFilter, setOpenScoreFilter] = useState<ScoreFilterMenu | null>(null);
-  const [localCardDraft, setLocalCardDraft] = useState<LocalCardFormState | null>(null);
-  const [editingLocalCardId, setEditingLocalCardId] = useState<string | null>(null);
-  const [editingLocalCardForm, setEditingLocalCardForm] = useState<LocalCardFormState | null>(null);
-  const [localCardSaving, setLocalCardSaving] = useState(false);
-  const [isOssCredentialsExpanded, setIsOssCredentialsExpanded] = useState(true);
-  const [exportSummary, setExportSummary] = useState<{
-    operation: ExportOperation;
-    attempted: number;
-    exported: number;
-    failed: number;
-    uploaded: number;
-    synced: number;
-    output_directory: string;
-  } | null>(null);
 
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(0);
@@ -341,8 +267,6 @@ export default function App() {
   const [timelineThumbnails, setTimelineThumbnails] = useState<ThumbnailFrame[]>([]);
   const [isLoadingThumbnails, setIsLoadingThumbnails] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const directClipFileInputRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const skipTrimSyncRef = useRef(true);
   const isScrubbingRef = useRef(false);
@@ -359,14 +283,7 @@ export default function App() {
   const trimRectRef = useRef<DOMRect | null>(null);
   const trimDraggingRef = useRef(false);
   const trimSavePromiseRef = useRef<Promise<ActiveSegmentEditSnapshot | null> | null>(null);
-  const handledJobIdsRef = useRef<Set<string>>(new Set());
-  const notifiedDesktopJobIdsRef = useRef<Set<string>>(new Set());
-  const desktopNotificationPrimedRef = useRef(false);
   const toastIdRef = useRef(0);
-  const apiKeyPersistenceReadyRef = useRef(false);
-  const uploadSettingsPersistenceReadyRef = useRef(false);
-  const platformFrequenciesByMatchIdRef = useRef<Record<string, PlatformFrequency[]>>({});
-  const loadingFrequencyMatchIdsRef = useRef<Record<string, boolean>>({});
   const clipUndoStackRef = useRef<ClipUndoSnapshot[]>([]);
 
   const videos = project?.videos ?? [];
@@ -583,235 +500,6 @@ export default function App() {
     [activeClipSegments, activeSegmentId],
   );
 
-  function getMatchById(matchId: string | null): PlatformMatch | null {
-    if (!matchId) return null;
-    return platformMatches.find((item) => item.id === matchId) ?? null;
-  }
-
-  function getFrequenciesForMatch(matchId: string | null): PlatformFrequency[] {
-    if (!matchId) return [];
-    return platformFrequenciesByMatchId[matchId] ?? [];
-  }
-
-  function getSelectedFrequenciesForItem(item: PendingImportVideo): PlatformFrequency[] {
-    return item.selectedFrequencies;
-  }
-
-  function getDerivedCategoryForItem(item: PendingImportVideo): PlatformCategory | '' {
-    const categories = Array.from(
-      new Set(
-        getSelectedFrequenciesForItem(item)
-          .map((frequency) => normalizeCategory(frequency.category))
-          .filter((value): value is PlatformCategory => value !== ''),
-      ),
-    );
-    if (categories.length !== 1) return '';
-    return categories[0];
-  }
-
-  function getDerivedSportKeysForItem(item: PendingImportVideo): string[] {
-    const category = getDerivedCategoryForItem(item);
-    if (!(category === 'EF' || category === 'QF')) return [];
-    const next = new Set<string>();
-    getSelectedFrequenciesForItem(item).forEach((frequency) => {
-      const derived = deriveSelectionFromVenue(frequency.venue);
-      if (derived.sex != null && derived.sportItemId != null) {
-        next.add(sportKey(derived.sex, derived.sportItemId));
-      }
-    });
-    return Array.from(next);
-  }
-
-  function getEffectiveSportKeysForItem(item: PendingImportVideo): string[] {
-    const category = getDerivedCategoryForItem(item);
-    return category === 'EF' || category === 'QF'
-      ? getDerivedSportKeysForItem(item)
-      : item.manualSportKeys;
-  }
-
-  function getEffectiveSportItemIdsForItem(item: PendingImportVideo): number[] {
-    return Array.from(
-      new Set(
-        getEffectiveSportKeysForItem(item)
-          .map((key) => parseSportKey(key))
-          .filter((value): value is {sex: number; sportItemId: number} => value != null)
-          .map((value) => value.sportItemId),
-      ),
-    ).sort((a, b) => a - b);
-  }
-
-  function getItemSexes(item: PendingImportVideo): number[] {
-    return Array.from(
-      new Set(
-        getEffectiveSportKeysForItem(item)
-          .map((key) => parseSportKey(key))
-          .filter((value): value is {sex: number; sportItemId: number} => value != null)
-          .map((value) => value.sex),
-      ),
-    ).sort((a, b) => a - b);
-  }
-
-  function getItemValidationError(item: PendingImportVideo): string | null {
-    const match = getMatchById(item.matchId);
-    if (!match) return '请选择赛事';
-    const selectedFrequencies = getSelectedFrequenciesForItem(item);
-    if (selectedFrequencies.length === 0) return '请至少选择一个场次';
-    const categoryValues = Array.from(
-      new Set(
-        selectedFrequencies
-          .map((frequency) => normalizeCategory(frequency.category))
-          .filter((value): value is PlatformCategory => value !== ''),
-      ),
-    );
-    if (categoryValues.length !== 1) return '同一视频的场次必须属于同一比赛类型';
-    if (getEffectiveSportKeysForItem(item).length === 0) {
-      return categoryValues[0] === 'EF' || categoryValues[0] === 'QF'
-        ? '当前场次无法自动识别项目，请检查场次名称'
-        : '请至少选择一个项目';
-    }
-    return null;
-  }
-
-  const directClipSelectedCategories = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          directClipSelectedMatchIds.flatMap((matchId) =>
-            (directClipSelectedFrequenciesByMatchId[matchId] ?? [])
-              .map((frequency) => normalizeCategory(frequency.category))
-              .filter((value): value is PlatformCategory => value !== ''),
-          ),
-        ),
-      ),
-    [directClipSelectedFrequenciesByMatchId, directClipSelectedMatchIds],
-  );
-  const directClipRequiresManualApparatus = directClipSelectedCategories.some(
-    (category) => category === 'AA' || category === 'TF',
-  );
-  const directClipDerivedSportKeys = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          directClipSelectedMatchIds.flatMap((matchId) =>
-            (directClipSelectedFrequenciesByMatchId[matchId] ?? [])
-              .filter((frequency) => {
-                const category = normalizeCategory(frequency.category);
-                return category === 'EF' || category === 'QF';
-              })
-              .map((frequency) => deriveSelectionFromVenue(frequency.venue))
-              .filter((value) => value.sex != null && value.sportItemId != null)
-              .map((value) => sportKey(value.sex as number, value.sportItemId as number)),
-          ),
-        ),
-      ),
-    [directClipSelectedFrequenciesByMatchId, directClipSelectedMatchIds],
-  );
-  const directClipEffectiveSportKeys = useMemo(
-    () => (
-      directClipRequiresManualApparatus
-        ? [...directClipManualSportKeys]
-        : [...directClipDerivedSportKeys]
-    ),
-    [directClipDerivedSportKeys, directClipManualSportKeys, directClipRequiresManualApparatus],
-  );
-  const directClipManualSportKeySet = useMemo(
-    () => new Set(directClipEffectiveSportKeys),
-    [directClipEffectiveSportKeys],
-  );
-  const directClipHasAllMag = MAG_OPTIONS.every((option) => directClipManualSportKeySet.has(sportKey(1, option.id)));
-  const directClipHasAllWag = WAG_OPTIONS.every((option) => directClipManualSportKeySet.has(sportKey(2, option.id)));
-  const directClipScopeQueries = useMemo<PlatformScopeQuery[]>(() => {
-    const queries: PlatformScopeQuery[] = [];
-    directClipSelectedMatchIds.forEach((matchId) => {
-      const match = getMatchById(matchId);
-      if (!match) return;
-      const selectedFrequencies = directClipSelectedFrequenciesByMatchId[matchId] ?? [];
-      const groupedByCategory = new Map<PlatformCategory, PlatformFrequency[]>();
-      selectedFrequencies.forEach((frequency) => {
-        const category = normalizeCategory(frequency.category);
-        if (!category) return;
-        const existing = groupedByCategory.get(category) ?? [];
-        existing.push(frequency);
-        groupedByCategory.set(category, existing);
-      });
-
-      groupedByCategory.forEach((categoryFrequencies, category) => {
-        const sportSelectionKeys =
-          category === 'EF' || category === 'QF'
-            ? Array.from(
-                new Set(
-                  categoryFrequencies
-                    .map((frequency) => deriveSelectionFromVenue(frequency.venue))
-                    .filter((value) => value.sex != null && value.sportItemId != null)
-                    .map((value) => sportKey(value.sex as number, value.sportItemId as number)),
-                ),
-              )
-            : [...directClipEffectiveSportKeys];
-        const sportItemIds = Array.from(
-          new Set(
-            sportSelectionKeys
-              .map((key) => parseSportKey(key))
-              .filter((value): value is {sex: number; sportItemId: number} => value != null)
-              .map((value) => value.sportItemId),
-          ),
-        ).sort((a, b) => a - b);
-        if (categoryFrequencies.length === 0 || sportItemIds.length === 0) return;
-        const sexes = Array.from(
-          new Set(
-            sportSelectionKeys
-              .map((key) => parseSportKey(key))
-              .filter((value): value is {sex: number; sportItemId: number} => value != null)
-              .map((value) => value.sex),
-          ),
-        );
-        queries.push({
-          match_id: matchId,
-          match_name: match.match_name,
-          frequency_info_id: categoryFrequencies[0]?.id ?? null,
-          frequency_info_ids: categoryFrequencies.map((frequency) => frequency.id),
-          venue: categoryFrequencies[0]?.venue ?? '',
-          venues: categoryFrequencies.map((frequency) => frequency.venue),
-          category,
-          sex: sexes.length === 1 ? sexes[0] : null,
-          sport_selection_keys: sportSelectionKeys,
-          sport_item_ids: sportItemIds,
-          team_country: null,
-        });
-      });
-    });
-    return queries;
-  }, [directClipEffectiveSportKeys, directClipSelectedFrequenciesByMatchId, directClipSelectedMatchIds, platformMatches]);
-  const directClipValidationError = useMemo(() => {
-    if (pendingDirectClipFiles.length === 0) return '请先选择已有片段文件';
-    if (directClipSelectedMatchIds.length === 0) return '请至少选择一个比赛';
-    for (const matchId of directClipSelectedMatchIds) {
-      const match = getMatchById(matchId);
-      if (!match) return '存在无效的比赛选择';
-      const selectedFrequencies = directClipSelectedFrequenciesByMatchId[matchId] ?? [];
-      if (selectedFrequencies.length === 0) {
-        return `请至少为比赛《${match.match_name}》选择一个场次`;
-      }
-      if (selectedFrequencies.some((frequency) => normalizeCategory(frequency.category) === '')) {
-        return `比赛《${match.match_name}》存在无法识别比赛类型的场次`;
-      }
-    }
-    if (directClipRequiresManualApparatus && directClipEffectiveSportKeys.length === 0) {
-      return '当前包含全能或团体场次，请至少选择一个项目';
-    }
-    if (directClipScopeQueries.length === 0) {
-      return '当前选择无法生成平台卡片查询条件';
-    }
-    return null;
-  }, [
-    directClipEffectiveSportKeys.length,
-    directClipRequiresManualApparatus,
-    directClipScopeQueries.length,
-    directClipSelectedFrequenciesByMatchId,
-    directClipSelectedMatchIds,
-    pendingDirectClipFiles.length,
-    platformMatches,
-  ]);
-
   // selectedClipIds is already a Set in the zustand store; keep the alias for call-site stability.
   const selectedClipIdSet = selectedClipIds;
   const exportTargetClipIds = useMemo(
@@ -875,8 +563,6 @@ export default function App() {
       directSourceCount,
     };
   }, [exportTargetClips, videoById]);
-  const hasOssCredentials = Boolean(ossAccessKeyId.trim() && ossAccessKeySecret.trim());
-  const hasSavedOutputDir = savedOutputDir.trim().length > 0;
   const requiresUploadCredentials =
     exportOperation !== 'export_only' && exportTargetBoundCount - exportTargetLocalBoundCount > 0;
 
@@ -1045,41 +731,22 @@ export default function App() {
       return matchesQuery && matchesApparatus && matchesSex && matchesCountry;
     });
   }, [videoScopedPlatformRecords, scoreSearchQuery, scoreApparatusFilter, scoreSexFilter, scoreCountryFilter, videoById]);
-  const localPlatformRecords = useMemo(() => {
-    const query = scoreSearchQuery.trim().toLowerCase();
-    return videoScopedPlatformRecords.filter((entry) => {
-      if (!entry.is_local) return false;
-      const matchesApparatus =
-        scoreApparatusFilter === 'all' ||
-        String(entry.sport_item_id ?? '') === scoreApparatusFilter;
-      if (!matchesApparatus) return false;
-      if (!query) return true;
-      return (
-        entry.user_name.toLowerCase().includes(query) ||
-        entry.english_name.toLowerCase().includes(query) ||
-        entry.country.toLowerCase().includes(query)
-      );
-    });
-  }, [videoScopedPlatformRecords, scoreSearchQuery, scoreApparatusFilter]);
-  const localCardNameSuggestions = useMemo(() => {
-    const seen = new Set<string>();
-    const sorted = [...platformRecords]
-      .filter((r) => r.is_local && r.user_name.trim())
-      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
-    const result: string[] = [];
-    for (const record of sorted) {
-      if (seen.has(record.user_name)) continue;
-      seen.add(record.user_name);
-      result.push(record.user_name);
-    }
-    return result;
-  }, [platformRecords]);
-  const lastUsedLocalSportItemId = useMemo(() => {
-    const recent = [...platformRecords]
-      .filter((r) => r.is_local && r.sport_item_id != null)
-      .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))[0];
-    return recent ? String(recent.sport_item_id) : '';
-  }, [platformRecords]);
+  const localCardApi = useLocalCard({
+    activeVideoId,
+    videoScopedPlatformRecords,
+    platformRecords,
+    scoreSearchQuery,
+    scoreApparatusFilter,
+    onProjectUpdate: setProject,
+    setErrorMessage,
+    setSuccessMessage,
+    syncScoreApparatusFilter: (sportItemId) => {
+      if (scoreApparatusFilter !== 'all' && scoreApparatusFilter !== String(sportItemId)) {
+        setScoreApparatusFilter(String(sportItemId));
+      }
+    },
+  });
+  const {localPlatformRecords} = localCardApi;
   const groupedPlatformRecords = useMemo(() => {
     const groups: Array<{
       matchName: string;
@@ -1200,18 +867,10 @@ export default function App() {
     void refreshWorkspace();
   }, []);
 
+  // Load API key (and prime secure-storage gate); other export-related load is in useExportJobs
   useEffect(() => {
     if (!desktopBridge?.isDesktop) {
-      const browserDefaultDirectory = loadBrowserDefaultExportDirectory();
-      const browserUploadSettings = loadBrowserUploadSettings();
-      if (browserDefaultDirectory) {
-        setSavedOutputDir(browserDefaultDirectory);
-        setOutputDir(browserDefaultDirectory);
-      }
-      setUploadParallelFiles(browserUploadSettings.uploadParallelFiles);
-      setUploadPartThreads(browserUploadSettings.uploadPartThreads);
       apiKeyPersistenceReadyRef.current = true;
-      uploadSettingsPersistenceReadyRef.current = true;
       return;
     }
 
@@ -1236,55 +895,12 @@ export default function App() {
         }
       });
 
-    void desktopBridge
-      .loadOssCredentials()
-      .then((response) => {
-        if (cancelled) return;
-        if (response.accessKeyId) {
-          setOssAccessKeyId(response.accessKeyId);
-        }
-        if (response.accessKeySecret) {
-          setOssAccessKeySecret(response.accessKeySecret);
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-      });
-
-    void desktopBridge
-      .loadDefaultExportDirectory()
-      .then((response) => {
-        if (cancelled) return;
-        const nextDirectory = String(response.defaultExportDirectory || '').trim();
-        if (!nextDirectory) return;
-        setSavedOutputDir(nextDirectory);
-        setOutputDir(nextDirectory);
-      })
-      .catch(() => {
-        if (cancelled) return;
-      });
-
-    void desktopBridge
-      .loadUploadSettings()
-      .then((response) => {
-        if (cancelled) return;
-        setUploadParallelFiles(response.uploadParallelFiles);
-        setUploadPartThreads(response.uploadPartThreads);
-      })
-      .catch(() => {
-        if (cancelled) return;
-      })
-      .finally(() => {
-        if (!cancelled) {
-          uploadSettingsPersistenceReadyRef.current = true;
-        }
-      });
-
     return () => {
       cancelled = true;
     };
   }, [desktopBridge]);
 
+  // Debounce-persist API key
   useEffect(() => {
     if (!desktopBridge?.isDesktop) return;
     if (!apiKeyPersistenceReadyRef.current) return;
@@ -1307,61 +923,6 @@ export default function App() {
 
     return () => window.clearTimeout(timer);
   }, [desktopBridge, supportsSecureStorage, rememberApiKey, apiKey]);
-
-  useEffect(() => {
-    if (!uploadSettingsPersistenceReadyRef.current) return;
-
-    const timer = window.setTimeout(async () => {
-      const nextParallelFiles = Math.max(1, uploadParallelFiles);
-      const nextPartThreads = Math.max(1, uploadPartThreads);
-      if (desktopBridge?.isDesktop && desktopBridge.loadUploadSettings && desktopBridge.saveUploadSettings) {
-        try {
-          await desktopBridge.saveUploadSettings(nextParallelFiles, nextPartThreads);
-        } catch {
-          // ignore persistence failures to avoid blocking export configuration
-        }
-      } else {
-        saveBrowserUploadSettings(nextParallelFiles, nextPartThreads);
-      }
-    }, 250);
-
-    return () => window.clearTimeout(timer);
-  }, [desktopBridge, uploadParallelFiles, uploadPartThreads]);
-
-  useEffect(() => {
-    if (!desktopBridge?.isDesktop) return;
-    if (!apiKeyPersistenceReadyRef.current) return;
-    if (!supportsSecureStorage) return;
-
-    const timer = window.setTimeout(async () => {
-      const trimmedId = ossAccessKeyId.trim();
-      const trimmedSecret = ossAccessKeySecret.trim();
-      if (!trimmedId && !trimmedSecret) {
-        setIsPersistingOssCredentials(true);
-        try {
-          await desktopBridge.clearOssCredentials();
-        } catch (error) {
-          setErrorMessage(error instanceof Error ? error.message : '清除 OSS 凭证失败');
-        } finally {
-          setIsPersistingOssCredentials(false);
-        }
-        return;
-      }
-      if (!trimmedId || !trimmedSecret) {
-        return;
-      }
-      setIsPersistingOssCredentials(true);
-      try {
-        await desktopBridge.saveOssCredentials(trimmedId, trimmedSecret);
-      } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : '保存 OSS 凭证失败');
-      } finally {
-        setIsPersistingOssCredentials(false);
-      }
-    }, 250);
-
-    return () => window.clearTimeout(timer);
-  }, [desktopBridge, supportsSecureStorage, ossAccessKeyId, ossAccessKeySecret]);
 
   useEffect(() => {
     if (!successMessage) return;
@@ -1544,235 +1105,6 @@ export default function App() {
   }, [openScoreFilter]);
 
   useEffect(() => {
-    if (!showImportModal) {
-      setIsLoadingPlatformMatches(false);
-      return;
-    }
-    if (platformMatches.length > 0) return;
-    let cancelled = false;
-    setIsLoadingPlatformMatches(true);
-    void fetchPlatformMatches()
-      .then((response) => {
-        if (cancelled) return;
-        setPlatformMatches(response.matches);
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setErrorMessage(error instanceof Error ? error.message : '无法读取赛事列表');
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setIsLoadingPlatformMatches(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [showImportModal, platformMatches.length]);
-
-  useEffect(() => {
-    platformFrequenciesByMatchIdRef.current = platformFrequenciesByMatchId;
-  }, [platformFrequenciesByMatchId]);
-
-  useEffect(() => {
-    loadingFrequencyMatchIdsRef.current = loadingFrequencyMatchIds;
-  }, [loadingFrequencyMatchIds]);
-
-  useEffect(() => {
-    if (!showImportModal) {
-      loadingFrequencyMatchIdsRef.current = {};
-      setLoadingFrequencyMatchIds({});
-      return;
-    }
-    const seenMatchIds = new Set<string>();
-    const targetMatchIds =
-      importMode === 'direct_clip'
-        ? directClipSelectedMatchIds.reduce<string[]>((result, matchId) => {
-            if (!matchId || seenMatchIds.has(matchId)) {
-              return result;
-            }
-            seenMatchIds.add(matchId);
-            if (
-              !platformFrequenciesByMatchIdRef.current[matchId]
-              && !loadingFrequencyMatchIdsRef.current[matchId]
-            ) {
-              result.push(matchId);
-            }
-            return result;
-          }, [])
-        : pendingImportVideos.reduce<string[]>((result, item) => {
-            if (!item.matchId || seenMatchIds.has(item.matchId)) {
-              return result;
-            }
-            seenMatchIds.add(item.matchId);
-            if (
-              !platformFrequenciesByMatchIdRef.current[item.matchId]
-              && !loadingFrequencyMatchIdsRef.current[item.matchId]
-            ) {
-              result.push(item.matchId);
-            }
-            return result;
-          }, []);
-    if (targetMatchIds.length === 0) return;
-
-    const nextLoadingState = {...loadingFrequencyMatchIdsRef.current};
-    targetMatchIds.forEach((matchId) => {
-      nextLoadingState[matchId] = true;
-    });
-    loadingFrequencyMatchIdsRef.current = nextLoadingState;
-    setLoadingFrequencyMatchIds(nextLoadingState);
-
-    void Promise.all(
-      targetMatchIds.map(async (matchId) => {
-        const match = platformMatches.find((item) => item.id === matchId) ?? null;
-        if (!match) return [matchId, []] as const;
-        const response = await fetchPlatformFrequencies({
-          matchId,
-          matchName: match.match_name,
-        });
-        return [matchId, response.frequencies] as const;
-      }),
-    )
-      .then((entries) => {
-        const nextFrequencyMap = {...platformFrequenciesByMatchIdRef.current};
-        for (const [matchId, frequencies] of entries) {
-          nextFrequencyMap[matchId] = frequencies;
-        }
-        platformFrequenciesByMatchIdRef.current = nextFrequencyMap;
-        setPlatformFrequenciesByMatchId(nextFrequencyMap);
-      })
-      .catch((error) => {
-        setErrorMessage(error instanceof Error ? error.message : '无法读取场次列表');
-      })
-      .finally(() => {
-        const settledLoadingState = {...loadingFrequencyMatchIdsRef.current};
-        targetMatchIds.forEach((matchId) => {
-          delete settledLoadingState[matchId];
-        });
-        loadingFrequencyMatchIdsRef.current = settledLoadingState;
-        setLoadingFrequencyMatchIds(settledLoadingState);
-      });
-  }, [directClipSelectedMatchIds, importMode, pendingImportVideos, platformMatches, showImportModal]);
-
-  useEffect(() => {
-    if (!showImportModal) {
-      setPreviewByImportId({});
-      setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-      return;
-    }
-
-    if (importMode === 'direct_clip') {
-      let cancelled = false;
-      if (directClipValidationError) {
-        setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-        return () => {
-          cancelled = true;
-        };
-      }
-
-      setDirectClipPreview((current) => ({
-        count: current.count,
-        loading: true,
-        error: null,
-        cacheKey: current.cacheKey,
-      }));
-      const timer = window.setTimeout(() => {
-        void previewScopePlatformRecords(directClipScopeQueries)
-        .then((response) => {
-          if (cancelled) return;
-          setDirectClipPreview({
-            count: response.count,
-            loading: false,
-            error: null,
-            cacheKey: response.cache_key ?? null,
-          });
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          setDirectClipPreview({
-            count: null,
-            loading: false,
-            error: error instanceof Error ? error.message : '预览失败',
-            cacheKey: null,
-          });
-        });
-      }, 500);
-      return () => {
-        cancelled = true;
-        window.clearTimeout(timer);
-      };
-    }
-
-    let cancelled = false;
-
-    async function loadPreviews() {
-      const nextState: Record<string, {count: number | null; loading: boolean; error: string | null}> = {};
-      pendingImportVideos.forEach((item) => {
-        nextState[item.clientFileId] = {count: null, loading: false, error: null};
-      });
-      setPreviewByImportId(nextState);
-
-      for (const item of pendingImportVideos) {
-        const validationError = getItemValidationError(item);
-        if (validationError) {
-          continue;
-        }
-
-        const match = getMatchById(item.matchId);
-        const selectedFrequencies = getSelectedFrequenciesForItem(item);
-        const category = getDerivedCategoryForItem(item);
-        const sportItemIds = getEffectiveSportItemIdsForItem(item);
-        if (!match || selectedFrequencies.length === 0 || !category || sportItemIds.length === 0) {
-          continue;
-        }
-
-        setPreviewByImportId((current) => ({
-          ...current,
-          [item.clientFileId]: {count: current[item.clientFileId]?.count ?? null, loading: true, error: null},
-        }));
-        try {
-          const response = await fetchPlatformRecords({
-            matchId: item.matchId,
-            matchName: match.match_name,
-            frequencyInfoIds: selectedFrequencies.map((frequency) => frequency.id),
-            venues: selectedFrequencies.map((frequency) => frequency.venue),
-            category,
-            sportSelectionKeys: getEffectiveSportKeysForItem(item),
-            sportItemIds,
-          });
-          if (cancelled) return;
-          setPreviewByImportId((current) => ({
-            ...current,
-            [item.clientFileId]: {count: response.count, loading: false, error: null},
-          }));
-        } catch (error) {
-          if (cancelled) return;
-          setPreviewByImportId((current) => ({
-            ...current,
-            [item.clientFileId]: {
-              count: null,
-              loading: false,
-              error: error instanceof Error ? error.message : '预览失败',
-            },
-          }));
-        }
-      }
-    }
-
-    void loadPreviews();
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    directClipScopeQueries,
-    directClipValidationError,
-    importMode,
-    pendingImportVideos,
-    platformFrequenciesByMatchId,
-    platformMatches,
-    showImportModal,
-  ]);
-
-  useEffect(() => {
     if (!activeClip) {
       setTrimStart(0);
       setTrimEnd(0);
@@ -1831,77 +1163,6 @@ export default function App() {
   useEffect(() => {
     setVideoPlaybackError(null);
   }, [streamUrl, activeVideoId]);
-
-  useEffect(() => {
-    for (const job of jobs) {
-      if (job.status === 'queued' || job.status === 'running') continue;
-      if (handledJobIdsRef.current.has(job.id)) continue;
-      handledJobIdsRef.current.add(job.id);
-
-      if (job.status === 'failed') {
-        setErrorMessage(job.error_message || `${job.kind === 'detect' ? '检测' : '导出'}任务失败`);
-        continue;
-      }
-
-      if (job.status === 'cancelled') {
-        if (job.kind === 'detect') {
-          setSuccessMessage('检测已取消');
-        }
-        continue;
-      }
-
-      if (job.kind === 'detect') {
-        const totalCandidates = Number(job.result.total_candidates || 0);
-        setSuccessMessage(`检测完成，生成 ${totalCandidates} 个候选片段`);
-        continue;
-      }
-
-      if (job.kind === 'export') {
-        const summary = summarizeExportJob(job, outputDir);
-        const {operation} = summary;
-        setExportSummary(summary);
-        if (operation === 'export_only') {
-          setSuccessMessage(`导出完成：本地 ${summary.exported}/${summary.attempted}`);
-        } else if (operation === 'upload_only') {
-          setSuccessMessage(`上传完成：OSS ${summary.uploaded}/${summary.attempted}，回写 ${summary.synced}`);
-        } else {
-          setSuccessMessage(`导出完成：本地 ${summary.exported}/${summary.attempted}，上传 ${summary.uploaded}，回写 ${summary.synced}`);
-        }
-      }
-    }
-  }, [jobs, outputDir]);
-
-  useEffect(() => {
-    if (!desktopBridge?.isDesktop || !desktopBridge.showSystemNotification) return;
-
-    if (!desktopNotificationPrimedRef.current) {
-      for (const job of jobs) {
-        if (job.status === 'queued' || job.status === 'running') continue;
-        notifiedDesktopJobIdsRef.current.add(job.id);
-      }
-      desktopNotificationPrimedRef.current = true;
-      return;
-    }
-
-    for (const job of jobs) {
-      if (job.status === 'queued' || job.status === 'running') continue;
-      if (notifiedDesktopJobIdsRef.current.has(job.id)) continue;
-      notifiedDesktopJobIdsRef.current.add(job.id);
-      if (job.kind !== 'export') continue;
-
-      const payload =
-        job.status === 'failed'
-          ? buildExportFailedNotification(job, outputDir)
-          : job.status === 'completed'
-            ? buildExportCompletedNotification(summarizeExportJob(job, outputDir))
-            : null;
-      if (!payload) continue;
-
-      void desktopBridge.showSystemNotification(payload).catch(() => {
-        // Ignore notification failures and keep in-app status as the source of truth.
-      });
-    }
-  }, [desktopBridge, jobs, outputDir]);
 
   useEffect(() => {
     if (!activeVideo || !activeClip) {
@@ -2615,301 +1876,6 @@ export default function App() {
     }
   }
 
-  async function handleImportFiles(
-    fileList: FileList | File[] | DesktopImportSource[],
-    mode: ImportMode = 'full_video',
-  ) {
-    const rawEntries: Array<File | DesktopImportSource> = fileList instanceof FileList
-      ? Array.from(fileList)
-      : [...fileList];
-    const entries = rawEntries.filter((item) =>
-      isDesktopImportSource(item)
-        ? !item.name.startsWith('.') && /\.(mp4|mov|mkv|avi|flv|wmv)$/i.test(item.name)
-        : !item.name.startsWith('.') && (item.type.startsWith('video/') || /\.(mp4|mov|mkv|avi|flv|wmv)$/i.test(item.name)),
-    );
-    if (!entries.length) {
-      setErrorMessage('未检测到支持的视频文件');
-      return;
-    }
-    setImportMode(mode);
-    if (mode === 'direct_clip') {
-      setPendingDirectClipFiles(entries.map((file) => createPendingDirectClipFile(file)));
-      setDirectClipSelectedMatchIds([]);
-      setDirectClipSelectedFrequenciesByMatchId({});
-      setDirectClipManualSportKeys([]);
-      setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-      setPendingImportVideos([]);
-      setPreviewByImportId({});
-    } else {
-      setPendingImportVideos(entries.map((file) => createPendingImportVideo(file)));
-      setPendingDirectClipFiles([]);
-      setDirectClipSelectedMatchIds([]);
-      setDirectClipSelectedFrequenciesByMatchId({});
-      setDirectClipManualSportKeys([]);
-      setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-    }
-    setPreviewByImportId({});
-    setShowImportModal(true);
-    setErrorMessage(null);
-    setSuccessMessage(null);
-  }
-
-  async function openImportSourcePicker(mode: ImportMode) {
-    if (desktopBridge?.isDesktop && desktopBridge.selectImportSources) {
-      try {
-        const sources = await desktopBridge.selectImportSources();
-        if (sources.length > 0) {
-          await handleImportFiles(sources, mode);
-        }
-      } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : '选择导入文件夹失败');
-      }
-      return;
-    }
-    if (mode === 'direct_clip') {
-      directClipFileInputRef.current?.click();
-    } else {
-      fileInputRef.current?.click();
-    }
-  }
-
-  function closeImportModal() {
-    if (isImporting) return;
-    setShowImportModal(false);
-    setImportMode('full_video');
-    setPendingImportVideos([]);
-    setPendingDirectClipFiles([]);
-    setDirectClipSelectedMatchIds([]);
-    setDirectClipSelectedFrequenciesByMatchId({});
-    setDirectClipManualSportKeys([]);
-    setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-    setPreviewByImportId({});
-    setIsLoadingPlatformMatches(false);
-    setLoadingFrequencyMatchIds({});
-  }
-
-  function updatePendingImportVideo(clientFileId: string, updater: (item: PendingImportVideo) => PendingImportVideo) {
-    setPendingImportVideos((current) =>
-      current.map((item) => (item.clientFileId === clientFileId ? updater(item) : item)),
-    );
-  }
-
-  function resetPreviewForImportVideo(clientFileId: string) {
-    setPreviewByImportId((current) => ({
-      ...current,
-      [clientFileId]: {count: null, loading: false, error: null},
-    }));
-  }
-
-  function resetDirectClipPreview() {
-    setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-  }
-
-  function togglePendingVideoApparatus(clientFileId: string, sex: number, sportItemId: number) {
-    updatePendingImportVideo(clientFileId, (item) => ({
-      ...item,
-      manualSportKeys: toggleSportKey(item.manualSportKeys, sportKey(sex, sportItemId)),
-    }));
-    resetPreviewForImportVideo(clientFileId);
-  }
-
-  function setPendingVideoApparatusGroup(clientFileId: string, sex: number, ids: number[]) {
-    updatePendingImportVideo(clientFileId, (item) => {
-      const keys = ids.map((id) => sportKey(sex, id));
-      const hasAll = keys.every((key) => item.manualSportKeys.includes(key));
-      return {
-        ...item,
-        manualSportKeys: hasAll
-          ? item.manualSportKeys.filter((key) => !keys.includes(key))
-          : Array.from(new Set([...item.manualSportKeys.filter((key) => !keys.includes(key)), ...keys])),
-      };
-    });
-    resetPreviewForImportVideo(clientFileId);
-  }
-
-  function setPendingVideoMatch(clientFileId: string, matchId: string | null) {
-    updatePendingImportVideo(clientFileId, (item) => ({
-      ...item,
-      matchId,
-      selectedFrequencies: [],
-      manualSportKeys: [],
-    }));
-    resetPreviewForImportVideo(clientFileId);
-  }
-
-  function togglePendingVideoFrequency(clientFileId: string, frequency: PlatformFrequency) {
-    updatePendingImportVideo(clientFileId, (item) => {
-      const nextSelectedFrequencies = item.selectedFrequencies.some((entry) => entry.id === frequency.id)
-        ? item.selectedFrequencies.filter((entry) => entry.id !== frequency.id)
-        : [...item.selectedFrequencies, frequency];
-      const nextCategories = Array.from(
-        new Set(
-          nextSelectedFrequencies
-            .map((entry) => normalizeCategory(entry.category))
-            .filter((value): value is PlatformCategory => value !== ''),
-        ),
-      );
-      if (nextCategories.length > 1) {
-        setErrorMessage('同一视频只能选择同一比赛类型的场次');
-        return item;
-      }
-      return {
-        ...item,
-        selectedFrequencies: nextSelectedFrequencies,
-        manualSportKeys:
-          nextCategories[0] === 'EF' || nextCategories[0] === 'QF'
-            ? []
-            : item.manualSportKeys,
-      };
-    });
-    resetPreviewForImportVideo(clientFileId);
-  }
-
-  function toggleDirectClipMatch(matchId: string) {
-    setDirectClipSelectedMatchIds((current) => {
-      const exists = current.includes(matchId);
-      const next = exists ? current.filter((id) => id !== matchId) : [...current, matchId];
-      if (exists) {
-        setDirectClipSelectedFrequenciesByMatchId((currentFrequencies) => {
-          const copy = {...currentFrequencies};
-          delete copy[matchId];
-          return copy;
-        });
-      }
-      return next;
-    });
-    resetDirectClipPreview();
-  }
-
-  function toggleDirectClipFrequency(matchId: string, frequency: PlatformFrequency) {
-    setDirectClipSelectedFrequenciesByMatchId((current) => {
-      const existing = current[matchId] ?? [];
-      return {
-        ...current,
-        [matchId]: existing.some((entry) => entry.id === frequency.id)
-          ? existing.filter((entry) => entry.id !== frequency.id)
-          : [...existing, frequency],
-      };
-    });
-    resetDirectClipPreview();
-  }
-
-  function toggleDirectClipApparatus(sex: number, sportItemId: number) {
-    setDirectClipManualSportKeys((current) => toggleSportKey(current, sportKey(sex, sportItemId)));
-    resetDirectClipPreview();
-  }
-
-  function setDirectClipApparatusGroup(sex: number, ids: number[]) {
-    setDirectClipManualSportKeys((current) => {
-      const keys = ids.map((id) => sportKey(sex, id));
-      const hasAll = keys.every((key) => current.includes(key));
-      return hasAll
-        ? current.filter((key) => !keys.includes(key))
-        : Array.from(new Set([...current.filter((key) => !keys.includes(key)), ...keys]));
-    });
-    resetDirectClipPreview();
-  }
-
-  async function handleSubmitImport() {
-    if (isImporting) return;
-    if (importMode === 'direct_clip') {
-      if (directClipValidationError) {
-        setErrorMessage(directClipValidationError);
-        return;
-      }
-      if (directClipPreview.error) {
-        setErrorMessage(directClipPreview.error);
-        return;
-      }
-
-      setIsImporting(true);
-      setSuccessMessage(null);
-      try {
-        const response = await importDirectClipFiles(
-          pendingDirectClipFiles.map((item) => ({
-            clientFileId: item.clientFileId,
-            file: item.file,
-            path: item.path,
-          })),
-          directClipScopeQueries,
-          directClipPreview.cacheKey,
-        );
-        setProjectState(response.project);
-        if (response.imported_videos.length > 0) {
-          setActiveVideoId(response.imported_videos[0].id);
-        }
-        setErrorMessage(null);
-        setSuccessMessage(`已导入 ${response.imported_count} 个已有片段`);
-        setShowImportModal(false);
-        setImportMode('full_video');
-        setPendingDirectClipFiles([]);
-        setDirectClipSelectedMatchIds([]);
-        setDirectClipSelectedFrequenciesByMatchId({});
-        setDirectClipManualSportKeys([]);
-        setDirectClipPreview({count: null, loading: false, error: null, cacheKey: null});
-      } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : '导入已有片段失败');
-      } finally {
-        setIsImporting(false);
-      }
-      return;
-    }
-
-    const invalidRow = pendingImportVideos.find(
-      (item) => Boolean(getItemValidationError(item)),
-    );
-    if (invalidRow) {
-      setErrorMessage(`请先完成视频《${invalidRow.name}》的比赛、场次和项目选择`);
-      return;
-    }
-    const failedPreview = pendingImportVideos.find((item) => previewByImportId[item.clientFileId]?.error);
-    if (failedPreview) {
-      setErrorMessage(`视频《${failedPreview.name}》的平台卡片预览失败，请先修正查询条件`);
-      return;
-    }
-
-    setIsImporting(true);
-    setSuccessMessage(null);
-    try {
-      const response = await importProjectFiles(
-        pendingImportVideos.flatMap((item) => {
-          const match = getMatchById(item.matchId);
-          const selectedFrequencies = getSelectedFrequenciesForItem(item);
-          const category = getDerivedCategoryForItem(item);
-          const sportItemIds = getEffectiveSportItemIdsForItem(item);
-          if (!match || selectedFrequencies.length === 0 || !category || sportItemIds.length === 0) {
-            return [];
-          }
-          return [{
-            clientFileId: item.clientFileId,
-            file: item.file,
-            path: item.path,
-            matchId: item.matchId,
-            matchName: match.match_name,
-            frequencyInfoIds: selectedFrequencies.map((frequency) => frequency.id),
-            venues: selectedFrequencies.map((frequency) => frequency.venue),
-            category,
-            sportSelectionKeys: getEffectiveSportKeysForItem(item),
-            sportItemIds,
-          }];
-        }),
-      );
-      setProjectState(response.project);
-      if (response.imported_videos.length > 0) {
-        setActiveVideoId(response.imported_videos[0].id);
-      }
-      setErrorMessage(null);
-      setSuccessMessage(`已导入 ${response.imported_count} 个视频`);
-      setShowImportModal(false);
-      setPendingImportVideos([]);
-      setPreviewByImportId({});
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '导入失败');
-    } finally {
-      setIsImporting(false);
-    }
-  }
-
   async function handleBindScoreCard(platformRecordId: string | null) {
     if (!activeClip) return;
     if (guardClipMutation(activeClip.id)) return;
@@ -2921,102 +1887,6 @@ export default function App() {
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '绑定平台成绩卡片失败');
     }
-  }
-
-  function validateLocalCardForm(form: LocalCardFormState): string | null {
-    if (!form.user_name.trim()) return '姓名不能为空';
-    if (!form.sport_item_id.trim()) return '请选择项目';
-    return null;
-  }
-
-  function buildLocalCardPayload(form: LocalCardFormState) {
-    const total = form.total_overridden && form.total_score.trim() !== ''
-      ? form.total_score.trim()
-      : computeLocalCardAutoTotal(form);
-    return {
-      user_name: form.user_name.trim(),
-      english_name: form.english_name.trim() || undefined,
-      country: form.country.trim() || undefined,
-      sport_item_id: Number(form.sport_item_id),
-      difficulty_score: form.difficulty_score.trim() || '0',
-      execution_score: form.execution_score.trim() || '0',
-      bonus_score: form.bonus_score.trim() || '0',
-      penalty_score: form.penalty_score.trim() || '0',
-      total_score: total,
-    };
-  }
-
-  async function handleSaveLocalCardDraft() {
-    if (!activeVideo || !localCardDraft || localCardSaving) return;
-    const validation = validateLocalCardForm(localCardDraft);
-    if (validation) {
-      setErrorMessage(validation);
-      return;
-    }
-    setLocalCardSaving(true);
-    try {
-      const response = await createLocalCard(activeVideo.id, buildLocalCardPayload(localCardDraft));
-      setProjectState(response.project);
-      setLocalCardDraft(null);
-      const newSportItemId = response.record.sport_item_id;
-      if (newSportItemId != null && scoreApparatusFilter !== 'all' && scoreApparatusFilter !== String(newSportItemId)) {
-        setScoreApparatusFilter(String(newSportItemId));
-      }
-      setErrorMessage(null);
-      setSuccessMessage('已创建本地补录卡片');
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '创建本地补录卡片失败');
-    } finally {
-      setLocalCardSaving(false);
-    }
-  }
-
-  async function handleSaveLocalCardEdit(recordId: string) {
-    if (!activeVideo || !editingLocalCardForm || localCardSaving) return;
-    const validation = validateLocalCardForm(editingLocalCardForm);
-    if (validation) {
-      setErrorMessage(validation);
-      return;
-    }
-    setLocalCardSaving(true);
-    try {
-      const response = await updateLocalCard(activeVideo.id, recordId, buildLocalCardPayload(editingLocalCardForm));
-      setProjectState(response.project);
-      setEditingLocalCardId(null);
-      setEditingLocalCardForm(null);
-      setErrorMessage(null);
-      setSuccessMessage('已更新本地补录卡片');
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '更新本地补录卡片失败');
-    } finally {
-      setLocalCardSaving(false);
-    }
-  }
-
-  async function handleDeleteLocalCardClick(recordId: string) {
-    if (!activeVideo || localCardSaving) return;
-    if (!window.confirm('删除本地补录卡片?已绑定的片段将自动解绑。')) return;
-    setLocalCardSaving(true);
-    try {
-      const response = await deleteLocalCard(activeVideo.id, recordId);
-      setProjectState(response.project);
-      if (editingLocalCardId === recordId) {
-        setEditingLocalCardId(null);
-        setEditingLocalCardForm(null);
-      }
-      setErrorMessage(null);
-      setSuccessMessage('已删除本地补录卡片');
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '删除本地补录卡片失败');
-    } finally {
-      setLocalCardSaving(false);
-    }
-  }
-
-  function startEditingLocalCard(record: PlatformRecord) {
-    setLocalCardDraft(null);
-    setEditingLocalCardId(record.id);
-    setEditingLocalCardForm(localCardRecordToForm(record));
   }
 
   async function handleDetectActiveVideo() {
@@ -3430,18 +2300,6 @@ export default function App() {
       discardClipUndoSnapshot(undoSnapshot);
       setErrorMessage(error instanceof Error ? error.message : '独立选区失败');
     }
-  }
-
-  async function persistDefaultOutputDirectory(nextPath: string) {
-    const trimmed = nextPath.trim();
-    if (!trimmed) return;
-
-    if (desktopBridge?.isDesktop && desktopBridge.loadDefaultExportDirectory && desktopBridge.saveDefaultExportDirectory) {
-      await desktopBridge.saveDefaultExportDirectory(trimmed);
-    } else {
-      saveBrowserDefaultExportDirectory(trimmed);
-    }
-    setSavedOutputDir(trimmed);
   }
 
   async function handleExport() {
@@ -3892,9 +2750,9 @@ export default function App() {
           )}
           <button
             onClick={() => {
-              setExportOperation('export_and_upload');
-              setIsOssCredentialsExpanded(!hasOssCredentials);
-              setIsUploadSettingsExpanded(false);
+              exportApi.setExportOperation('export_and_upload');
+              exportApi.setIsOssCredentialsExpanded(!hasOssCredentials);
+              exportApi.setIsUploadSettingsExpanded(false);
               setShowExport(true);
             }}
             className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-red-500 hover:bg-red-600 text-white font-medium flex items-center justify-center gap-2 whitespace-nowrap shadow-sm transition-colors disabled:opacity-50"
@@ -4766,14 +3624,8 @@ export default function App() {
                   {activeVideo && (
                     <button
                       type="button"
-                      onClick={() => {
-                        setEditingLocalCardId(null);
-                        setEditingLocalCardForm(null);
-                        setLocalCardDraft((current) =>
-                          current ?? {...emptyLocalCardForm(), sport_item_id: lastUsedLocalSportItemId},
-                        );
-                      }}
-                      disabled={localCardDraft != null}
+                      onClick={localCardApi.beginCreateDraft}
+                      disabled={localCardApi.localCardDraft != null}
                       title="新增本地补录卡片"
                       className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
                     >
@@ -4833,7 +3685,7 @@ export default function App() {
                     当前没有选中视频。
                   </div>
                 )}
-                {activeVideo && videoScopedPlatformRecords.length === 0 && !localCardDraft && (
+                {activeVideo && videoScopedPlatformRecords.length === 0 && !localCardApi.localCardDraft && (
                   <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
                     当前视频上下文没有查到平台成绩卡片。请检查导入时选择的比赛、场次和项目；或点击右上角「+ 本地补录」手动添加。
                   </div>
@@ -4843,142 +3695,13 @@ export default function App() {
                     当前筛选条件下没有命中的成绩卡片。
                   </div>
                 )}
-                {localCardDraft && activeVideo && (
-                  <LocalCardInlineForm
-                    form={localCardDraft}
-                    setForm={(updater) => setLocalCardDraft((prev) => (prev ? updater(prev) : prev))}
-                    onSave={() => void handleSaveLocalCardDraft()}
-                    onCancel={() => setLocalCardDraft(null)}
-                    saving={localCardSaving}
-                    title="新建本地补录卡片"
-                    nameSuggestions={localCardNameSuggestions}
-                  />
-                )}
-                {activeVideo && localPlatformRecords.length > 0 && (
-                  <div className="space-y-2">
-                    <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-amber-700">
-                      本地补录
-                    </div>
-                    {localPlatformRecords.map((entry) => {
-                      const isActive = activeClip.linked_platform_record_id === entry.id;
-                      const isBound = entry.linked_clip_ids.length > 0;
-                      const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
-                      const theme = bindingTheme(entry.id);
-                      const linkedClipLabels = entry.linked_clip_ids
-                        .map((clipId) => clipOrdinalById.get(clipId))
-                        .filter((value): value is number => value != null)
-                        .map((value) => `#${value}`);
-                      const bindingLabel = isActive
-                        ? `片段${linkedClipLabels[0] ?? `#${clipOrdinalById.get(activeClip.id) ?? '--'}`}`
-                        : isBoundElsewhere
-                          ? `片段${linkedClipLabels[0]}`
-                          : null;
-
-                      if (editingLocalCardId === entry.id && editingLocalCardForm) {
-                        return (
-                          <React.Fragment key={entry.id}>
-                            <LocalCardInlineForm
-                              form={editingLocalCardForm}
-                              setForm={(updater) => setEditingLocalCardForm((prev) => (prev ? updater(prev) : prev))}
-                              onSave={() => void handleSaveLocalCardEdit(entry.id)}
-                              onCancel={() => {
-                                setEditingLocalCardId(null);
-                                setEditingLocalCardForm(null);
-                              }}
-                              saving={localCardSaving}
-                              title="编辑本地补录卡片"
-                              onDelete={() => void handleDeleteLocalCardClick(entry.id)}
-                              nameSuggestions={localCardNameSuggestions}
-                            />
-                          </React.Fragment>
-                        );
-                      }
-
-                      return (
-                        <button
-                          key={entry.id}
-                          type="button"
-                          disabled={isBoundElsewhere || activeClipLockedByExport}
-                          onClick={(event) => {
-                            event.currentTarget.blur();
-                            if (isBoundElsewhere || activeClipLockedByExport) return;
-                            void handleBindScoreCard(isActive ? null : entry.id);
-                          }}
-                          className={`relative w-full rounded-2xl border border-amber-200 bg-amber-50/40 px-3 py-2.5 text-left transition-all shadow-[0_6px_18px_rgba(15,23,42,0.05)] ${
-                            isActive
-                              ? 'hover:border-amber-300'
-                              : isBoundElsewhere || activeClipLockedByExport
-                                ? 'cursor-not-allowed opacity-90'
-                                : 'hover:border-amber-300 hover:shadow-[0_10px_24px_rgba(15,23,42,0.08)]'
-                          }`}
-                        >
-                          {(isActive || isBound) && (
-                            <span
-                              className="absolute left-1 top-2 bottom-2 w-1 rounded-full"
-                              style={{backgroundColor: theme.accent}}
-                            />
-                          )}
-                          <div className="absolute right-2 top-2 flex items-center gap-1">
-                            <span className="rounded-full bg-amber-200/80 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900">
-                              本地补录
-                            </span>
-                            <span
-                              role="button"
-                              tabIndex={0}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                event.preventDefault();
-                                startEditingLocalCard(entry);
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === 'Enter' || event.key === ' ') {
-                                  event.stopPropagation();
-                                  event.preventDefault();
-                                  startEditingLocalCard(entry);
-                                }
-                              }}
-                              className="cursor-pointer rounded-md border border-amber-300 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 hover:bg-amber-100"
-                            >
-                              编辑
-                            </span>
-                          </div>
-                          <div className="flex items-start justify-between gap-3 pr-20">
-                            <div className="min-w-0">
-                              <p className="text-[15px] font-semibold leading-5 text-gray-900 truncate">
-                                {entry.english_name || entry.user_name || '未命名'}
-                              </p>
-                              {entry.user_name && (
-                                <div className="mt-0.5 text-[11px] text-gray-500 truncate">{entry.user_name}</div>
-                              )}
-                              <div className="mt-1 text-[11px] text-gray-500 truncate">
-                                {(entry.country || '--')} · {(entry.sport_item_label || '--')}
-                              </div>
-                              <div className="mt-2 text-[11px] font-semibold text-black whitespace-nowrap overflow-hidden text-ellipsis">
-                                {scoreFormulaLabel(entry)}
-                              </div>
-                            </div>
-                            <div className="shrink-0 text-right">
-                              <div className="text-xl font-bold text-black">{primaryScoreValue(entry)}</div>
-                              {bindingLabel && (
-                                <div
-                                  className="mt-1 text-[11px] font-medium"
-                                  style={{color: theme.text}}
-                                >
-                                  {bindingLabel}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                          {!isBound && (
-                            <div className="mt-2 text-[11px] text-gray-400">
-                              {activeClipLockedByExport ? '导出批次中，只读' : '可绑定'}
-                            </div>
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                <LocalCardPanel
+                  api={localCardApi}
+                  activeClip={activeClip}
+                  activeClipLockedByExport={activeClipLockedByExport}
+                  clipOrdinalById={clipOrdinalById}
+                  onBindScoreCard={(recordId) => void handleBindScoreCard(recordId)}
+                />
                 {groupedPlatformRecords.map((matchGroup) => (
                   <div key={matchGroup.matchName} className="space-y-2">
                     <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
@@ -5093,837 +3816,24 @@ export default function App() {
         </div>
       )}
 
-      {showImportModal && (
-        <div className="fixed inset-0 z-40 bg-gray-900/40 backdrop-blur-sm flex items-center justify-center p-6">
-          <div className="w-full max-w-6xl max-h-[88vh] bg-white border border-gray-100 rounded-3xl shadow-2xl overflow-hidden flex flex-col">
-            <div className="p-5 border-b border-gray-100 flex items-center justify-between bg-white">
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900">
-                  {importMode === 'direct_clip' ? '导入已有片段' : '导入视频与平台成绩卡片'}
-                </h3>
-                <p className="text-sm text-gray-500 mt-1">
-                  {importMode === 'direct_clip'
-                    ? '这一批片段共用一套平台查询条件；每个文件导入后直接成为一个可绑定、可导出的候选片段。'
-                    : '每个视频独立选择比赛与场次；单项会自动识别项目，全能和团体按视频实际内容手动勾选项目。'}
-                </p>
-              </div>
-              <button
-                onClick={closeImportModal}
-                disabled={isImporting}
-                className="text-gray-400 hover:text-gray-600 transition-colors disabled:opacity-40"
-              >
-                <XCircle size={22} />
-              </button>
-            </div>
+      <VideoImportPanel api={importApi} />
 
-            {importMode === 'full_video' ? (
-              <div className="flex-1 min-h-0 grid grid-cols-[1.55fr_0.85fr]">
-              <div className="border-r border-gray-100 min-h-0 flex flex-col bg-gray-50/40">
-                <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-                  <div>
-                    <div className="text-sm font-semibold text-gray-900">待导入视频</div>
-                    <div className="text-xs text-gray-500 mt-1">{pendingImportVideos.length} 个文件</div>
-                  </div>
-                  <button
-                    onClick={() => void openImportSourcePicker('full_video')}
-                    className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50"
-                  >
-                    <Upload size={15} />
-                    重新选择视频
-                  </button>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {pendingImportVideos.map((item) => {
-                    const match = getMatchById(item.matchId);
-                    const availableFrequencies = getFrequenciesForMatch(item.matchId);
-                    const selectedFrequencyIdSet = new Set(item.selectedFrequencies.map((frequency) => frequency.id));
-                    const selectedFrequencies = getSelectedFrequenciesForItem(item);
-                    const derivedCategory = getDerivedCategoryForItem(item);
-                    const effectiveSportKeys = getEffectiveSportKeysForItem(item);
-                    const effectiveSportKeySet = new Set(effectiveSportKeys);
-                    const isAutoDerivedByVenue = derivedCategory === 'EF' || derivedCategory === 'QF';
-                    const canChooseManualApparatus = selectedFrequencies.length > 0 && !isAutoDerivedByVenue;
-                    const hasAllMag = MAG_OPTIONS.every((option) => effectiveSportKeySet.has(sportKey(1, option.id)));
-                    const hasAllWag = WAG_OPTIONS.every((option) => effectiveSportKeySet.has(sportKey(2, option.id)));
-                    const validationMessage = getItemValidationError(item);
-                    const isLoadingFrequencies = item.matchId ? Boolean(loadingFrequencyMatchIds[item.matchId]) : false;
-                    const preview = previewByImportId[item.clientFileId];
-                    return (
-                      <div key={item.clientFileId} className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-4">
-                        <div className="flex items-start justify-between gap-4">
-                          <div className="min-w-0">
-                            <div className="text-sm font-semibold text-gray-900 truncate">{item.name}</div>
-                            <div className="mt-1 text-xs text-gray-500">
-                              {(item.sizeBytes / (1024 * 1024)).toFixed(1)} MB
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-xs text-gray-400">平台卡片预览</div>
-                            <div className={`mt-1 text-sm font-semibold ${preview?.error ? 'text-red-500' : 'text-gray-900'}`}>
-                              {preview?.loading
-                                ? '查询中...'
-                                : preview?.error
-                                  ? '查询失败'
-                                  : preview?.count != null
-                                    ? `${preview.count} 条`
-                                    : '待选择'}
-                            </div>
-                          </div>
-                        </div>
 
-                        <div className="space-y-3">
-                          <label className="space-y-2 block">
-                            <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">赛事</span>
-                            <select
-                              value={item.matchId ?? ''}
-                              onChange={(event) => setPendingVideoMatch(item.clientFileId, event.target.value || null)}
-                              className="w-full bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-sm text-gray-700"
-                            >
-                              <option value="">选择赛事</option>
-                              {platformMatches.map((platformMatch) => (
-                                <option key={platformMatch.id} value={platformMatch.id}>
-                                  {platformMatch.match_name}
-                                </option>
-                              ))}
-                            </select>
-                            {isLoadingPlatformMatches && <div className="text-[11px] text-gray-400">正在加载赛事列表...</div>}
-                          </label>
-
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">场次</span>
-                              {selectedFrequencies.length > 0 && (
-                                <span className="text-[11px] text-gray-400">已选 {selectedFrequencies.length} 个</span>
-                              )}
-                            </div>
-                            {!item.matchId ? (
-                              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-400">
-                                请先为当前视频选择赛事，再从该比赛中勾选一个或多个场次。
-                              </div>
-                            ) : isLoadingFrequencies ? (
-                              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-400">
-                                正在加载该赛事的场次列表...
-                              </div>
-                            ) : availableFrequencies.length === 0 ? (
-                              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-400">
-                                当前赛事没有可用场次。
-                              </div>
-                            ) : (
-                              <div className="max-h-44 overflow-y-auto rounded-xl border border-gray-200 bg-white divide-y divide-gray-100">
-                                {availableFrequencies.map((frequency) => {
-                                  const checked = selectedFrequencyIdSet.has(frequency.id);
-                                  return (
-                                    <label key={frequency.id} className="flex items-start gap-3 px-3 py-2.5 text-sm cursor-pointer hover:bg-gray-50">
-                                      <input
-                                        type="checkbox"
-                                        className="mt-0.5 rounded border-gray-300 text-red-500 focus:ring-red-500"
-                                        checked={checked}
-                                        onChange={() => togglePendingVideoFrequency(item.clientFileId, frequency)}
-                                      />
-                                      <span className="min-w-0 flex-1">
-                                        <span className="block text-gray-800 break-words">{frequency.venue}</span>
-                                        <span className="mt-0.5 block text-[11px] text-gray-400">{categoryLabel(normalizeCategory(frequency.category))}</span>
-                                      </span>
-                                    </label>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-
-                          <div>
-                            <div className="mb-2 flex items-center justify-between">
-                              <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">男子项目</span>
-                              <button
-                                onClick={() => setPendingVideoApparatusGroup(item.clientFileId, 1, MAG_OPTIONS.map((option) => option.id))}
-                                className={`rounded-lg px-2.5 py-1 text-[11px] font-medium border transition-colors ${
-                                  hasAllMag
-                                    ? 'bg-gray-900 border-gray-900 text-white'
-                                    : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                                }`}
-                                disabled={!canChooseManualApparatus}
-                              >
-                                全部
-                              </button>
-                            </div>
-                            <div className="flex flex-wrap gap-2">
-                              {MAG_OPTIONS.map((option) => {
-                                const selected = effectiveSportKeySet.has(sportKey(1, option.id));
-                                return (
-                                  <button
-                                    key={`mag-${option.id}`}
-                                    onClick={() => togglePendingVideoApparatus(item.clientFileId, 1, option.id)}
-                                    className={`rounded-lg px-3 py-2 text-sm font-medium border transition-colors ${
-                                      selected
-                                        ? 'bg-gray-900 border-gray-900 text-white'
-                                        : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
-                                    }`}
-                                    disabled={!canChooseManualApparatus}
-                                  >
-                                    {option.label}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-
-                          <div>
-                            <div className="mb-2 flex items-center justify-between">
-                              <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">女子项目</span>
-                              <button
-                                onClick={() => setPendingVideoApparatusGroup(item.clientFileId, 2, WAG_OPTIONS.map((option) => option.id))}
-                                className={`rounded-lg px-2.5 py-1 text-[11px] font-medium border transition-colors ${
-                                  hasAllWag
-                                    ? 'bg-gray-900 border-gray-900 text-white'
-                                    : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                                }`}
-                                disabled={!canChooseManualApparatus}
-                              >
-                                全部
-                              </button>
-                            </div>
-                            <div className="flex flex-wrap gap-2">
-                              {WAG_OPTIONS.map((option) => {
-                                const selected = effectiveSportKeySet.has(sportKey(2, option.id));
-                                return (
-                                  <button
-                                    key={`wag-${option.id}`}
-                                    onClick={() => togglePendingVideoApparatus(item.clientFileId, 2, option.id)}
-                                    className={`rounded-lg px-3 py-2 text-sm font-medium border transition-colors ${
-                                      selected
-                                        ? 'bg-gray-900 border-gray-900 text-white'
-                                        : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
-                                    }`}
-                                    disabled={!canChooseManualApparatus}
-                                  >
-                                    {option.label}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-
-                          <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-2 text-xs">
-                            {validationMessage ? (
-                              <span className="text-gray-400">{validationMessage}</span>
-                            ) : preview?.error ? (
-                              <span className="text-red-500">{preview.error}</span>
-                            ) : preview?.loading ? (
-                              <span className="text-gray-600">正在查询平台卡片...</span>
-                            ) : preview?.count != null ? (
-                              <span className="text-gray-600">将为该视频加载 {preview.count} 张平台成绩卡片。</span>
-                            ) : (
-                              <span className="text-gray-400">
-                                {isAutoDerivedByVenue
-                                  ? '已按场次自动同步项目，确认场次后会自动查询预览。'
-                                  : '完成当前视频的比赛、场次和项目选择后自动查询预览。'}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="min-h-0 flex flex-col bg-white">
-                <div className="px-5 py-4 border-b border-gray-100">
-                  <div className="text-sm font-semibold text-gray-900">导入规则</div>
-                  <div className="mt-1 text-xs text-gray-500">每个视频独立选择比赛和场次，右侧卡片只显示当前视频命中的平台记录。</div>
-                </div>
-                <div className="flex-1 overflow-y-auto p-5 space-y-4">
-                  <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 p-4 text-sm text-gray-500 space-y-2">
-                    <p>导入要求：</p>
-                    <p>1. 每个视频都要单独选择比赛与一个或多个场次。</p>
-                    <p>2. 同一视频允许混合男子与女子内容，但已选场次必须属于同一比赛类型。</p>
-                    <p>3. 单项/资格赛会根据场次自动识别项目；全能和团体请手动勾选视频实际包含的项目。</p>
-                    <p>4. 预览成功后，导入会缓存该视频对应的平台卡片，右侧绑定栏只看当前视频。</p>
-                    <p>5. 团体赛不在导入阶段选国家，绑定时通过右侧国家筛选缩小范围。</p>
-                  </div>
-                </div>
-              </div>
-              </div>
-            ) : (
-              <div className="flex-1 min-h-0 grid grid-cols-[1.1fr_0.9fr]">
-                <div className="border-r border-gray-100 min-h-0 flex flex-col bg-gray-50/40">
-                  <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-semibold text-gray-900">共享平台查询条件</div>
-                      <div className="text-xs text-gray-500 mt-1">
-                        {directClipPreview.loading
-                          ? '平台卡片预览查询中...'
-                          : directClipPreview.error
-                            ? '平台卡片预览失败'
-                            : directClipPreview.count != null
-                              ? `命中 ${directClipPreview.count} 张卡片`
-                              : '选择比赛、场次、项目后自动预览'}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-xs text-gray-400">查询组</div>
-                      <div className="text-sm font-semibold text-gray-900">{directClipScopeQueries.length}</div>
-                    </div>
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-5 space-y-5">
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">比赛</span>
-                        <span className="text-[11px] text-gray-400">已选 {directClipSelectedMatchIds.length} 个</span>
-                      </div>
-                      <div className="max-h-48 overflow-y-auto rounded-2xl border border-gray-200 bg-white divide-y divide-gray-100">
-                        {platformMatches.map((match) => {
-                          const checked = directClipSelectedMatchIds.includes(match.id);
-                          return (
-                            <label key={match.id} className="flex items-start gap-3 px-3 py-2.5 text-sm cursor-pointer hover:bg-gray-50">
-                              <input
-                                type="checkbox"
-                                className="mt-0.5 rounded border-gray-300 text-red-500 focus:ring-red-500"
-                                checked={checked}
-                                onChange={() => toggleDirectClipMatch(match.id)}
-                              />
-                              <span className="min-w-0 flex-1">
-                                <span className="block text-gray-800 break-words">{match.match_name}</span>
-                                {match.city && (
-                                  <span className="mt-0.5 block text-[11px] text-gray-400">{match.city}</span>
-                                )}
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div className="space-y-3">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-gray-500">场次</div>
-                      {directClipSelectedMatchIds.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-gray-200 bg-white px-3 py-3 text-xs text-gray-400">
-                          先选择一个或多个比赛，再为每个比赛勾选场次。
-                        </div>
-                      ) : (
-                        directClipSelectedMatchIds.map((matchId) => {
-                          const match = getMatchById(matchId);
-                          const availableFrequencies = getFrequenciesForMatch(matchId);
-                          const selectedFrequencyIdSet = new Set((directClipSelectedFrequenciesByMatchId[matchId] ?? []).map((frequency) => frequency.id));
-                          const isLoadingFrequencies = Boolean(loadingFrequencyMatchIds[matchId]);
-                          return (
-                            <div key={matchId} className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="text-sm font-semibold text-gray-900">{match?.match_name || '未命名比赛'}</div>
-                                <div className="text-[11px] text-gray-400">
-                                  已选 {(directClipSelectedFrequenciesByMatchId[matchId] ?? []).length} 个场次
-                                </div>
-                              </div>
-                              {isLoadingFrequencies ? (
-                                <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-400">
-                                  正在加载该比赛的场次列表...
-                                </div>
-                              ) : availableFrequencies.length === 0 ? (
-                                <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3 text-xs text-gray-400">
-                                  当前比赛没有可用场次。
-                                </div>
-                              ) : (
-                                <div className="max-h-44 overflow-y-auto rounded-xl border border-gray-200 bg-white divide-y divide-gray-100">
-                                  {availableFrequencies.map((frequency) => {
-                                    const checked = selectedFrequencyIdSet.has(frequency.id);
-                                    return (
-                                      <label key={frequency.id} className="flex items-start gap-3 px-3 py-2.5 text-sm cursor-pointer hover:bg-gray-50">
-                                        <input
-                                          type="checkbox"
-                                          className="mt-0.5 rounded border-gray-300 text-red-500 focus:ring-red-500"
-                                          checked={checked}
-                                          onChange={() => toggleDirectClipFrequency(matchId, frequency)}
-                                        />
-                                        <span className="min-w-0 flex-1">
-                                          <span className="block text-gray-800 break-words">{frequency.venue}</span>
-                                          <span className="mt-0.5 block text-[11px] text-gray-400">{categoryLabel(normalizeCategory(frequency.category))}</span>
-                                        </span>
-                                      </label>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-
-                    <div className="space-y-4 rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <div className="text-sm font-semibold text-gray-900">共享项目选择</div>
-                          <div className="mt-1 text-[11px] text-gray-500">
-                            EF / QF 会按场次自动识别项目；AA / TF 使用这里的手动选择。
-                          </div>
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="mb-2 flex items-center justify-between">
-                          <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">男子项目</span>
-                          <button
-                            onClick={() => setDirectClipApparatusGroup(1, MAG_OPTIONS.map((option) => option.id))}
-                            className={`rounded-lg px-2.5 py-1 text-[11px] font-medium border transition-colors ${
-                              directClipHasAllMag
-                                ? 'bg-gray-900 border-gray-900 text-white'
-                                : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                            }`}
-                            disabled={!directClipRequiresManualApparatus}
-                          >
-                            全部
-                          </button>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {MAG_OPTIONS.map((option) => {
-                            const selected = directClipManualSportKeySet.has(sportKey(1, option.id));
-                            return (
-                              <button
-                                key={`direct-mag-${option.id}`}
-                                onClick={() => toggleDirectClipApparatus(1, option.id)}
-                                className={`rounded-lg px-3 py-2 text-sm font-medium border transition-colors ${
-                                  selected
-                                    ? 'bg-gray-900 border-gray-900 text-white'
-                                    : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
-                                }`}
-                                disabled={!directClipRequiresManualApparatus}
-                              >
-                                {option.label}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="mb-2 flex items-center justify-between">
-                          <span className="text-xs font-semibold uppercase tracking-wider text-gray-500">女子项目</span>
-                          <button
-                            onClick={() => setDirectClipApparatusGroup(2, WAG_OPTIONS.map((option) => option.id))}
-                            className={`rounded-lg px-2.5 py-1 text-[11px] font-medium border transition-colors ${
-                              directClipHasAllWag
-                                ? 'bg-gray-900 border-gray-900 text-white'
-                                : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                            }`}
-                            disabled={!directClipRequiresManualApparatus}
-                          >
-                            全部
-                          </button>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {WAG_OPTIONS.map((option) => {
-                            const selected = directClipManualSportKeySet.has(sportKey(2, option.id));
-                            return (
-                              <button
-                                key={`direct-wag-${option.id}`}
-                                onClick={() => toggleDirectClipApparatus(2, option.id)}
-                                className={`rounded-lg px-3 py-2 text-sm font-medium border transition-colors ${
-                                  selected
-                                    ? 'bg-gray-900 border-gray-900 text-white'
-                                    : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
-                                }`}
-                                disabled={!directClipRequiresManualApparatus}
-                              >
-                                {option.label}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-2 text-xs">
-                        {directClipValidationError ? (
-                          <span className="text-gray-400">{directClipValidationError}</span>
-                        ) : directClipPreview.error ? (
-                          <span className="text-red-500">{directClipPreview.error}</span>
-                        ) : directClipPreview.loading ? (
-                          <span className="text-gray-600">正在查询平台成绩卡片...</span>
-                        ) : directClipPreview.count != null ? (
-                          <span className="text-gray-600">本批片段将共享 {directClipPreview.count} 张平台成绩卡片。</span>
-                        ) : (
-                          <span className="text-gray-400">完成比赛、场次和项目选择后，会自动生成平台成绩卡片预览。</span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="min-h-0 flex flex-col bg-white">
-                  <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-semibold text-gray-900">待导入片段</div>
-                      <div className="text-xs text-gray-500 mt-1">{pendingDirectClipFiles.length} 个文件</div>
-                    </div>
-                    <button
-                      onClick={() => void openImportSourcePicker('direct_clip')}
-                      className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50"
-                    >
-                      <Upload size={15} />
-                      重新选择片段
-                    </button>
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-5 space-y-3 bg-gray-50/40">
-                    {pendingDirectClipFiles.map((item) => (
-                      <div key={item.clientFileId} className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-                        <div className="text-sm font-semibold text-gray-900 truncate">{item.name}</div>
-                        <div className="mt-1 text-xs text-gray-500">
-                          {(item.sizeBytes / (1024 * 1024)).toFixed(1)} MB
-                        </div>
-                      </div>
-                    ))}
-                    <div className="rounded-2xl border border-dashed border-gray-200 bg-white p-4 text-sm text-gray-500 space-y-2">
-                      <p>导入规则：</p>
-                      <p>1. 这一批片段共用一个卡片池，可同时覆盖多个比赛、多个场次和多个项目。</p>
-                      <p>2. 每个文件导入后会直接生成一个候选片段，默认保留，可立即绑定和导出。</p>
-                      <p>3. 右侧卡片区会按比赛和场次分组展示，继续复用现有性别、项目、国家筛选。</p>
-                      <p>4. 导出、重命名、OSS 上传和平台回写全部沿用现有逻辑。</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            <div className="p-5 border-t border-gray-100 flex justify-end gap-3 bg-white">
-              <button
-                onClick={closeImportModal}
-                disabled={isImporting}
-                className="px-4 py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium text-sm transition-colors border border-gray-200 shadow-sm disabled:opacity-50"
-              >
-                取消
-              </button>
-              <button
-                onClick={() => void handleSubmitImport()}
-                disabled={
-                  importMode === 'direct_clip'
-                    ? (
-                      isImporting ||
-                      pendingDirectClipFiles.length === 0 ||
-                      Boolean(directClipValidationError) ||
-                      directClipPreview.loading ||
-                      Boolean(directClipPreview.error)
-                    )
-                    : (
-                      isImporting ||
-                      pendingImportVideos.length === 0 ||
-                      pendingImportVideos.some(
-                        (item) =>
-                          Boolean(getItemValidationError(item)) ||
-                          previewByImportId[item.clientFileId]?.loading ||
-                          Boolean(previewByImportId[item.clientFileId]?.error),
-                      )
-                    )
-                }
-                className="px-5 py-2.5 rounded-xl bg-gray-900 hover:bg-black text-white font-medium text-sm transition-colors shadow-sm disabled:opacity-50"
-              >
-                {isImporting ? '导入中...' : importMode === 'direct_clip' ? '确认导入已有片段' : '确认导入'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showExport && (
-        <div className="fixed inset-0 z-40 bg-gray-900/40 backdrop-blur-sm flex items-center justify-center">
-          <div className="w-[520px] max-h-[min(92vh,920px)] bg-white border border-gray-100 rounded-3xl shadow-2xl flex flex-col overflow-hidden">
-            <div className="shrink-0 p-5 border-b border-gray-100 flex items-center justify-between bg-white">
-              <h3 className="text-lg font-semibold text-gray-900">导出与上传</h3>
-              <button onClick={() => setShowExport(false)} className="text-gray-400 hover:text-gray-600 transition-colors">
-                <XCircle size={22} />
-              </button>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto p-6 space-y-6 bg-gray-50/50">
-              <div className="flex items-center justify-between p-4 rounded-2xl bg-white border border-gray-200 shadow-sm">
-                <div>
-                  <p className="text-sm font-medium text-gray-500 mb-1">准备执行</p>
-                  <p className="text-2xl font-bold text-gray-900">
-                    {exportTargetClipsCount} <span className="text-base font-medium text-gray-500">个片段</span>
-                  </p>
-                  <p className="mt-2 text-xs text-gray-500">
-                    {exportTargetClipsCount > 0
-                      ? exportOperation === 'export_only'
-                        ? '当前模式只做本地导出，不上传 OSS，也不回写平台。'
-                        : exportOperation === 'upload_only'
-                          ? uploadOnlyInvalidClips.length > 0
-                            ? `仅上传要求所选片段已绑定平台卡片，且已导出或满足已有片段原片直传条件；当前有 ${uploadOnlyInvalidClips.length} 个片段不满足条件。`
-                            : `当前将直接上传所选片段；默认优先上传已导出文件，仅当没有导出文件时才会重命名原片直传。已绑定平台卡片会在 OSS 成功后自动回写平台。`
-                          : `当前将导出所选片段；其中 ${Math.max(exportTargetBoundCount - exportTargetLocalBoundCount, 0)} 个已绑定平台卡片会自动上传 OSS 并回写平台${exportTargetLocalBoundCount > 0 ? `，${exportTargetLocalBoundCount} 个本地补录片段会落入"本地补录"子文件夹` : ''}。`
-                      : '请先在候选片段列表中选择要导出的片段。'}
-                  </p>
-                </div>
-                <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center text-gray-900">
-                  <CheckCircle2 size={24} />
-                </div>
-              </div>
-
-              <div className="space-y-3">
-                <label className="text-sm font-semibold text-gray-700">执行模式</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {(['export_only', 'upload_only', 'export_and_upload'] as const).map((operation) => (
-                    <button
-                      key={operation}
-                      type="button"
-                      onClick={() => setExportOperation(operation)}
-                      className={`rounded-2xl border px-3 py-3 text-left transition-colors ${
-                        exportOperation === operation
-                          ? 'border-red-200 bg-red-50 text-red-600'
-                          : 'border-gray-200 bg-white text-gray-700 hover:border-gray-300'
-                      }`}
-                    >
-                      <div className="text-sm font-semibold">{EXPORT_OPERATION_DETAILS[operation].label}</div>
-                      <div className={`mt-1 text-xs ${exportOperation === operation ? 'text-red-500' : 'text-gray-500'}`}>
-                        {EXPORT_OPERATION_DETAILS[operation].description}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-                {exportOperation === 'upload_only' && uploadOnlyInvalidClips.length > 0 && (
-                  <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
-                    仅上传要求所选片段已绑定平台卡片，且已导出或满足已有片段原片直传条件。请先处理不满足条件的片段。
-                  </div>
-                )}
-                {exportOperation === 'upload_only' && exportTargetClipsCount > 0 && uploadOnlyInvalidClips.length === 0 && (
-                  <div className="rounded-2xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs leading-5 text-sky-700">
-                    当前上传来源：已导出文件 {uploadOnlySourceSummary.exportedFileCount} 个；原片直传 {uploadOnlySourceSummary.directSourceCount} 个。
-                    规则：如果片段已有导出文件，优先上传导出文件；只有没有导出文件时，才会对未编辑的已有片段重命名原文件后直传。
-                  </div>
-                )}
-                {exportOperation !== 'export_only' && exportTargetLocalBoundCount > 0 && (
-                  <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700">
-                    选中片段中有 {exportTargetLocalBoundCount} 个绑定本地补录卡片，将自动跳过上传与平台回写，{exportOperation === 'upload_only' ? '仅作为跳过处理' : '本地导出后落入"本地补录"子文件夹'}。
-                  </div>
-                )}
-              </div>
-
-              {exportOperation !== 'export_only' && (
-                <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold text-gray-900">上传设置</div>
-                      <div className="text-xs text-gray-500">自动记住同时上传文件数和单文件分片线程。</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setIsUploadSettingsExpanded((current) => !current)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-100"
-                    >
-                      {isUploadSettingsExpanded ? '收起' : '展开'}
-                      {isUploadSettingsExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                    </button>
-                  </div>
-                  {isUploadSettingsExpanded && (
-                    <>
-                      <div className="grid grid-cols-2 gap-3">
-                        <label className="space-y-2 text-sm font-semibold text-gray-700">
-                          同时上传文件数
-                          <input
-                            type="number"
-                            min={1}
-                            max={6}
-                            value={uploadParallelFiles}
-                            onChange={(event) => setUploadParallelFiles(Math.max(1, Number(event.target.value) || 1))}
-                            className="w-full bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-sm text-gray-700 shadow-sm"
-                          />
-                        </label>
-                        <label className="space-y-2 text-sm font-semibold text-gray-700">
-                          单文件分片线程
-                          <input
-                            type="number"
-                            min={1}
-                            max={8}
-                            value={uploadPartThreads}
-                            onChange={(event) => setUploadPartThreads(Math.max(1, Number(event.target.value) || 1))}
-                            className="w-full bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-sm text-gray-700 shadow-sm"
-                          />
-                        </label>
-                      </div>
-                      <p className="text-xs text-gray-400">默认使用 2 个文件并发上传，每个文件 4 个分片线程。网络或磁盘吃满时可调低。</p>
-                    </>
-                  )}
-                </div>
-              )}
-
-              {exportOperation !== 'upload_only' && (
-                <div className="space-y-3">
-                  <label className="text-sm font-semibold text-gray-700">默认导出目录</label>
-                  <input
-                    type="text"
-                    value={outputDir}
-                    onChange={(event) => setOutputDir(event.target.value)}
-                    onBlur={() => {
-                      if (outputDir.trim()) {
-                        void persistDefaultOutputDirectory(outputDir);
-                      }
-                    }}
-                    placeholder="输入或选择默认导出目录"
-                    className="w-full bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-sm text-gray-700 font-mono shadow-sm"
-                  />
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => {
-                        if (hasSavedOutputDir) {
-                          setOutputDir(savedOutputDir);
-                        }
-                      }}
-                      disabled={!hasSavedOutputDir}
-                      className="rounded-xl border border-gray-200 bg-gray-100 px-4 py-2.5 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-200 disabled:opacity-50"
-                    >
-                      使用默认目录
-                    </button>
-                    {desktopBridge?.isDesktop && (
-                      <button
-                        onClick={() => void handlePickExportDirectory()}
-                        className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-50"
-                      >
-                        <FolderOpen size={16} />
-                        选择文件夹
-                      </button>
-                    )}
-                  </div>
-                  <p className="text-xs text-gray-400">
-                    {hasSavedOutputDir ? '当前已记住这个目录，下次打开会默认回填。' : '输入或选择目录后，app 会记住它作为下次默认目录。'}
-                  </p>
-                </div>
-              )}
-
-              <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-gray-900">OSS 凭证</div>
-                    <div className="text-xs text-gray-500">
-                      {hasOssCredentials ? '已配置，可用于包含上传的模式。' : '未配置完整 OSS 凭证，包含上传的模式将无法开始。'}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {(isPersistingOssCredentials || isPersistingApiKey) && (
-                      <div className="text-xs text-gray-400">保存中...</div>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => setIsOssCredentialsExpanded((current) => !current)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-100"
-                    >
-                      {isOssCredentialsExpanded ? '收起' : '展开'}
-                      {isOssCredentialsExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                    </button>
-                  </div>
-                </div>
-                {isOssCredentialsExpanded && (
-                  <>
-                    <div className="grid grid-cols-1 gap-3">
-                      <label className="space-y-1.5">
-                        <div className="text-xs font-medium text-gray-600">AccessKey ID</div>
-                        <input
-                          type="text"
-                          value={ossAccessKeyId}
-                          onChange={(event) => setOssAccessKeyId(event.target.value)}
-                          placeholder="输入 OSS AccessKey ID"
-                          className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 shadow-sm"
-                        />
-                      </label>
-                      <label className="space-y-1.5">
-                        <div className="text-xs font-medium text-gray-600">AccessKey Secret</div>
-                        <input
-                          type="password"
-                          value={ossAccessKeySecret}
-                          onChange={(event) => setOssAccessKeySecret(event.target.value)}
-                          placeholder="输入 OSS AccessKey Secret"
-                          className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-700 shadow-sm"
-                        />
-                      </label>
-                    </div>
-                    <div className="flex items-center justify-between gap-3 text-xs">
-                      <span className={hasOssCredentials ? 'text-green-600' : 'text-amber-600'}>
-                        {hasOssCredentials ? '已就绪，可执行 OSS 上传' : '未配置完整 OSS 凭证，已绑定片段将无法上传'}
-                      </span>
-                      {desktopBridge?.isDesktop && (
-                        <button
-                          onClick={async () => {
-                            setOssAccessKeyId('');
-                            setOssAccessKeySecret('');
-                            if (desktopBridge?.clearOssCredentials) {
-                              await desktopBridge.clearOssCredentials();
-                            }
-                          }}
-                          className="text-gray-500 hover:text-gray-700"
-                        >
-                          清除凭证
-                        </button>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-
-              {activeExportJob && (
-                <div className="rounded-2xl border border-gray-200 bg-white px-4 py-3 shadow-sm space-y-1.5">
-                  <div className="h-2 overflow-hidden rounded-full bg-gray-100">
-                    <div
-                      className="h-full rounded-full bg-red-500 transition-all duration-300"
-                      style={{width: `${renderJobPercent(activeExportJob)}%`}}
-                    />
-                  </div>
-                  <div className="text-base text-gray-700">{renderJobProgress(activeExportJob)}</div>
-                  {activeExportJob.error_message && (
-                    <div className="text-xs text-red-600">{activeExportJob.error_message}</div>
-                  )}
-                </div>
-              )}
-
-              {exportOperation !== 'upload_only' && (
-                <div className="space-y-3">
-                  <label className="text-sm font-semibold text-gray-700">编码模式</label>
-                  <select
-                    value={exportMode}
-                    onChange={(event) => setExportMode(event.target.value as ExportMode)}
-                    className="w-full bg-white border border-gray-200 rounded-xl px-3 py-2.5 text-sm text-gray-700 shadow-sm"
-                  >
-                    <option value="standard">标准</option>
-                    <option value="fast">快速</option>
-                  </select>
-                  <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-                    <div className="text-sm font-semibold text-gray-900">{EXPORT_MODE_DETAILS[exportMode].label}</div>
-                    <div className="mt-1 text-xs text-gray-500">{EXPORT_MODE_DETAILS[exportMode].description}</div>
-                  </div>
-                </div>
-              )}
-
-              {exportSummary && (
-                <div className="rounded-2xl bg-white border border-gray-200 p-4 text-sm text-gray-600 space-y-1 shadow-sm">
-                  <div>执行模式：{EXPORT_OPERATION_DETAILS[exportSummary.operation].label}</div>
-                  <div>输出目录：{exportSummary.output_directory}</div>
-                  <div>尝试导出：{exportSummary.attempted}</div>
-                  <div>本地导出成功：{exportSummary.exported}</div>
-                  <div>OSS 上传成功：{exportSummary.uploaded}</div>
-                  <div>平台回写成功：{exportSummary.synced}</div>
-                  <div>失败：{exportSummary.failed}</div>
-                </div>
-              )}
-
-            </div>
-
-            <div className="shrink-0 border-t border-gray-100 bg-white px-6 py-4">
-              <div className="flex justify-end gap-3">
-                <button
-                  onClick={() => setShowExport(false)}
-                  className="px-4 py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium text-sm transition-colors border border-gray-200 shadow-sm"
-                >
-                  关闭
-                </button>
-                <button
-                  onClick={() => void handleExport()}
-                  disabled={exportTargetClipsCount === 0 || Boolean(activeExportJob)}
-                  className="px-5 py-2.5 rounded-xl bg-red-500 hover:bg-red-600 text-white font-medium text-sm transition-colors shadow-sm disabled:opacity-50"
-                >
-                  {activeExportJob
-                    ? (activeExportJob.status === 'queued' ? '排队中...' : '处理中...')
-                    : `开始${EXPORT_OPERATION_DETAILS[exportOperation].label}`}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <ExportDialog
+        api={exportApi}
+        desktopBridge={desktopBridge}
+        isPersistingApiKey={isPersistingApiKey}
+        exportTargetClipsCount={exportTargetClipsCount}
+        exportTargetBoundCount={exportTargetBoundCount}
+        exportTargetLocalBoundCount={exportTargetLocalBoundCount}
+        uploadOnlyInvalidClips={uploadOnlyInvalidClips}
+        uploadOnlySourceSummary={uploadOnlySourceSummary}
+        activeExportJob={activeExportJob}
+        renderJobProgress={renderJobProgress}
+        renderJobPercent={renderJobPercent}
+        onExport={() => void handleExport()}
+        onPickExportDirectory={() => void handlePickExportDirectory()}
+      />
       {videoContextMenu && (
         <div
           className="fixed z-50 min-w-[200px] rounded-lg border border-gray-200 bg-white py-1 shadow-lg"
