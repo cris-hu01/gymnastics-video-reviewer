@@ -190,7 +190,13 @@ export default function App() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [toast, setToast] = useState<AppToast | null>(null);
   const [isToastVisible, setIsToastVisible] = useState(false);
-  const [jobs, setJobs] = useState<AppJob[]>([]);
+  // A3: jobs migrated to zustand (see store/jobs.ts). Subscribed once here so
+  // the existing useExportJobs hook (which receives the array as a prop) keeps
+  // working unchanged; setters come straight from the store.
+  const jobs = useStore((s) => s.jobs);
+  const setJobs = useStore((s) => s.setJobs);
+  const upsertJob = useStore((s) => s.upsertJob);
+  const upsertJobs = useStore((s) => s.upsertJobs);
 
   // A3: activeVideoId / activeClipId migrated to zustand store (see store/active.ts).
   // Subscribe via selectors to keep referential equality with the prior useState
@@ -1907,7 +1913,7 @@ export default function App() {
     try {
       const response = await detectProjectVideo(activeVideo.id, apiKey || undefined);
       setProjectState(response.project);
-      setJobs((current) => [response.job, ...current.filter((job) => job.id !== response.job.id)]);
+      upsertJob(response.job);
       setErrorMessage(null);
       setSuccessMessage('检测任务已加入后台队列');
     } catch (error) {
@@ -1949,10 +1955,7 @@ export default function App() {
       }
 
       if (queuedJobs.length > 0) {
-        setJobs((current) => [
-          ...queuedJobs,
-          ...current.filter((job) => !queuedJobs.some((queuedJob) => queuedJob.id === job.id)),
-        ]);
+        upsertJobs(queuedJobs);
         const currentSelected = useStore.getState().selectedVideoIds;
         const nextSelected = new Set<string>();
         currentSelected.forEach((videoId) => {
@@ -2362,7 +2365,7 @@ export default function App() {
         upload_part_threads: uploadPartThreads,
       });
       setProjectState(response.project);
-      setJobs((current) => [response.job, ...current.filter((job) => job.id !== response.job.id)]);
+      upsertJob(response.job);
       setSuccessMessage(`${EXPORT_OPERATION_DETAILS[exportOperation].label}任务已在后台开始/排队，可在主页进度条查看`);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '导出失败');
