@@ -116,6 +116,7 @@ import { useExportJobs, ExportDialog } from './features/export';
 import { useLocalCard } from './features/local-card';
 import { useVideoListPanel, VideoListPanel } from './features/video-list';
 import { usePlatformMatchPanel, PlatformMatchPanel } from './features/platform-match';
+import { PlayerSurface } from './features/review';
 
 type FilterStatus = ClipStatus | 'all';
 
@@ -294,22 +295,29 @@ export default function App() {
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(0);
   const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
-  const [playhead, setPlayhead] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
+  // A4-2: `playhead` (seconds) is now derived from the playback slice's
+  // `currentTimeMs` publish channel. `isPlaying` likewise mirrors the
+  // slice. The renderer (PlayerSurface) owns the <video> element and
+  // pushes these snapshots; UI here reads them but never writes back
+  // through `setCurrentTimeMs` (that would re-enter the loop the slice
+  // is designed to break — see store/playback.ts header).
+  const playheadMs = useStore((s) => s.currentTimeMs);
+  const playhead = playheadMs / 1000;
+  const isPlaying = useStore((s) => s.isPlaying);
+  const setIsPlayingStore = useStore((s) => s.setIsPlaying);
+  const enqueueSeekStore = useStore((s) => s.enqueueSeek);
   const [isSavingTrim, setIsSavingTrim] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
   const [timelineThumbnails, setTimelineThumbnails] = useState<ThumbnailFrame[]>([]);
   const [isLoadingThumbnails, setIsLoadingThumbnails] = useState(false);
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  // A4-2: videoRef removed — PlayerSurface is now the sole owner. The
+  // remaining refs below still belong to App.tsx (trim drag state,
+  // scrub windowing, undo stack). They will move out in A4-3/A4-4.
   const skipTrimSyncRef = useRef(true);
   const isScrubbingRef = useRef(false);
   const resumeAfterScrubRef = useRef(false);
-  const scrubRafRef = useRef<number | null>(null);
-  const pendingSeekRef = useRef<number | null>(null);
-  const isSeekingRef = useRef(false);
-  const seekSafetyTimerRef = useRef<number | null>(null);
   const trimStartRef = useRef(0);
   const trimEndRef = useRef(0);
   const trimAutoSaveTimerRef = useRef<number | null>(null);
@@ -1146,7 +1154,7 @@ export default function App() {
       trimStartRef.current = 0;
       trimEndRef.current = 0;
       setActiveSegmentId(null);
-      setPlayhead(0);
+      enqueueSeekStore(0);
       return;
     }
     const nextSegment = firstEditableSegment(activeClip);
@@ -1161,8 +1169,10 @@ export default function App() {
     setTrimEnd(e);
     trimStartRef.current = s;
     trimEndRef.current = e;
-    setPlayhead(s);
-    setIsPlaying(false);
+    // Park playhead at the segment start. PlayerSurface translates this
+    // into a video.currentTime write once metadata is ready.
+    enqueueSeekStore(s * 1000);
+    setIsPlayingStore(false);
   }, [activeClip?.id, activeVideo?.duration]);
 
   useEffect(() => {
@@ -1192,7 +1202,16 @@ export default function App() {
     setTrimEnd(clampedEnd);
     trimStartRef.current = clampedStart;
     trimEndRef.current = clampedEnd;
-    setPlayhead((current) => Math.min(Math.max(current, clampedStart), clampedEnd));
+    // Clamp playhead into the new segment if it currently sits outside.
+    // Read the live snapshot from the store (not the render-time `playhead`
+    // closure) so we don't queue a seek to a stale position when this
+    // effect runs again before the publish channel catches up.
+    const currentMs = useStore.getState().currentTimeMs;
+    const currentS = currentMs / 1000;
+    const clampedS = Math.min(Math.max(currentS, clampedStart), clampedEnd);
+    if (clampedS !== currentS) {
+      enqueueSeekStore(clampedS * 1000);
+    }
   }, [activeClip?.id, activeSegment?.id, activeSegment?.start, activeSegment?.end]);
 
   useEffect(() => {
@@ -1237,12 +1256,6 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if (scrubRafRef.current != null) {
-        cancelAnimationFrame(scrubRafRef.current);
-      }
-      if (seekSafetyTimerRef.current != null) {
-        window.clearTimeout(seekSafetyTimerRef.current);
-      }
       if (trimAutoSaveTimerRef.current != null) {
         window.clearTimeout(trimAutoSaveTimerRef.current);
       }
@@ -1285,55 +1298,19 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trimStart, trimEnd, activeSegment?.id, activeSegment?.start, activeSegment?.end, isScrubbing, activeClipLockedByExport]);
 
+  // A4-2: <video> element listeners (timeupdate / loadedmetadata / play /
+  // pause) now live in PlayerSurface. The auto-pause-at-trim-end behavior
+  // formerly inlined in the timeupdate handler is reimplemented here as a
+  // store subscriber so it survives the renderer extraction.
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-
-    const syncPosition = () => {
-      const nextTime = Math.max(activeClip.review_start, 0);
-      video.currentTime = nextTime;
-      setPlayhead(nextTime);
-    };
-
-    if (video.readyState >= 1) {
-      syncPosition();
+    if (!activeClip || !isPlaying) return;
+    // playhead is in seconds; trimEnd is in seconds. We only pause when
+    // we cross trimEnd; the renderer publishes ~30Hz so this catches
+    // the boundary within ~33ms.
+    if (playhead >= trimEnd) {
+      setIsPlayingStore(false);
     }
-  }, [activeClip?.id, streamUrl]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-
-    const onTimeUpdate = () => {
-      const current = video.currentTime;
-      setPlayhead(current);
-      if (current >= trimEnd) {
-        video.pause();
-        setIsPlaying(false);
-      }
-    };
-
-    const onLoadedMetadata = () => {
-      const target = Math.max(activeClip.review_start, 0);
-      video.currentTime = target;
-      setPlayhead(target);
-    };
-
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-
-    video.addEventListener('timeupdate', onTimeUpdate);
-    video.addEventListener('loadedmetadata', onLoadedMetadata);
-    video.addEventListener('play', onPlay);
-    video.addEventListener('pause', onPause);
-
-    return () => {
-      video.removeEventListener('timeupdate', onTimeUpdate);
-      video.removeEventListener('loadedmetadata', onLoadedMetadata);
-      video.removeEventListener('play', onPlay);
-      video.removeEventListener('pause', onPause);
-    };
-  }, [activeClip, trimEnd, streamUrl]);
+  }, [activeClip, isPlaying, playhead, trimEnd, setIsPlayingStore]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1676,9 +1653,11 @@ export default function App() {
   }
 
   function seekRelative(offset: number) {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-    const nextTime = Math.max(trimStart, Math.min(trimEnd, video.currentTime + offset));
+    if (!activeClip) return;
+    // Read the live position from the publish channel rather than a stale
+    // React closure — keyboard repeats can fire faster than React commits.
+    const currentS = useStore.getState().currentTimeMs / 1000;
+    const nextTime = Math.max(trimStart, Math.min(trimEnd, currentS + offset));
     syncVideoTime(nextTime, {force: true});
   }
 
@@ -1697,145 +1676,60 @@ export default function App() {
   }
 
   function togglePlayPause() {
-    const video = videoRef.current;
-    if (!video) return;
-    if (video.paused) {
-      if (video.currentTime < trimStart || video.currentTime >= trimEnd) {
-        video.currentTime = trimStart;
+    // Mirror the play/pause intent through the store. PlayerSurface
+    // applies it to the underlying <video> element.
+    const {isPlaying: storeIsPlaying, currentTimeMs} = useStore.getState();
+    if (!storeIsPlaying) {
+      const currentS = currentTimeMs / 1000;
+      if (currentS < trimStart || currentS >= trimEnd) {
+        enqueueSeekStore(trimStart * 1000);
       }
-      void video.play();
+      setIsPlayingStore(true);
     } else {
-      video.pause();
+      setIsPlayingStore(false);
     }
   }
 
-  function syncVideoTime(nextTime: number, options?: {force?: boolean}) {
+  function syncVideoTime(nextTime: number, _options?: {force?: boolean}) {
+    // A4-2: rAF batching + fastSeek + safety-timer logic now lives inside
+    // PlayerSurface (it is the videoRef owner). Here we just dispatch a
+    // seek command through the store; the renderer coalesces back-to-back
+    // commands into a single per-frame seek and uses fastSeek for big
+    // deltas, preserving the pre-A4 scrub UX.
+    //
+    // The `force` flag previously bypassed the rAF coalescer; PlayerSurface
+    // already cancels any queued rAF when a new pendingSeek arrives, so
+    // every `enqueueSeek` call effectively "wins" — `force` is now a no-op
+    // but we keep the parameter so existing call sites compile unchanged.
     const safeTime = Number(nextTime.toFixed(2));
-    pendingSeekRef.current = safeTime;
-
-    // During scrubbing, defer setPlayhead to rAF to reduce React re-renders
-    if (!isScrubbingRef.current) {
-      setPlayhead(safeTime);
-    }
-
-    const video = videoRef.current;
-    if (!video) return;
-
-    const applySeek = () => {
-      if (pendingSeekRef.current == null || isSeekingRef.current) return;
-      const target = pendingSeekRef.current;
-      pendingSeekRef.current = null;
-      if (Math.abs(video.currentTime - target) > 0.02) {
-        isSeekingRef.current = true;
-
-        // Clear any previous safety timer
-        if (seekSafetyTimerRef.current != null) {
-          window.clearTimeout(seekSafetyTimerRef.current);
-        }
-
-        const onSeeked = () => {
-          video.removeEventListener('seeked', onSeeked);
-          if (seekSafetyTimerRef.current != null) {
-            window.clearTimeout(seekSafetyTimerRef.current);
-            seekSafetyTimerRef.current = null;
-          }
-          isSeekingRef.current = false;
-          // If a new target accumulated while seeking, apply it immediately
-          if (pendingSeekRef.current != null) {
-            applySeek();
-          }
-        };
-        video.addEventListener('seeked', onSeeked);
-
-        // Safety timeout in case seeked never fires
-        seekSafetyTimerRef.current = window.setTimeout(() => {
-          video.removeEventListener('seeked', onSeeked);
-          seekSafetyTimerRef.current = null;
-          isSeekingRef.current = false;
-          if (pendingSeekRef.current != null) {
-            applySeek();
-          }
-        }, 300);
-
-        // Fast scrub: use fastSeek for large jumps (keyframe-only, instant)
-        const delta = Math.abs(target - video.currentTime);
-        if (delta > 2 && typeof video.fastSeek === 'function') {
-          video.fastSeek(target);
-        } else {
-          video.currentTime = target;
-        }
-      }
-    };
-
-    if (options?.force) {
-      if (scrubRafRef.current != null) {
-        cancelAnimationFrame(scrubRafRef.current);
-        scrubRafRef.current = null;
-      }
-      isSeekingRef.current = false;
-      if (seekSafetyTimerRef.current != null) {
-        window.clearTimeout(seekSafetyTimerRef.current);
-        seekSafetyTimerRef.current = null;
-      }
-      pendingSeekRef.current = safeTime;
-      setPlayhead(safeTime);
-      // Force seek always uses precise currentTime
-      if (Math.abs(video.currentTime - safeTime) > 0.02) {
-        video.currentTime = safeTime;
-      }
-      return;
-    }
-
-    if (scrubRafRef.current != null) {
-      return;
-    }
-
-    scrubRafRef.current = requestAnimationFrame(() => {
-      scrubRafRef.current = null;
-      if (pendingSeekRef.current != null) {
-        setPlayhead(pendingSeekRef.current);
-      }
-      applySeek();
-    });
+    enqueueSeekStore(safeTime * 1000);
   }
 
   function beginScrub() {
-    const video = videoRef.current;
     isScrubbingRef.current = true;
     setIsScrubbing(true);
-    resumeAfterScrubRef.current = Boolean(video && !video.paused);
-    if (video && !video.paused) {
-      video.pause();
+    // Remember whether we were playing so endScrub can resume. PlayerSurface
+    // is the only thing touching <video>; we route the pause through the
+    // store so the renderer applies it.
+    const wasPlaying = useStore.getState().isPlaying;
+    resumeAfterScrubRef.current = wasPlaying;
+    if (wasPlaying) {
+      setIsPlayingStore(false);
     }
   }
 
   function endScrub() {
     isScrubbingRef.current = false;
     setIsScrubbing(false);
-    if (scrubRafRef.current != null) {
-      cancelAnimationFrame(scrubRafRef.current);
-      scrubRafRef.current = null;
-    }
-    isSeekingRef.current = false;
-    if (seekSafetyTimerRef.current != null) {
-      window.clearTimeout(seekSafetyTimerRef.current);
-      seekSafetyTimerRef.current = null;
-    }
-    if (pendingSeekRef.current != null) {
-      syncVideoTime(pendingSeekRef.current, {force: true});
-    }
 
     const activeElement = document.activeElement;
     if (activeElement instanceof HTMLInputElement && activeElement.type === 'range') {
       activeElement.blur();
     }
 
-    const video = videoRef.current;
-    if (video && resumeAfterScrubRef.current) {
+    if (resumeAfterScrubRef.current) {
       resumeAfterScrubRef.current = false;
-      void video.play().catch(() => undefined);
-    } else {
-      resumeAfterScrubRef.current = false;
+      setIsPlayingStore(true);
     }
   }
 
@@ -2180,7 +2074,9 @@ export default function App() {
     if (trimSavePromiseRef.current) {
       return trimSavePromiseRef.current;
     }
-    const livePlayhead = Number((videoRef.current?.currentTime ?? playhead).toFixed(3));
+    // Use the renderer's published snapshot rather than reaching into the
+    // <video> element directly (A4-2: videoRef now lives in PlayerSurface).
+    const livePlayhead = Number((useStore.getState().currentTimeMs / 1000).toFixed(3));
     if (Math.abs(trimStart - activeSegment.start) < 0.01 && Math.abs(trimEnd - activeSegment.end) < 0.01) {
       return {
         clip: activeClip,
@@ -2266,7 +2162,7 @@ export default function App() {
             ?? orderedSegments(splitClip)[orderedSegments(splitClip).length - 1]
           : null;
       setActiveSegmentId(nextSegment?.id ?? null);
-      setPlayhead(splitPoint);
+      enqueueSeekStore(splitPoint * 1000);
       setErrorMessage(null);
       setSuccessMessage('已按播放头拆分当前选区');
     } catch (error) {
@@ -3115,16 +3011,14 @@ export default function App() {
               <div className="flex-1 p-8 flex flex-col min-h-0">
                 <div className="flex-1 min-h-0 w-full flex items-center justify-center">
                   <div className="w-full max-h-full max-w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-xl border border-gray-200/50 relative group">
-                    <video
-                      key={streamUrl}
-                      ref={videoRef}
-                      src={streamUrl}
-                      className="w-full h-full object-contain bg-black"
-                      controls={false}
-                      preload="auto"
-                      onError={() => setVideoPlaybackError(activeVideo.error_message || '视频加载失败，请确认源文件仍存在。')}
+                    <PlayerSurface
+                      streamUrl={streamUrl}
+                      onError={() =>
+                        setVideoPlaybackError(
+                          activeVideo.error_message || '视频加载失败，请确认源文件仍存在。',
+                        )
+                      }
                     />
-
 
                     {videoPlaybackError && (
                       <div className="absolute inset-0 flex items-center justify-center bg-black/75 px-6 text-center">
@@ -3348,15 +3242,7 @@ export default function App() {
                     <button
                       data-testid="player-play-toggle-trim"
                       type="button"
-                      onClick={() => {
-                        const video = videoRef.current;
-                        if (!video) return;
-                        if (video.paused) {
-                          void video.play().catch(() => undefined);
-                        } else {
-                          video.pause();
-                        }
-                      }}
+                      onClick={togglePlayPause}
                       className="w-10 h-10 flex items-center justify-center rounded-full bg-red-500 hover:bg-red-600 text-white shadow-md transition-colors"
                     >
                       {isPlaying ? <Pause size={18} /> : <Play size={18} className="ml-0.5" />}
