@@ -33,7 +33,6 @@ import {
   extractClipSegment,
   fetchJobs,
   fetchProject,
-  fetchVideoThumbnails,
   getVideoStreamUrl,
   restoreCandidateClips,
   retryClipStage,
@@ -47,7 +46,6 @@ import type {
   ClipStatus,
   PlatformRecord,
   ProjectState,
-  ThumbnailFrame,
 } from './types';
 import {
   categoryLabel,
@@ -116,7 +114,7 @@ import { useExportJobs, ExportDialog } from './features/export';
 import { useLocalCard } from './features/local-card';
 import { useVideoListPanel, VideoListPanel } from './features/video-list';
 import { usePlatformMatchPanel, PlatformMatchPanel } from './features/platform-match';
-import { PlayerSurface } from './features/review';
+import { PlayerSurface, TimelineSurface } from './features/review';
 
 type FilterStatus = ClipStatus | 'all';
 
@@ -309,8 +307,9 @@ export default function App() {
   const [isSavingTrim, setIsSavingTrim] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
-  const [timelineThumbnails, setTimelineThumbnails] = useState<ThumbnailFrame[]>([]);
-  const [isLoadingThumbnails, setIsLoadingThumbnails] = useState(false);
+  // A4-3: timelineThumbnails / isLoadingThumbnails moved into TimelineSurface
+  // along with the debounced fetch effect. The component watches the trim
+  // slice's draggingHandle to suppress refetches mid-drag.
 
   // A4-2: videoRef removed — PlayerSurface is now the sole owner. The
   // remaining refs below still belong to App.tsx (trim drag state,
@@ -627,8 +626,9 @@ export default function App() {
   const clipWindowStart = (clipWindowOverride ?? initialClipWindow).start;
   const clipWindowEnd = (clipWindowOverride ?? initialClipWindow).end;
   const clipWindowDuration = Math.max(CLIP_STEP, clipWindowEnd - clipWindowStart);
-  const trimStartLocal = Math.max(0, trimStart - clipWindowStart);
-  const trimEndLocal = Math.max(trimStartLocal + CLIP_STEP, trimEnd - clipWindowStart);
+  // A4-3: trim* / playhead-local-to-window calculations now live inside
+  // TimelineSurface. Only the in-player overlay needs the playhead
+  // percent (kept below near the JSX that uses it).
   const playheadLocal = Math.max(0, Math.min(clipWindowDuration, playhead - clipWindowStart));
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === 'queued' || job.status === 'running'),
@@ -1218,41 +1218,7 @@ export default function App() {
     setVideoPlaybackError(null);
   }, [streamUrl, activeVideoId]);
 
-  useEffect(() => {
-    if (!activeVideo || !activeClip) {
-      setTimelineThumbnails([]);
-      return;
-    }
-    if (trimDraggingRef.current) return;
-
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      setIsLoadingThumbnails(true);
-      void fetchVideoThumbnails(activeVideo.id, {
-        start: clipWindowStart,
-        end: clipWindowEnd,
-        count: 12,
-      })
-        .then((response) => {
-          if (cancelled) return;
-          setTimelineThumbnails(response.thumbnails);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          setTimelineThumbnails([]);
-        })
-        .finally(() => {
-          if (cancelled) return;
-          setIsLoadingThumbnails(false);
-        });
-    }, 250);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [activeVideo?.id, activeClip?.id, clipWindowStart, clipWindowEnd, clipWindowVersion]);
+  // A4-3: thumbnail fetch + suppression effect moved into TimelineSurface.
 
   useEffect(() => {
     return () => {
@@ -1735,6 +1701,12 @@ export default function App() {
 
   function startTrimScroll(edge: 'left' | 'right') {
     trimDraggingRef.current = true;
+    // A4-3: wire the trim slice's draggingHandle flag so TimelineSurface
+    // (and, in A4-4, TrimHandles) can react via a React-tracked signal
+    // instead of the ref. Pre-A4 the ref-only flag was OK because the
+    // thumbnail fetch effect was a few lines above its setter; now they
+    // live in different components.
+    useStore.getState().beginDrag(edge === 'left' ? 'start' : 'end');
     const tick = () => {
       const rect = trimRectRef.current;
       if (!rect || rect.width === 0) {
@@ -1801,6 +1773,9 @@ export default function App() {
     }
     if (trimDraggingRef.current) {
       trimDraggingRef.current = false;
+      // Clear the store-side flag so TimelineSurface re-enables thumbnail
+      // fetching. The clipWindowVersion bump kicks the fetch right away.
+      useStore.getState().endDrag();
       setClipWindowVersion((v) => v + 1);
     }
   }
@@ -2321,8 +2296,6 @@ export default function App() {
     await handleImportFiles(event.dataTransfer.files);
   };
 
-  const trimStartPercent = clipWindowDuration > 0 ? (trimStartLocal / clipWindowDuration) * 100 : 0;
-  const trimEndPercent = clipWindowDuration > 0 ? (trimEndLocal / clipWindowDuration) * 100 : 0;
   const playheadPercent = clipWindowDuration > 0 ? (playheadLocal / clipWindowDuration) * 100 : 0;
 
   function renderVideoProgress(video: ProjectState['videos'][number]) {
@@ -3083,140 +3056,85 @@ export default function App() {
               </div>
 
               <div className="h-auto pt-6 pb-6 px-8 border-t border-gray-200 bg-white flex flex-col shrink-0 shadow-[0_-4px_20px_rgba(0,0,0,0.02)] z-10 overflow-hidden">
-                <div className="mb-4 relative">
-                  <div
-                    className="w-full h-16 bg-gray-100 rounded-xl border border-gray-200/80 overflow-hidden relative shadow-inner select-none"
-                    ref={(el) => { if (el) el.dataset.timelineContainer = 'true'; }}
-                    onPointerDown={(e) => {
-                      if ((e.target as HTMLElement).dataset.handleEdge) return;
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                      const time = clipWindowStart + fraction * clipWindowDuration;
-                      beginScrub();
-                      syncVideoTime(time, {force: false});
-
-                      const onMove = (ev: PointerEvent) => {
-                        const f = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-                        const t = clipWindowStart + f * clipWindowDuration;
-                        syncVideoTime(t, {force: false});
-                      };
-                      const onUp = () => {
-                        document.removeEventListener('pointermove', onMove);
-                        document.removeEventListener('pointerup', onUp);
-                        endScrub();
-                      };
-                      document.addEventListener('pointermove', onMove);
-                      document.addEventListener('pointerup', onUp);
-                      e.preventDefault();
-                    }}
-                  >
-                    <div className="absolute inset-0 flex pointer-events-none">
-                      {timelineThumbnails.length > 0 ? (
-                        timelineThumbnails.map((frame) => (
-                          <img
-                            key={`${frame.url}-${frame.time_seconds}`}
-                            src={frame.url}
-                            alt=""
-                            className="h-full min-w-0 flex-1 object-cover"
-                            draggable={false}
-                          />
-                        ))
-                      ) : (
-                        <div className="flex w-full items-center justify-center text-xs text-gray-400">
-                          {isLoadingThumbnails ? '生成缩略图中...' : '暂无缩略图'}
-                        </div>
-                      )}
-                    </div>
-                    <div className="absolute inset-0 bg-black/10 pointer-events-none" />
-                    {activeClipSegments.map((segment) => {
-                      const isCurrent = activeSegment?.id === segment.id;
-                      const displayStart = isCurrent ? trimStart : segment.start;
-                      const displayEnd = isCurrent ? trimEnd : segment.end;
-                      const left = clipWindowDuration > 0 ? ((displayStart - clipWindowStart) / clipWindowDuration) * 100 : 0;
-                      const right = clipWindowDuration > 0 ? 100 - (((displayEnd - clipWindowStart) / clipWindowDuration) * 100) : 0;
-                      return (
-                        <div
-                          key={segment.id}
-                          className={`absolute top-0 bottom-0 pointer-events-none ${
-                            isCurrent
-                              ? 'bg-red-500/20 border-y-2 border-red-500 z-20'
-                              : 'bg-white/30 border-y-2 border-white/80 z-10'
-                          }`}
-                          style={{left: `${left}%`, right: `${right}%`}}
-                        >
-                          {isCurrent && !activeClipLockedByExport && (
-                            <>
-                              <div
-                                data-handle-edge="left"
-                                data-testid="trim-handle-start"
-                                className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                                title="拖动调整起点"
-                                onPointerDown={(e) => {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                                  if (!containerEl) return;
-                                  trimRectRef.current = containerEl.getBoundingClientRect();
-                                  trimPointerXRef.current = e.clientX;
-                                  beginScrub();
-                                  startTrimScroll('left');
-                                  const onMove = (ev: PointerEvent) => {
-                                    trimPointerXRef.current = ev.clientX;
-                                    trimRectRef.current = containerEl.getBoundingClientRect();
-                                  };
-                                  const onUp = () => {
-                                    document.removeEventListener('pointermove', onMove);
-                                    document.removeEventListener('pointerup', onUp);
-                                    stopTrimScroll();
-                                    endScrub();
-                                  };
-                                  document.addEventListener('pointermove', onMove);
-                                  document.addEventListener('pointerup', onUp);
-                                }}
-                              >
-                                <div className="absolute inset-y-0 left-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:left-0.5 transition-all" />
-                              </div>
-                              <div
-                                data-handle-edge="right"
-                                data-testid="trim-handle-end"
-                                className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                                title="拖动调整终点"
-                                onPointerDown={(e) => {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                                  if (!containerEl) return;
-                                  trimRectRef.current = containerEl.getBoundingClientRect();
-                                  trimPointerXRef.current = e.clientX;
-                                  beginScrub();
-                                  startTrimScroll('right');
-                                  const onMove = (ev: PointerEvent) => {
-                                    trimPointerXRef.current = ev.clientX;
-                                    trimRectRef.current = containerEl.getBoundingClientRect();
-                                  };
-                                  const onUp = () => {
-                                    document.removeEventListener('pointermove', onMove);
-                                    document.removeEventListener('pointerup', onUp);
-                                    stopTrimScroll();
-                                    endScrub();
-                                  };
-                                  document.addEventListener('pointermove', onMove);
-                                  document.addEventListener('pointerup', onUp);
-                                }}
-                              >
-                                <div className="absolute inset-y-0 right-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:right-0.5 transition-all" />
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
-                    <div
-                      className="absolute top-0 bottom-0 w-0.5 bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)] z-30 pointer-events-none"
-                      style={{left: `${playheadPercent}%`}}
-                    />
-                  </div>
-                </div>
+                <TimelineSurface
+                  activeVideoId={activeVideo.id}
+                  activeClipId={activeClip.id}
+                  clipWindowStart={clipWindowStart}
+                  clipWindowEnd={clipWindowEnd}
+                  clipWindowVersion={clipWindowVersion}
+                  segments={activeClipSegments}
+                  activeSegmentId={activeSegment?.id ?? null}
+                  trimStart={trimStart}
+                  trimEnd={trimEnd}
+                  activeClipLockedByExport={activeClipLockedByExport}
+                  onScrubStart={beginScrub}
+                  onScrubMove={(t) => syncVideoTime(t, {force: false})}
+                  onScrubEnd={endScrub}
+                  renderActiveSegmentHandles={() => (
+                    <>
+                      <div
+                        data-handle-edge="left"
+                        data-testid="trim-handle-start"
+                        className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
+                        title="拖动调整起点"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
+                          if (!containerEl) return;
+                          trimRectRef.current = containerEl.getBoundingClientRect();
+                          trimPointerXRef.current = e.clientX;
+                          beginScrub();
+                          startTrimScroll('left');
+                          const onMove = (ev: PointerEvent) => {
+                            trimPointerXRef.current = ev.clientX;
+                            trimRectRef.current = containerEl.getBoundingClientRect();
+                          };
+                          const onUp = () => {
+                            document.removeEventListener('pointermove', onMove);
+                            document.removeEventListener('pointerup', onUp);
+                            stopTrimScroll();
+                            endScrub();
+                          };
+                          document.addEventListener('pointermove', onMove);
+                          document.addEventListener('pointerup', onUp);
+                        }}
+                      >
+                        <div className="absolute inset-y-0 left-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:left-0.5 transition-all" />
+                      </div>
+                      <div
+                        data-handle-edge="right"
+                        data-testid="trim-handle-end"
+                        className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
+                        title="拖动调整终点"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
+                          if (!containerEl) return;
+                          trimRectRef.current = containerEl.getBoundingClientRect();
+                          trimPointerXRef.current = e.clientX;
+                          beginScrub();
+                          startTrimScroll('right');
+                          const onMove = (ev: PointerEvent) => {
+                            trimPointerXRef.current = ev.clientX;
+                            trimRectRef.current = containerEl.getBoundingClientRect();
+                          };
+                          const onUp = () => {
+                            document.removeEventListener('pointermove', onMove);
+                            document.removeEventListener('pointerup', onUp);
+                            stopTrimScroll();
+                            endScrub();
+                          };
+                          document.addEventListener('pointermove', onMove);
+                          document.addEventListener('pointerup', onUp);
+                        }}
+                      >
+                        <div className="absolute inset-y-0 right-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:right-0.5 transition-all" />
+                      </div>
+                    </>
+                  )}
+                />
 
                 {activeClipSegments.length > 1 && (
                   <div className="flex flex-wrap gap-2 mb-4">
