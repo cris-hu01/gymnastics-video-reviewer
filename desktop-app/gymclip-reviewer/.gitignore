@@ -1,5 +1,8 @@
 node_modules/
-build/
+# Ignore everything under build/ (Vite/tsc output, electron-builder staging),
+# but keep tracked signing resources (entitlements plist, icons) committed.
+build/*
+!build/entitlements.mac.plist
 dist/
 coverage/
 .DS_Store

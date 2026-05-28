@@ -57,6 +57,7 @@
       "output": "electron-dist"
     },
     "afterPack": "electron/scripts/after-pack.cjs",
+    "afterSign": "electron/scripts/notarize.cjs",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -86,12 +87,36 @@
       }
     ],
     "mac": {
-      "category": "public.app-category.video"
+      "category": "public.app-category.video",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": {
+        "teamId": "REPLACE_WITH_APPLE_TEAM_ID"
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["arm64"]
+        }
+      ]
     },
     "win": {
       "target": [
         "nsis"
       ]
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "cris-hu01",
+        "repo": "gymnastics-video-reviewer"
+      }
+    ]
   }
 }
