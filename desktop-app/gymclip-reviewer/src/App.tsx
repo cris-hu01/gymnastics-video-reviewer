@@ -114,7 +114,7 @@ import { useExportJobs, ExportDialog } from './features/export';
 import { useLocalCard } from './features/local-card';
 import { useVideoListPanel, VideoListPanel } from './features/video-list';
 import { usePlatformMatchPanel, PlatformMatchPanel } from './features/platform-match';
-import { PlayerSurface, TimelineSurface } from './features/review';
+import { PlayerSurface, TimelineSurface, TrimHandles } from './features/review';
 
 type FilterStatus = ClipStatus | 'all';
 
@@ -1780,6 +1780,39 @@ export default function App() {
     }
   }
 
+  /**
+   * A4-4: TrimHandles dispatches both edges through this single entry
+   * point. We install the document-level pointer listeners here (rather
+   * than inside TrimHandles) so the auto-scroll loop in startTrimScroll
+   * can keep reading App-owned refs (`trimRectRef`, `trimPointerXRef`)
+   * without prop drilling them into the handle component.
+   */
+  function handleTrimDragStart(
+    edge: 'start' | 'end',
+    event: React.PointerEvent<HTMLDivElement>,
+  ) {
+    event.stopPropagation();
+    event.preventDefault();
+    const containerEl = event.currentTarget.closest('[data-timeline-container]') as HTMLElement | null;
+    if (!containerEl) return;
+    trimRectRef.current = containerEl.getBoundingClientRect();
+    trimPointerXRef.current = event.clientX;
+    beginScrub();
+    startTrimScroll(edge === 'start' ? 'left' : 'right');
+    const onMove = (ev: PointerEvent) => {
+      trimPointerXRef.current = ev.clientX;
+      trimRectRef.current = containerEl.getBoundingClientRect();
+    };
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      stopTrimScroll();
+      endScrub();
+    };
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }
+
   async function handleBindScoreCard(platformRecordId: string | null) {
     if (!activeClip) return;
     if (guardClipMutation(activeClip.id)) return;
@@ -3071,68 +3104,7 @@ export default function App() {
                   onScrubMove={(t) => syncVideoTime(t, {force: false})}
                   onScrubEnd={endScrub}
                   renderActiveSegmentHandles={() => (
-                    <>
-                      <div
-                        data-handle-edge="left"
-                        data-testid="trim-handle-start"
-                        className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                        title="拖动调整起点"
-                        onPointerDown={(e) => {
-                          e.stopPropagation();
-                          e.preventDefault();
-                          const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                          if (!containerEl) return;
-                          trimRectRef.current = containerEl.getBoundingClientRect();
-                          trimPointerXRef.current = e.clientX;
-                          beginScrub();
-                          startTrimScroll('left');
-                          const onMove = (ev: PointerEvent) => {
-                            trimPointerXRef.current = ev.clientX;
-                            trimRectRef.current = containerEl.getBoundingClientRect();
-                          };
-                          const onUp = () => {
-                            document.removeEventListener('pointermove', onMove);
-                            document.removeEventListener('pointerup', onUp);
-                            stopTrimScroll();
-                            endScrub();
-                          };
-                          document.addEventListener('pointermove', onMove);
-                          document.addEventListener('pointerup', onUp);
-                        }}
-                      >
-                        <div className="absolute inset-y-0 left-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:left-0.5 transition-all" />
-                      </div>
-                      <div
-                        data-handle-edge="right"
-                        data-testid="trim-handle-end"
-                        className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                        title="拖动调整终点"
-                        onPointerDown={(e) => {
-                          e.stopPropagation();
-                          e.preventDefault();
-                          const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                          if (!containerEl) return;
-                          trimRectRef.current = containerEl.getBoundingClientRect();
-                          trimPointerXRef.current = e.clientX;
-                          beginScrub();
-                          startTrimScroll('right');
-                          const onMove = (ev: PointerEvent) => {
-                            trimPointerXRef.current = ev.clientX;
-                            trimRectRef.current = containerEl.getBoundingClientRect();
-                          };
-                          const onUp = () => {
-                            document.removeEventListener('pointermove', onMove);
-                            document.removeEventListener('pointerup', onUp);
-                            stopTrimScroll();
-                            endScrub();
-                          };
-                          document.addEventListener('pointermove', onMove);
-                          document.addEventListener('pointerup', onUp);
-                        }}
-                      >
-                        <div className="absolute inset-y-0 right-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:right-0.5 transition-all" />
-                      </div>
-                    </>
+                    <TrimHandles onDragStart={handleTrimDragStart} />
                   )}
                 />
 
