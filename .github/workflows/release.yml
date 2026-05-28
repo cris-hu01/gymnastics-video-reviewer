@@ -73,3 +73,13 @@ jobs:
           SENTRY_DSN_ELECTRON: ${{ secrets.SENTRY_DSN_ELECTRON }}
           SENTRY_DSN_BACKEND: ${{ secrets.SENTRY_DSN_BACKEND }}
         run: npx electron-builder --mac --publish always
+
+      - name: Mark Release as pre-release for rc/beta/alpha tags
+        # electron-builder publishes as a regular Release (releaseType=release
+        # in package.json). For pre-release tags (v1.3.0-rc.x, v1.3.0-beta.x,
+        # v1.3.0-alpha.x) downgrade visibility via gh CLI so autoUpdater on
+        # 'latest' channel doesn't pick them up unless the user opts in.
+        if: contains(github.ref_name, '-rc.') || contains(github.ref_name, '-beta.') || contains(github.ref_name, '-alpha.')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit ${{ github.ref_name }} --prerelease --draft=false

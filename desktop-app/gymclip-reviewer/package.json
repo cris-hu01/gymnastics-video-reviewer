@@ -120,7 +120,8 @@
       {
         "provider": "github",
         "owner": "cris-hu01",
-        "repo": "gymnastics-video-reviewer"
+        "repo": "gymnastics-video-reviewer",
+        "releaseType": "release"
       }
     ]
   }
