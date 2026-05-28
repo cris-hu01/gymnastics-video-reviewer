@@ -160,8 +160,23 @@ def _resolve_dependency_path(owner_path: Path, dependency: str) -> Path | None:
 
 
 def _ensure_executable(path: Path) -> None:
-    current_mode = path.stat().st_mode
-    path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # 0o755 = rwx for owner, rx for group / others.
+    #
+    # The owner-WRITE bit is REQUIRED for autoUpdater on macOS:
+    # Squirrel.Mac's install helper opens each bundled file O_RDWR to
+    # strip the com.apple.quarantine xattr that macOS auto-adds when the
+    # update zip is unpacked. Without write permission, that syscall
+    # fails with EACCES; Squirrel logs
+    #   "Couldn't remove quarantine attribute from .../ffmpeg.
+    #    This most likely means the file is read-only."
+    # then aborts the install and the user is stuck on the old version.
+    #
+    # Brew ships ffmpeg/ffprobe with mode 555 (no owner-write). The old
+    # version of this function used OR-with-X-bits which preserved 555,
+    # causing rc.5 -> rc.6 auto-update to fail. Setting explicit 0o755
+    # gives owner-write, fixing autoUpdater for both ffmpeg/ffprobe bins
+    # and all collected dylibs.
+    path.chmod(0o755)
 
 
 def _codesign_targets(paths: list[Path]) -> None:
