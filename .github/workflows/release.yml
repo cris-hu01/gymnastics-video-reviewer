@@ -24,6 +24,12 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install ffmpeg
+        # build:media-tools resolves ffmpeg + ffprobe via PATH and copies them
+        # into the bundled extraResources/media-tools/. macos-latest runners
+        # don't ship ffmpeg by default; install via Homebrew.
+        run: brew install ffmpeg
+
       - name: Install backend deps
         working-directory: desktop-app/backend
         run: pip install -r requirements.txt
