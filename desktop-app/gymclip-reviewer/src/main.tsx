@@ -3,6 +3,7 @@ import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
 import {initSentry, SentryErrorBoundary} from './lib/sentry';
+import {UpdateToast} from './features/update';
 
 initSentry();
 
@@ -32,6 +33,7 @@ createRoot(document.getElementById('root')!).render(
       showDialog={false}
     >
       <App />
+      <UpdateToast />
     </SentryErrorBoundary>
   </StrictMode>,
 );
