@@ -59,11 +59,14 @@ function main() {
     run('xattr', ['-cr', electronAppPath]);
   }
 
+  // NOTE: CSC_IDENTITY_AUTO_DISCOVERY was forced to 'false' here for ad-hoc
+  // (unsigned) cleanroom packaging. With real Developer ID signing + notarize
+  // enabled (E-2/E-3), electron-builder must be allowed to auto-discover the
+  // identity from the keychain (or CSC_LINK env in CI). Forward env as-is.
   run('npm', ['run', 'electron:pack'], {
     cwd: tempFrontendRoot,
     env: {
       ...process.env,
-      CSC_IDENTITY_AUTO_DISCOVERY: 'false',
     },
   });
 

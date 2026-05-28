@@ -17,6 +17,14 @@ declare global {
       selectDirectory: (initialPath?: string) => Promise<string | null>;
       selectImportSources: (initialPath?: string) => Promise<Array<{ path: string; name: string; size: number }>>;
       showSystemNotification: (payload: { title: string; subtitle?: string; body?: string }) => Promise<{ shown: boolean; reason?: string }>;
+      // === Telemetry / Sentry consent (C-5) ===
+      getTelemetryConfig: () => Promise<{ userId: string; telemetryEnabled: boolean }>;
+      setTelemetryConsent: (enabled: boolean) => Promise<{ userId: string; telemetryEnabled: boolean }>;
+      // === Auto-updater (E-5) ===
+      onUpdateAvailable?: (cb: (info: { version: string; releaseNotes?: string; releaseName?: string }) => void) => void;
+      onDownloadProgress?: (cb: (progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void) => void;
+      onUpdateDownloaded?: (cb: (info: { version: string; releaseNotes?: string; releaseName?: string }) => void) => void;
+      quitAndInstall?: () => Promise<void>;
     };
   }
 }

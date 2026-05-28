@@ -58,16 +58,32 @@ ehthumbs.db
 # Node / Frontend
 node_modules/
 dist/
-build/
+# Anchor `build/` to repo root only — nested sub-packages manage their own
+# build/ visibility (e.g. desktop-app/gymclip-reviewer/build/ keeps tracked
+# electron-builder resources like entitlements.mac.plist).
+/build/
 .next/
 coverage/
+coverage_html/
+.coverage
 electron-dist/
 
 # GymClip Reviewer runtime
 desktop-app/backend/workspace/
-desktop-app/gymclip-reviewer/.env.local
 desktop-app/backend/dist/standalone/
 desktop-app/backend/dist/media-tools/
+
+# Secrets: .env files (Sentry DSN, OSS keys, etc.) — never commit
+# .env.example is the public template and is explicitly allowed below
+desktop-app/.env
+desktop-app/.env.local
+desktop-app/.env.*.local
+desktop-app/gymclip-reviewer/.env
+desktop-app/gymclip-reviewer/.env.local
+desktop-app/gymclip-reviewer/.env.*.local
+desktop-app/backend/.env
+desktop-app/backend/.env.local
+!desktop-app/.env.example
 
 # 本地探索/实验/工作目录（不进版本控制）
 desktop-app/.claude/

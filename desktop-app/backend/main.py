@@ -6,6 +6,12 @@ from pathlib import Path
 
 import uvicorn
 
+from video_review_backend.sentry_init import init_sentry
+
+# Initialize Sentry at import time so uvicorn workers and PyInstaller entry both pick it up.
+# Empty DSN / import failure are handled internally and degrade gracefully.
+init_sentry()
+
 
 def _setup_logging() -> Path:
     backend_root = Path(

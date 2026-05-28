@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from video_review_backend import api, video_import
+from video_review_backend.deps import paths as deps_paths
+from video_review_backend.deps import services as deps_services
 from video_review_backend.models import CandidateClip, ClipSegment, PlatformRecord, PlatformScope, ProjectState, VideoTask
 from video_review_backend.storage import save_project_state
 
@@ -17,11 +19,12 @@ from video_review_backend.storage import save_project_state
 @pytest.fixture
 def client_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     project_file = tmp_path / "project_state.json"
-    monkeypatch.setattr(api, "PROJECT_FILE", project_file)
-    monkeypatch.setattr(api, "_platform_client", None)
-    monkeypatch.setattr(api, "_thumbnail_service", None)
-    monkeypatch.setattr(api, "_export_service", None)
-    monkeypatch.setattr(api, "_detection_service", None)
+    # B-12: monkeypatch deps modules where the singletons actually live now.
+    monkeypatch.setattr(deps_paths, "PROJECT_FILE", project_file)
+    monkeypatch.setattr(deps_services, "_platform_client", None)
+    monkeypatch.setattr(deps_services, "_thumbnail_service", None)
+    monkeypatch.setattr(deps_services, "_export_service", None)
+    monkeypatch.setattr(deps_services, "_detection_service", None)
     with TestClient(api.app) as client:
         yield client, project_file, tmp_path
 
@@ -99,8 +102,15 @@ def test_import_direct_clips_creates_shared_scope(
         path.write_bytes(b"fake-video")
         clip_paths.append(path)
 
+    from video_review_backend.deps import validators as deps_validators
+    from video_review_backend.routers import project as project_router
     monkeypatch.setattr(
-        api,
+        deps_validators,
+        "build_direct_clip_inputs",
+        lambda _files: [{"path": str(path)} for path in clip_paths],
+    )
+    monkeypatch.setattr(
+        project_router,
         "build_direct_clip_inputs",
         lambda _files: [{"path": str(path)} for path in clip_paths],
     )
@@ -142,7 +152,8 @@ def test_import_direct_clips_creates_shared_scope(
                 for index, query in enumerate(scope_queries)
             ]
 
-    monkeypatch.setattr(api, "get_platform_client", lambda: FakePlatformClient())
+    monkeypatch.setattr(deps_services, "get_platform_client", lambda: FakePlatformClient())
+    monkeypatch.setattr(project_router, "get_platform_client", lambda: FakePlatformClient())
 
     response = client.post(
         "/api/project/import-direct-clips",
