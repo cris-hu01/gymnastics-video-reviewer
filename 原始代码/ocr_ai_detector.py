@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ============================================================
 # API密钥配置
 # ============================================================
-DEFAULT_ZHIPU_API_KEY = "ffe92f4a26d24d35b421ddf0329b2852.MAomlItVln6BvTVj"
+DEFAULT_ZHIPU_API_KEY = ""  # MUST come from env (ZHIPU_API_KEY) or config.json — never hardcode
 DEFAULT_ANTHROPIC_API_KEY = ""
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
