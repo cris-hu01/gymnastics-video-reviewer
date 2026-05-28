@@ -21,4 +21,9 @@ contextBridge.exposeInMainWorld('gymclipDesktop', {
   // === Telemetry / Sentry consent (C-5) ===
   getTelemetryConfig: () => ipcRenderer.invoke('telemetry:get-config'),
   setTelemetryConsent: (enabled) => ipcRenderer.invoke('telemetry:set-consent', !!enabled),
+  // === Auto-updater (E-5) ===
+  onUpdateAvailable: (cb) => ipcRenderer.on('autoUpdater:update-available', (_, info) => cb(info)),
+  onDownloadProgress: (cb) => ipcRenderer.on('autoUpdater:download-progress', (_, p) => cb(p)),
+  onUpdateDownloaded: (cb) => ipcRenderer.on('autoUpdater:update-downloaded', (_, info) => cb(info)),
+  quitAndInstall: () => ipcRenderer.invoke('autoUpdater:quit-and-install'),
 });

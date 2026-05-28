@@ -20,6 +20,11 @@ declare global {
       // === Telemetry / Sentry consent (C-5) ===
       getTelemetryConfig: () => Promise<{ userId: string; telemetryEnabled: boolean }>;
       setTelemetryConsent: (enabled: boolean) => Promise<{ userId: string; telemetryEnabled: boolean }>;
+      // === Auto-updater (E-5) ===
+      onUpdateAvailable?: (cb: (info: { version: string; releaseNotes?: string; releaseName?: string }) => void) => void;
+      onDownloadProgress?: (cb: (progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void) => void;
+      onUpdateDownloaded?: (cb: (info: { version: string; releaseNotes?: string; releaseName?: string }) => void) => void;
+      quitAndInstall?: () => Promise<void>;
     };
   }
 }

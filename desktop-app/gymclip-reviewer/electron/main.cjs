@@ -4,6 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { autoUpdater } = require('electron-updater');
 
 // Ensure hardware-accelerated video decode for smooth scrubbing
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
@@ -756,6 +757,69 @@ function _initSentryMain() {
   }
 }
 
+// === Auto-updater (E-5) ===
+// 接 electron-updater 到 GitHub Releases（feed 由 package.json build.publish 配置）。
+// 仅在 app.isPackaged 时实际检查；开发模式打 log 跳过，避免本地 dirty build 触发更新提示。
+function setupAutoUpdater(mainWindow) {
+  if (!mainWindow || mainWindow.isDestroyed?.()) {
+    console.warn('[autoUpdater] mainWindow unavailable, skip setup');
+    return;
+  }
+
+  autoUpdater.logger = console;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  const breadcrumb = (msg, data) => {
+    try {
+      const Sentry = require('@sentry/electron/main');
+      Sentry.addBreadcrumb({ category: 'autoUpdater', message: msg, level: 'info', data });
+    } catch (_) { /* Sentry 未 init 时静默 */ }
+  };
+
+  const sendToRenderer = (channel, payload) => {
+    try {
+      if (!mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+        mainWindow.webContents.send(channel, payload);
+      }
+    } catch (e) {
+      console.warn('[autoUpdater] send to renderer failed:', e?.message || e);
+    }
+  };
+
+  autoUpdater.on('checking-for-update', () => breadcrumb('checking-for-update'));
+  autoUpdater.on('update-available', (info) => {
+    breadcrumb('update-available', { version: info?.version });
+    sendToRenderer('autoUpdater:update-available', info);
+  });
+  autoUpdater.on('update-not-available', () => breadcrumb('update-not-available'));
+  autoUpdater.on('error', (err) => {
+    breadcrumb('error', { message: err?.message });
+    try { require('@sentry/electron/main').captureException(err); } catch (_) {}
+    console.error('[autoUpdater] error:', err?.message || err);
+  });
+  autoUpdater.on('download-progress', (progress) => {
+    sendToRenderer('autoUpdater:download-progress', progress);
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    breadcrumb('update-downloaded', { version: info?.version });
+    sendToRenderer('autoUpdater:update-downloaded', info);
+  });
+
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdatesAndNotify().catch((e) => {
+      console.error('[autoUpdater] checkForUpdatesAndNotify failed:', e?.message || e);
+    });
+  } else {
+    console.log('[autoUpdater] skipped in non-packaged build');
+  }
+}
+
+ipcMain.handle('autoUpdater:quit-and-install', () => {
+  autoUpdater.quitAndInstall();
+});
+// === end Auto-updater ===
+
 ipcMain.handle('telemetry:get-config', () => getTelemetryConfig());
 ipcMain.handle('telemetry:set-consent', (_event, enabled) => setTelemetryConsent(enabled));
 ipcMain.handle('settings:load-api-key', () => loadSavedApiKey());
@@ -784,7 +848,13 @@ app.whenReady().then(async () => {
   }
   _initSentryMain();
 
-  void openMainWindow();
+  void openMainWindow().then(() => {
+    // openMainWindow resolves after createMainWindow() finishes (or after the
+    // .catch reports startup failure + app.quit). Only wire the updater when
+    // a window actually exists — defensive against the failure path.
+    const mainWindow = BrowserWindow.getAllWindows()[0] ?? null;
+    if (mainWindow) setupAutoUpdater(mainWindow);
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

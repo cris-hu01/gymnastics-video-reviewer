@@ -58,7 +58,10 @@ ehthumbs.db
 # Node / Frontend
 node_modules/
 dist/
-build/
+# Anchor `build/` to repo root only — nested sub-packages manage their own
+# build/ visibility (e.g. desktop-app/gymclip-reviewer/build/ keeps tracked
+# electron-builder resources like entitlements.mac.plist).
+/build/
 .next/
 coverage/
 coverage_html/
