@@ -292,7 +292,12 @@ export default function App() {
 
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(0);
-  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
+  // A4-5: activeSegmentId now lives in the trim slice as `segmentId`. The
+  // local wrapper `setActiveSegmentId` (defined below) writes through the
+  // slice's atomic `setActiveClip` so segmentId + bounds + clipId update
+  // in a single commit — no subscriber will ever see a (segmentId from
+  // clip A, bounds from clip B) mismatch.
+  const activeSegmentId = useStore((s) => s.segmentId);
   // A4-2: `playhead` (seconds) is now derived from the playback slice's
   // `currentTimeMs` publish channel. `isPlaying` likewise mirrors the
   // slice. The renderer (PlayerSurface) owns the <video> element and
@@ -327,6 +332,59 @@ export default function App() {
   const trimSavePromiseRef = useRef<Promise<ActiveSegmentEditSnapshot | null> | null>(null);
   const toastIdRef = useRef(0);
   const clipUndoStackRef = useRef<ClipUndoSnapshot[]>([]);
+
+  /**
+   * A4-5 helper: every site that used to call `setActiveSegmentId(id)`
+   * now routes through this wrapper, which commits the new segmentId
+   * (and matching bounds, when we can resolve them) atomically via the
+   * trim slice. Falls back to looking up the segment in the current
+   * `activeClip` so the call site never has to thread bounds through.
+   *
+   * Why not just call `setSegmentId` directly: a bare segmentId update
+   * would briefly leave the slice's startMs/endMs pointing at the
+   * previous segment, defeating the whole point of the atomic action.
+   */
+  const setActiveSegmentId = (segmentId: string | null) => {
+    const clipId = useStore.getState().activeClipId;
+    if (!segmentId) {
+      // Null id means "no segment loaded" — reset every trim signal so
+      // downstream subscribers (e.g. TimelineSurface's segment list) see
+      // a clean cleared state.
+      useStore.getState().clearTrim();
+      return;
+    }
+    if (!activeClip) {
+      // Can't resolve bounds without a clip; commit the segmentId alone
+      // and leave bounds at their current values. Real bounds will arrive
+      // when the clip finishes loading and the clip-change useEffect runs.
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: trimStart * 1000,
+        endMs: Math.max((trimStart + 0.001) * 1000, trimEnd * 1000),
+      });
+      return;
+    }
+    const segment = orderedSegments(activeClip).find((s) => s.id === segmentId);
+    if (segment) {
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: segment.start * 1000,
+        endMs: Math.max((segment.start + 0.001) * 1000, segment.end * 1000),
+      });
+    } else {
+      // Defensive: id didn't match any current segment (race with a
+      // structure edit). Keep the segmentId so subsequent effects can
+      // converge, leave bounds alone.
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: trimStart * 1000,
+        endMs: Math.max((trimStart + 0.001) * 1000, trimEnd * 1000),
+      });
+    }
+  };
 
   const videos = project?.videos ?? [];
   const platformScopes = project?.platform_scopes ?? [];
