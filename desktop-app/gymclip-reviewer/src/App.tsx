@@ -1,26 +1,5 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
-import {
-  AlertCircle,
-  Check,
-  CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
-  ChevronDown,
-  ChevronUp,
-  Clock,
-  Download,
-  FileVideo,
-  Filter,
-  FolderOpen,
-  Key,
-  Pause,
-  Play,
-  RefreshCw,
-  Search,
-  Trash2,
-  Upload,
-  XCircle,
-} from 'lucide-react';
+import {Upload} from 'lucide-react';
 
 import {
   addVideoAsCandidate,
@@ -33,7 +12,6 @@ import {
   extractClipSegment,
   fetchJobs,
   fetchProject,
-  fetchVideoThumbnails,
   getVideoStreamUrl,
   restoreCandidateClips,
   retryClipStage,
@@ -47,7 +25,6 @@ import type {
   ClipStatus,
   PlatformRecord,
   ProjectState,
-  ThumbnailFrame,
 } from './types';
 import {
   categoryLabel,
@@ -59,14 +36,10 @@ import {
   formatNotificationResultSummary,
   formatNotificationTargetCount,
   formatScopeFolderLabel,
-  formatScoreValue,
-  formatSpeed,
   formatSportItemLabel,
   getExportQueueStatusLabel,
   hashString,
   pipelineToneClass,
-  primaryScoreValue,
-  scoreFormulaLabel,
   statusLabel,
   truncateNotificationText,
   videoStatusClass,
@@ -104,21 +77,20 @@ import {
 } from './lib/clip-math';
 import {
   EXPORT_OPERATION_DETAILS,
-  stripFileExtension,
-} from './lib/utils';
-import type {
-  ExportJobSummary,
-  ExportOperation,
 } from './lib/utils';
 import { useStore } from './store';
 import { StatusBadge } from './components/StatusBadge';
 import { TriStateCheckboxButton } from './components/TriStateCheckboxButton';
-import { ScoreFilterDropdown } from './components/ScoreFilterDropdown';
-import type { ScoreFilterMenu } from './components/ScoreFilterDropdown';
 import { useVideoImport, VideoImportPanel } from './features/import';
 import type { ImportMode } from './features/import';
 import { useExportJobs, ExportDialog } from './features/export';
-import { useLocalCard, LocalCardPanel } from './features/local-card';
+import { useLocalCard } from './features/local-card';
+import { useVideoListPanel, VideoListPanel } from './features/video-list';
+import { usePlatformMatchPanel, PlatformMatchPanel } from './features/platform-match';
+import { ClipListPanel } from './features/clip-list';
+import { ReviewPanel } from './features/review';
+import { AppHeader } from './features/app-header';
+import { describeJobProgress, describeVideoProgress, jobPercent } from './lib/progress';
 
 type FilterStatus = ClipStatus | 'all';
 
@@ -134,22 +106,6 @@ type ActiveSegmentEditSnapshot = {
   playheadValue: number;
 };
 
-type PipelineTone = 'neutral' | 'muted' | 'success' | 'warning' | 'danger';
-type ClipPipelineBadgeItem = {
-  key: 'export' | 'oss' | 'platform';
-  text: string;
-  tone: PipelineTone;
-};
-type ExportUploadItem = {
-  clip_id: string;
-  file_name: string;
-  stage: string;
-  bytes_sent: number;
-  total_bytes: number;
-  percent: number;
-  speed_bps: number;
-  error_message: string | null;
-};
 type ToastKind = 'success' | 'error';
 type AppToast = {
   id: number;
@@ -179,21 +135,48 @@ const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出�
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
-  const [project, setProject] = useState<ProjectState | null>(null);
+  // A3: project state migrated to zustand (see store/project.ts). The hook form
+  // is used here so renders that depend on the snapshot stay subscribed; mutation
+  // paths use the store actions directly (still stable across renders).
+  const project = useStore((s) => s.project);
+  const setProject = useStore((s) => s.setProject);
+  const patchProject = useStore((s) => s.patchProject);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [toast, setToast] = useState<AppToast | null>(null);
   const [isToastVisible, setIsToastVisible] = useState(false);
-  const [jobs, setJobs] = useState<AppJob[]>([]);
+  // A3: jobs migrated to zustand (see store/jobs.ts). Subscribed once here so
+  // the existing useExportJobs hook (which receives the array as a prop) keeps
+  // working unchanged; setters come straight from the store.
+  const jobs = useStore((s) => s.jobs);
+  const setJobs = useStore((s) => s.setJobs);
+  const upsertJob = useStore((s) => s.upsertJob);
+  const upsertJobs = useStore((s) => s.upsertJobs);
 
-  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
-  const [activeClipId, setActiveClipId] = useState<string | null>(null);
+  // A3: activeVideoId / activeClipId migrated to zustand store (see store/active.ts).
+  // Subscribe via selectors to keep referential equality with the prior useState
+  // behavior; setters come from the store directly so they're stable across renders.
+  const activeVideoId = useStore((s) => s.activeVideoId);
+  const activeClipId = useStore((s) => s.activeClipId);
+  const setActiveVideoId = useStore((s) => s.setActiveVideoId);
+  const setActiveClipId = useStore((s) => s.setActiveClipId);
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
   const [isDragging, setIsDragging] = useState(false);
-  const [videoContextMenu, setVideoContextMenu] = useState<{x: number; y: number; videoId: string} | null>(null);
+  // A3-4: video-list-local UI state extracted into useVideoListPanel.
+  // collapsedVideoFolderIds / isVideoSidebarCollapsed / videoContextMenu still
+  // live here because they're consumed by effects in this file (folder cleanup,
+  // context-menu auto-close); the panel reads them via the `local` prop.
+  const videoListLocal = useVideoListPanel();
+  const {
+    collapsedVideoFolderIds,
+    setCollapsedVideoFolderIds,
+    setIsVideoSidebarCollapsed,
+    videoContextMenu,
+    setVideoContextMenu,
+  } = videoListLocal;
 
   const importApi = useVideoImport({
     desktopBridge,
@@ -248,33 +231,57 @@ export default function App() {
   const selectedClipIds = useStore((s) => s.selectedClipIds);
   const [isBatchDetecting, setIsBatchDetecting] = useState(false);
   const [collapsedClipGroupIds, setCollapsedClipGroupIds] = useState<string[]>([]);
-  const [collapsedVideoFolderIds, setCollapsedVideoFolderIds] = useState<string[]>([]);
-  const [isVideoSidebarCollapsed, setIsVideoSidebarCollapsed] = useState(false);
-  const [scoreSearchQuery, setScoreSearchQuery] = useState('');
-  const [scoreApparatusFilter, setScoreApparatusFilter] = useState('all');
-  const [scoreSexFilter, setScoreSexFilter] = useState('all');
-  const [scoreCountryFilter, setScoreCountryFilter] = useState('all');
-  const [openScoreFilter, setOpenScoreFilter] = useState<ScoreFilterMenu | null>(null);
+  // collapsedVideoFolderIds + isVideoSidebarCollapsed migrated to useVideoListPanel above.
+  // A3-5: right-panel filter state migrated to usePlatformMatchPanel. Kept
+  // at App level because App-level memos (videoScopedPlatformRecords etc.)
+  // and useLocalCard still read the same tuple; the panel sees it via
+  // the `local` prop.
+  const platformMatchLocal = usePlatformMatchPanel();
+  const {
+    scoreSearchQuery,
+    setScoreSearchQuery,
+    scoreApparatusFilter,
+    setScoreApparatusFilter,
+    scoreSexFilter,
+    setScoreSexFilter,
+    scoreCountryFilter,
+    setScoreCountryFilter,
+    openScoreFilter,
+    setOpenScoreFilter,
+  } = platformMatchLocal;
 
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(0);
-  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
-  const [playhead, setPlayhead] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
+  // A4-5: activeSegmentId now lives in the trim slice as `segmentId`. The
+  // local wrapper `setActiveSegmentId` (defined below) writes through the
+  // slice's atomic `setActiveClip` so segmentId + bounds + clipId update
+  // in a single commit — no subscriber will ever see a (segmentId from
+  // clip A, bounds from clip B) mismatch.
+  const activeSegmentId = useStore((s) => s.segmentId);
+  // A4-2: `playhead` (seconds) is now derived from the playback slice's
+  // `currentTimeMs` publish channel. `isPlaying` likewise mirrors the
+  // slice. The renderer (PlayerSurface) owns the <video> element and
+  // pushes these snapshots; UI here reads them but never writes back
+  // through `setCurrentTimeMs` (that would re-enter the loop the slice
+  // is designed to break — see store/playback.ts header).
+  const playheadMs = useStore((s) => s.currentTimeMs);
+  const playhead = playheadMs / 1000;
+  const isPlaying = useStore((s) => s.isPlaying);
+  const setIsPlayingStore = useStore((s) => s.setIsPlaying);
+  const enqueueSeekStore = useStore((s) => s.enqueueSeek);
   const [isSavingTrim, setIsSavingTrim] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
-  const [timelineThumbnails, setTimelineThumbnails] = useState<ThumbnailFrame[]>([]);
-  const [isLoadingThumbnails, setIsLoadingThumbnails] = useState(false);
+  // A4-3: timelineThumbnails / isLoadingThumbnails moved into TimelineSurface
+  // along with the debounced fetch effect. The component watches the trim
+  // slice's draggingHandle to suppress refetches mid-drag.
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  // A4-2: videoRef removed — PlayerSurface is now the sole owner. The
+  // remaining refs below still belong to App.tsx (trim drag state,
+  // scrub windowing, undo stack). They will move out in A4-3/A4-4.
   const skipTrimSyncRef = useRef(true);
   const isScrubbingRef = useRef(false);
   const resumeAfterScrubRef = useRef(false);
-  const scrubRafRef = useRef<number | null>(null);
-  const pendingSeekRef = useRef<number | null>(null);
-  const isSeekingRef = useRef(false);
-  const seekSafetyTimerRef = useRef<number | null>(null);
   const trimStartRef = useRef(0);
   const trimEndRef = useRef(0);
   const trimAutoSaveTimerRef = useRef<number | null>(null);
@@ -285,6 +292,59 @@ export default function App() {
   const trimSavePromiseRef = useRef<Promise<ActiveSegmentEditSnapshot | null> | null>(null);
   const toastIdRef = useRef(0);
   const clipUndoStackRef = useRef<ClipUndoSnapshot[]>([]);
+
+  /**
+   * A4-5 helper: every site that used to call `setActiveSegmentId(id)`
+   * now routes through this wrapper, which commits the new segmentId
+   * (and matching bounds, when we can resolve them) atomically via the
+   * trim slice. Falls back to looking up the segment in the current
+   * `activeClip` so the call site never has to thread bounds through.
+   *
+   * Why not just call `setSegmentId` directly: a bare segmentId update
+   * would briefly leave the slice's startMs/endMs pointing at the
+   * previous segment, defeating the whole point of the atomic action.
+   */
+  const setActiveSegmentId = (segmentId: string | null) => {
+    const clipId = useStore.getState().activeClipId;
+    if (!segmentId) {
+      // Null id means "no segment loaded" — reset every trim signal so
+      // downstream subscribers (e.g. TimelineSurface's segment list) see
+      // a clean cleared state.
+      useStore.getState().clearTrim();
+      return;
+    }
+    if (!activeClip) {
+      // Can't resolve bounds without a clip; commit the segmentId alone
+      // and leave bounds at their current values. Real bounds will arrive
+      // when the clip finishes loading and the clip-change useEffect runs.
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: trimStart * 1000,
+        endMs: Math.max((trimStart + 0.001) * 1000, trimEnd * 1000),
+      });
+      return;
+    }
+    const segment = orderedSegments(activeClip).find((s) => s.id === segmentId);
+    if (segment) {
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: segment.start * 1000,
+        endMs: Math.max((segment.start + 0.001) * 1000, segment.end * 1000),
+      });
+    } else {
+      // Defensive: id didn't match any current segment (race with a
+      // structure edit). Keep the segmentId so subsequent effects can
+      // converge, leave bounds alone.
+      useStore.getState().setActiveClip({
+        clipId,
+        segmentId,
+        startMs: trimStart * 1000,
+        endMs: Math.max((trimStart + 0.001) * 1000, trimEnd * 1000),
+      });
+    }
+  };
 
   const videos = project?.videos ?? [];
   const platformScopes = project?.platform_scopes ?? [];
@@ -584,8 +644,9 @@ export default function App() {
   const clipWindowStart = (clipWindowOverride ?? initialClipWindow).start;
   const clipWindowEnd = (clipWindowOverride ?? initialClipWindow).end;
   const clipWindowDuration = Math.max(CLIP_STEP, clipWindowEnd - clipWindowStart);
-  const trimStartLocal = Math.max(0, trimStart - clipWindowStart);
-  const trimEndLocal = Math.max(trimStartLocal + CLIP_STEP, trimEnd - clipWindowStart);
+  // A4-3: trim* / playhead-local-to-window calculations now live inside
+  // TimelineSurface. Only the in-player overlay needs the playhead
+  // percent (kept below near the JSX that uses it).
   const playheadLocal = Math.max(0, Math.min(clipWindowDuration, playhead - clipWindowStart));
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === 'queued' || job.status === 'running'),
@@ -1111,7 +1172,7 @@ export default function App() {
       trimStartRef.current = 0;
       trimEndRef.current = 0;
       setActiveSegmentId(null);
-      setPlayhead(0);
+      enqueueSeekStore(0);
       return;
     }
     const nextSegment = firstEditableSegment(activeClip);
@@ -1126,8 +1187,10 @@ export default function App() {
     setTrimEnd(e);
     trimStartRef.current = s;
     trimEndRef.current = e;
-    setPlayhead(s);
-    setIsPlaying(false);
+    // Park playhead at the segment start. PlayerSurface translates this
+    // into a video.currentTime write once metadata is ready.
+    enqueueSeekStore(s * 1000);
+    setIsPlayingStore(false);
   }, [activeClip?.id, activeVideo?.duration]);
 
   useEffect(() => {
@@ -1157,57 +1220,26 @@ export default function App() {
     setTrimEnd(clampedEnd);
     trimStartRef.current = clampedStart;
     trimEndRef.current = clampedEnd;
-    setPlayhead((current) => Math.min(Math.max(current, clampedStart), clampedEnd));
+    // Clamp playhead into the new segment if it currently sits outside.
+    // Read the live snapshot from the store (not the render-time `playhead`
+    // closure) so we don't queue a seek to a stale position when this
+    // effect runs again before the publish channel catches up.
+    const currentMs = useStore.getState().currentTimeMs;
+    const currentS = currentMs / 1000;
+    const clampedS = Math.min(Math.max(currentS, clampedStart), clampedEnd);
+    if (clampedS !== currentS) {
+      enqueueSeekStore(clampedS * 1000);
+    }
   }, [activeClip?.id, activeSegment?.id, activeSegment?.start, activeSegment?.end]);
 
   useEffect(() => {
     setVideoPlaybackError(null);
   }, [streamUrl, activeVideoId]);
 
-  useEffect(() => {
-    if (!activeVideo || !activeClip) {
-      setTimelineThumbnails([]);
-      return;
-    }
-    if (trimDraggingRef.current) return;
-
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      setIsLoadingThumbnails(true);
-      void fetchVideoThumbnails(activeVideo.id, {
-        start: clipWindowStart,
-        end: clipWindowEnd,
-        count: 12,
-      })
-        .then((response) => {
-          if (cancelled) return;
-          setTimelineThumbnails(response.thumbnails);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          setTimelineThumbnails([]);
-        })
-        .finally(() => {
-          if (cancelled) return;
-          setIsLoadingThumbnails(false);
-        });
-    }, 250);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [activeVideo?.id, activeClip?.id, clipWindowStart, clipWindowEnd, clipWindowVersion]);
+  // A4-3: thumbnail fetch + suppression effect moved into TimelineSurface.
 
   useEffect(() => {
     return () => {
-      if (scrubRafRef.current != null) {
-        cancelAnimationFrame(scrubRafRef.current);
-      }
-      if (seekSafetyTimerRef.current != null) {
-        window.clearTimeout(seekSafetyTimerRef.current);
-      }
       if (trimAutoSaveTimerRef.current != null) {
         window.clearTimeout(trimAutoSaveTimerRef.current);
       }
@@ -1250,55 +1282,19 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trimStart, trimEnd, activeSegment?.id, activeSegment?.start, activeSegment?.end, isScrubbing, activeClipLockedByExport]);
 
+  // A4-2: <video> element listeners (timeupdate / loadedmetadata / play /
+  // pause) now live in PlayerSurface. The auto-pause-at-trim-end behavior
+  // formerly inlined in the timeupdate handler is reimplemented here as a
+  // store subscriber so it survives the renderer extraction.
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-
-    const syncPosition = () => {
-      const nextTime = Math.max(activeClip.review_start, 0);
-      video.currentTime = nextTime;
-      setPlayhead(nextTime);
-    };
-
-    if (video.readyState >= 1) {
-      syncPosition();
+    if (!activeClip || !isPlaying) return;
+    // playhead is in seconds; trimEnd is in seconds. We only pause when
+    // we cross trimEnd; the renderer publishes ~30Hz so this catches
+    // the boundary within ~33ms.
+    if (playhead >= trimEnd) {
+      setIsPlayingStore(false);
     }
-  }, [activeClip?.id, streamUrl]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-
-    const onTimeUpdate = () => {
-      const current = video.currentTime;
-      setPlayhead(current);
-      if (current >= trimEnd) {
-        video.pause();
-        setIsPlaying(false);
-      }
-    };
-
-    const onLoadedMetadata = () => {
-      const target = Math.max(activeClip.review_start, 0);
-      video.currentTime = target;
-      setPlayhead(target);
-    };
-
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-
-    video.addEventListener('timeupdate', onTimeUpdate);
-    video.addEventListener('loadedmetadata', onLoadedMetadata);
-    video.addEventListener('play', onPlay);
-    video.addEventListener('pause', onPause);
-
-    return () => {
-      video.removeEventListener('timeupdate', onTimeUpdate);
-      video.removeEventListener('loadedmetadata', onLoadedMetadata);
-      video.removeEventListener('play', onPlay);
-      video.removeEventListener('pause', onPause);
-    };
-  }, [activeClip, trimEnd, streamUrl]);
+  }, [activeClip, isPlaying, playhead, trimEnd, setIsPlayingStore]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1485,8 +1481,8 @@ export default function App() {
   function markVideosQueued(videoIds: string[]) {
     if (videoIds.length === 0) return;
     const videoIdSet = new Set(videoIds);
-    setProject((current) => {
-      if (!current) return current;
+    patchProject((current) => {
+      if (!current) return undefined;
       return {
         ...current,
         videos: current.videos.map((video) =>
@@ -1641,9 +1637,11 @@ export default function App() {
   }
 
   function seekRelative(offset: number) {
-    const video = videoRef.current;
-    if (!video || !activeClip) return;
-    const nextTime = Math.max(trimStart, Math.min(trimEnd, video.currentTime + offset));
+    if (!activeClip) return;
+    // Read the live position from the publish channel rather than a stale
+    // React closure — keyboard repeats can fire faster than React commits.
+    const currentS = useStore.getState().currentTimeMs / 1000;
+    const nextTime = Math.max(trimStart, Math.min(trimEnd, currentS + offset));
     syncVideoTime(nextTime, {force: true});
   }
 
@@ -1662,150 +1660,71 @@ export default function App() {
   }
 
   function togglePlayPause() {
-    const video = videoRef.current;
-    if (!video) return;
-    if (video.paused) {
-      if (video.currentTime < trimStart || video.currentTime >= trimEnd) {
-        video.currentTime = trimStart;
+    // Mirror the play/pause intent through the store. PlayerSurface
+    // applies it to the underlying <video> element.
+    const {isPlaying: storeIsPlaying, currentTimeMs} = useStore.getState();
+    if (!storeIsPlaying) {
+      const currentS = currentTimeMs / 1000;
+      if (currentS < trimStart || currentS >= trimEnd) {
+        enqueueSeekStore(trimStart * 1000);
       }
-      void video.play();
+      setIsPlayingStore(true);
     } else {
-      video.pause();
+      setIsPlayingStore(false);
     }
   }
 
-  function syncVideoTime(nextTime: number, options?: {force?: boolean}) {
+  function syncVideoTime(nextTime: number, _options?: {force?: boolean}) {
+    // A4-2: rAF batching + fastSeek + safety-timer logic now lives inside
+    // PlayerSurface (it is the videoRef owner). Here we just dispatch a
+    // seek command through the store; the renderer coalesces back-to-back
+    // commands into a single per-frame seek and uses fastSeek for big
+    // deltas, preserving the pre-A4 scrub UX.
+    //
+    // The `force` flag previously bypassed the rAF coalescer; PlayerSurface
+    // already cancels any queued rAF when a new pendingSeek arrives, so
+    // every `enqueueSeek` call effectively "wins" — `force` is now a no-op
+    // but we keep the parameter so existing call sites compile unchanged.
     const safeTime = Number(nextTime.toFixed(2));
-    pendingSeekRef.current = safeTime;
-
-    // During scrubbing, defer setPlayhead to rAF to reduce React re-renders
-    if (!isScrubbingRef.current) {
-      setPlayhead(safeTime);
-    }
-
-    const video = videoRef.current;
-    if (!video) return;
-
-    const applySeek = () => {
-      if (pendingSeekRef.current == null || isSeekingRef.current) return;
-      const target = pendingSeekRef.current;
-      pendingSeekRef.current = null;
-      if (Math.abs(video.currentTime - target) > 0.02) {
-        isSeekingRef.current = true;
-
-        // Clear any previous safety timer
-        if (seekSafetyTimerRef.current != null) {
-          window.clearTimeout(seekSafetyTimerRef.current);
-        }
-
-        const onSeeked = () => {
-          video.removeEventListener('seeked', onSeeked);
-          if (seekSafetyTimerRef.current != null) {
-            window.clearTimeout(seekSafetyTimerRef.current);
-            seekSafetyTimerRef.current = null;
-          }
-          isSeekingRef.current = false;
-          // If a new target accumulated while seeking, apply it immediately
-          if (pendingSeekRef.current != null) {
-            applySeek();
-          }
-        };
-        video.addEventListener('seeked', onSeeked);
-
-        // Safety timeout in case seeked never fires
-        seekSafetyTimerRef.current = window.setTimeout(() => {
-          video.removeEventListener('seeked', onSeeked);
-          seekSafetyTimerRef.current = null;
-          isSeekingRef.current = false;
-          if (pendingSeekRef.current != null) {
-            applySeek();
-          }
-        }, 300);
-
-        // Fast scrub: use fastSeek for large jumps (keyframe-only, instant)
-        const delta = Math.abs(target - video.currentTime);
-        if (delta > 2 && typeof video.fastSeek === 'function') {
-          video.fastSeek(target);
-        } else {
-          video.currentTime = target;
-        }
-      }
-    };
-
-    if (options?.force) {
-      if (scrubRafRef.current != null) {
-        cancelAnimationFrame(scrubRafRef.current);
-        scrubRafRef.current = null;
-      }
-      isSeekingRef.current = false;
-      if (seekSafetyTimerRef.current != null) {
-        window.clearTimeout(seekSafetyTimerRef.current);
-        seekSafetyTimerRef.current = null;
-      }
-      pendingSeekRef.current = safeTime;
-      setPlayhead(safeTime);
-      // Force seek always uses precise currentTime
-      if (Math.abs(video.currentTime - safeTime) > 0.02) {
-        video.currentTime = safeTime;
-      }
-      return;
-    }
-
-    if (scrubRafRef.current != null) {
-      return;
-    }
-
-    scrubRafRef.current = requestAnimationFrame(() => {
-      scrubRafRef.current = null;
-      if (pendingSeekRef.current != null) {
-        setPlayhead(pendingSeekRef.current);
-      }
-      applySeek();
-    });
+    enqueueSeekStore(safeTime * 1000);
   }
 
   function beginScrub() {
-    const video = videoRef.current;
     isScrubbingRef.current = true;
     setIsScrubbing(true);
-    resumeAfterScrubRef.current = Boolean(video && !video.paused);
-    if (video && !video.paused) {
-      video.pause();
+    // Remember whether we were playing so endScrub can resume. PlayerSurface
+    // is the only thing touching <video>; we route the pause through the
+    // store so the renderer applies it.
+    const wasPlaying = useStore.getState().isPlaying;
+    resumeAfterScrubRef.current = wasPlaying;
+    if (wasPlaying) {
+      setIsPlayingStore(false);
     }
   }
 
   function endScrub() {
     isScrubbingRef.current = false;
     setIsScrubbing(false);
-    if (scrubRafRef.current != null) {
-      cancelAnimationFrame(scrubRafRef.current);
-      scrubRafRef.current = null;
-    }
-    isSeekingRef.current = false;
-    if (seekSafetyTimerRef.current != null) {
-      window.clearTimeout(seekSafetyTimerRef.current);
-      seekSafetyTimerRef.current = null;
-    }
-    if (pendingSeekRef.current != null) {
-      syncVideoTime(pendingSeekRef.current, {force: true});
-    }
 
     const activeElement = document.activeElement;
     if (activeElement instanceof HTMLInputElement && activeElement.type === 'range') {
       activeElement.blur();
     }
 
-    const video = videoRef.current;
-    if (video && resumeAfterScrubRef.current) {
+    if (resumeAfterScrubRef.current) {
       resumeAfterScrubRef.current = false;
-      void video.play().catch(() => undefined);
-    } else {
-      resumeAfterScrubRef.current = false;
+      setIsPlayingStore(true);
     }
   }
 
   function startTrimScroll(edge: 'left' | 'right') {
     trimDraggingRef.current = true;
+    // A4-3: wire the trim slice's draggingHandle flag so TimelineSurface
+    // (and, in A4-4, TrimHandles) can react via a React-tracked signal
+    // instead of the ref. Pre-A4 the ref-only flag was OK because the
+    // thumbnail fetch effect was a few lines above its setter; now they
+    // live in different components.
+    useStore.getState().beginDrag(edge === 'left' ? 'start' : 'end');
     const tick = () => {
       const rect = trimRectRef.current;
       if (!rect || rect.width === 0) {
@@ -1872,8 +1791,44 @@ export default function App() {
     }
     if (trimDraggingRef.current) {
       trimDraggingRef.current = false;
+      // Clear the store-side flag so TimelineSurface re-enables thumbnail
+      // fetching. The clipWindowVersion bump kicks the fetch right away.
+      useStore.getState().endDrag();
       setClipWindowVersion((v) => v + 1);
     }
+  }
+
+  /**
+   * A4-4: TrimHandles dispatches both edges through this single entry
+   * point. We install the document-level pointer listeners here (rather
+   * than inside TrimHandles) so the auto-scroll loop in startTrimScroll
+   * can keep reading App-owned refs (`trimRectRef`, `trimPointerXRef`)
+   * without prop drilling them into the handle component.
+   */
+  function handleTrimDragStart(
+    edge: 'start' | 'end',
+    event: React.PointerEvent<HTMLDivElement>,
+  ) {
+    event.stopPropagation();
+    event.preventDefault();
+    const containerEl = event.currentTarget.closest('[data-timeline-container]') as HTMLElement | null;
+    if (!containerEl) return;
+    trimRectRef.current = containerEl.getBoundingClientRect();
+    trimPointerXRef.current = event.clientX;
+    beginScrub();
+    startTrimScroll(edge === 'start' ? 'left' : 'right');
+    const onMove = (ev: PointerEvent) => {
+      trimPointerXRef.current = ev.clientX;
+      trimRectRef.current = containerEl.getBoundingClientRect();
+    };
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      stopTrimScroll();
+      endScrub();
+    };
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
   }
 
   async function handleBindScoreCard(platformRecordId: string | null) {
@@ -1897,7 +1852,7 @@ export default function App() {
     try {
       const response = await detectProjectVideo(activeVideo.id, apiKey || undefined);
       setProjectState(response.project);
-      setJobs((current) => [response.job, ...current.filter((job) => job.id !== response.job.id)]);
+      upsertJob(response.job);
       setErrorMessage(null);
       setSuccessMessage('检测任务已加入后台队列');
     } catch (error) {
@@ -1939,10 +1894,7 @@ export default function App() {
       }
 
       if (queuedJobs.length > 0) {
-        setJobs((current) => [
-          ...queuedJobs,
-          ...current.filter((job) => !queuedJobs.some((queuedJob) => queuedJob.id === job.id)),
-        ]);
+        upsertJobs(queuedJobs);
         const currentSelected = useStore.getState().selectedVideoIds;
         const nextSelected = new Set<string>();
         currentSelected.forEach((videoId) => {
@@ -2148,7 +2100,9 @@ export default function App() {
     if (trimSavePromiseRef.current) {
       return trimSavePromiseRef.current;
     }
-    const livePlayhead = Number((videoRef.current?.currentTime ?? playhead).toFixed(3));
+    // Use the renderer's published snapshot rather than reaching into the
+    // <video> element directly (A4-2: videoRef now lives in PlayerSurface).
+    const livePlayhead = Number((useStore.getState().currentTimeMs / 1000).toFixed(3));
     if (Math.abs(trimStart - activeSegment.start) < 0.01 && Math.abs(trimEnd - activeSegment.end) < 0.01) {
       return {
         clip: activeClip,
@@ -2234,7 +2188,7 @@ export default function App() {
             ?? orderedSegments(splitClip)[orderedSegments(splitClip).length - 1]
           : null;
       setActiveSegmentId(nextSegment?.id ?? null);
-      setPlayhead(splitPoint);
+      enqueueSeekStore(splitPoint * 1000);
       setErrorMessage(null);
       setSuccessMessage('已按播放头拆分当前选区');
     } catch (error) {
@@ -2352,7 +2306,7 @@ export default function App() {
         upload_part_threads: uploadPartThreads,
       });
       setProjectState(response.project);
-      setJobs((current) => [response.job, ...current.filter((job) => job.id !== response.job.id)]);
+      upsertJob(response.job);
       setSuccessMessage(`${EXPORT_OPERATION_DETAILS[exportOperation].label}任务已在后台开始/排队，可在主页进度条查看`);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '导出失败');
@@ -2393,179 +2347,13 @@ export default function App() {
     await handleImportFiles(event.dataTransfer.files);
   };
 
-  const trimStartPercent = clipWindowDuration > 0 ? (trimStartLocal / clipWindowDuration) * 100 : 0;
-  const trimEndPercent = clipWindowDuration > 0 ? (trimEndLocal / clipWindowDuration) * 100 : 0;
   const playheadPercent = clipWindowDuration > 0 ? (playheadLocal / clipWindowDuration) * 100 : 0;
 
-  function renderVideoProgress(video: ProjectState['videos'][number]) {
-    const progress = video.detection_progress || {};
-    const stage = String(progress.stage || '');
-    const completed = Number(progress.completed || 0);
-    const total = Number(progress.total || 0);
-    const message = String(progress.message || '');
-    const detectJob = activeJobs.find((job) => job.kind === 'detect' && job.video_id === video.id) ?? null;
-
-    if (video.source_kind === 'direct_clip') {
-      if (video.status === 'error' && video.error_message) {
-        return video.error_message;
-      }
-      if (video.status === 'done') {
-        return '已有片段处理完成';
-      }
-      return message || '已有片段已导入，可直接绑定或导出';
-    }
-
-    if (detectJob?.status === 'queued') {
-      return String(detectJob.progress.message || '等待检测任务开始');
-    }
-
-    if (video.status === 'detecting') {
-      if (total > 0) {
-        return `${completed}/${total} ${message || '检测中'}`;
-      }
-      if (Number(progress.precheck_passed || 0) > 0) {
-        return `${Number(progress.precheck_passed || 0)} 已通过预检查`;
-      }
-      return message || '检测中...';
-    }
-
-    if (stage === 'cancel_requested') {
-      return message || '正在取消检测...';
-    }
-
-    if (stage === 'cancelled') {
-      return message || '检测已取消';
-    }
-
-    if (stage === 'interrupted') {
-      return message || '检测任务已中断，请重新开始';
-    }
-
-    if (stage === 'completed') {
-      const finalCount = progress.final_count;
-      if (typeof finalCount === 'number') {
-        if (finalCount === 0) {
-          return '检测完成，未识别到候选片段';
-        }
-        return `检测完成，得到 ${finalCount} 个候选`;
-      }
-      return '检测完成';
-    }
-
-    if (video.status === 'error' && video.error_message) {
-      return video.error_message;
-    }
-
-    return `${video.reviewed_candidates}/${video.total_candidates} 已审`;
-  }
-
-  function renderJobProgress(job: AppJob) {
-    const completed = Number(job.progress.completed || 0);
-    const total = Number(job.progress.total || 0);
-    const message = String(job.progress.message || '');
-    const stage = String(job.progress.stage || '');
-
-    if (job.status === 'failed') {
-      return job.error_message || '任务失败';
-    }
-    if (job.status === 'cancelled') {
-      return message || '任务已取消';
-    }
-    if (job.kind === 'export') {
-      const aggregateUploadSpeed = Number((job.progress as Record<string, unknown>).aggregate_upload_speed_bps || 0);
-      const activeUploadCount = Number((job.progress as Record<string, unknown>).active_upload_count || 0);
-      const localExported = Number((job.progress as Record<string, unknown>).local_exported || 0);
-      const uploaded = Number((job.progress as Record<string, unknown>).uploaded || 0);
-      const synced = Number((job.progress as Record<string, unknown>).synced || 0);
-      const operation = String((job.progress as Record<string, unknown>).operation || 'export_and_upload') as ExportOperation;
-      if (operation === 'upload_only') {
-        const summary = [`上传 ${uploaded}/${total || uploaded}`, `回写 ${synced}`];
-        const detail = [
-          activeUploadCount > 0 ? `${activeUploadCount} 个文件并行` : '',
-          aggregateUploadSpeed > 0 ? formatSpeed(aggregateUploadSpeed) : '',
-          message,
-        ]
-          .filter(Boolean)
-          .join(' · ');
-        return `${summary.join(' · ')}${detail ? ` · ${detail}` : ''}`.trim();
-      }
-      if (operation === 'export_only') {
-        return `导出 ${localExported}/${total || localExported}${message ? ` · ${message}` : ''}`.trim();
-      }
-      const detail = [
-        activeUploadCount > 0 ? `${activeUploadCount} 个文件并行` : '',
-        aggregateUploadSpeed > 0 ? formatSpeed(aggregateUploadSpeed) : '',
-        message,
-      ]
-        .filter(Boolean)
-        .join(' · ');
-      return `导出 ${localExported}/${total || localExported} · 上传 ${uploaded} · 回写 ${synced}${detail ? ` · ${detail}` : ''}`.trim();
-    }
-    if (job.kind === 'detect') {
-      const currentName = String((job.progress as Record<string, unknown>).current_name || '');
-      const stageLabel =
-        stage === 'extracting'
-          ? '正在采样视频帧'
-          : stage === 'start'
-            ? '准备开始检测'
-            : stage === 'precheck_complete'
-              ? '预检查完成'
-              : stage === 'detecting'
-                ? `AI 检测中${currentName ? `: ${currentName}` : ''}`
-                : stage === 'completed'
-                  ? '检测完成'
-                  : stage === 'cancel_requested'
-                    ? '正在取消检测...'
-                    : stage === 'cancelled'
-                      ? '检测已取消'
-                      : '';
-      const label = stageLabel || (message && message !== '等待检测任务开始' ? message : '') ||
-        (job.status === 'queued' ? '已排队，准备抽帧' : '准备开始检测');
-      if (total > 0) {
-        return `${completed}/${total} ${label}`.trim();
-      }
-      return label;
-    }
-    if (total > 0) {
-      return `${completed}/${total} ${message}`.trim();
-    }
-    return message || (job.status === 'queued' ? '等待开始' : '处理中');
-  }
-
-  function renderJobPercent(job: AppJob) {
-    const completed = Number(job.progress.completed || 0);
-    const total = Number(job.progress.total || 0);
-    const stage = String(job.progress.stage || '');
-    const completedSteps = Number((job.progress as Record<string, unknown>).completed_steps || 0);
-    const totalSteps = Number((job.progress as Record<string, unknown>).total_steps || 0);
-    if (job.kind === 'export' && totalSteps > 0) {
-      return Math.max(0, Math.min(100, Math.round((completedSteps / totalSteps) * 100)));
-    }
-    if (total <= 0) return 0;
-    if (job.kind === 'export') {
-      const operation = String(job.progress.operation || 'export_and_upload') as ExportOperation;
-      const stepsPerClip = Number(
-        job.progress.steps_per_clip
-          || (operation === 'export_only' ? 1 : operation === 'upload_only' ? 2 : 3),
-      );
-      const totalSteps = Math.max(1, total * stepsPerClip);
-      let currentStep = completed * stepsPerClip;
-      if (stage === 'completed') {
-        currentStep = totalSteps;
-      } else if (operation === 'export_only') {
-        if (stage === 'local_export') currentStep = completed * stepsPerClip + 1;
-      } else if (operation === 'upload_only') {
-        if (stage === 'oss_upload') currentStep = completed * stepsPerClip + 1;
-        else if (stage === 'platform_callback') currentStep = completed * stepsPerClip + 2;
-      } else {
-        if (stage === 'local_export') currentStep = completed * stepsPerClip + 1;
-        else if (stage === 'oss_upload') currentStep = completed * stepsPerClip + 2;
-        else if (stage === 'platform_callback') currentStep = completed * stepsPerClip + 3;
-      }
-      return Math.max(0, Math.min(100, Math.round((currentStep / totalSteps) * 100)));
-    }
-    return Math.max(0, Math.min(100, Math.round((completed / total) * 100)));
-  }
+  // A4-6: render helpers extracted to lib/progress.ts (pure functions).
+  const renderVideoProgress = (video: ProjectState['videos'][number]) =>
+    describeVideoProgress(video, activeJobs);
+  const renderJobProgress = (job: AppJob) => describeJobProgress(job);
+  const renderJobPercent = (job: AppJob) => jobPercent(job);
 
   function enqueueToast(kind: ToastKind, message: string) {
     const trimmedMessage = message.trim();
@@ -2585,189 +2373,33 @@ export default function App() {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <header className="h-14 border-b border-gray-200 bg-white/80 backdrop-blur-xl flex items-center justify-between px-4 shrink-0 z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-red-500 flex items-center justify-center text-white font-bold shadow-sm">
-            G
-          </div>
-          <h1 className="text-gray-900 font-semibold tracking-tight">GymClip Reviewer</h1>
-          {toast && (
-            <div className="pointer-events-none ml-1 flex items-center self-stretch">
-              <div
-                className={`max-w-[22rem] rounded-[1.05rem] border px-3 py-1.5 shadow-[0_8px_22px_rgba(15,23,42,0.09)] ring-1 ring-white/70 backdrop-blur-xl transition-all duration-200 ease-out ${
-                  toast.kind === 'error'
-                    ? 'border-red-200/90 bg-gradient-to-r from-red-50/95 via-white to-red-50/65 text-red-700'
-                    : 'border-green-200/90 bg-gradient-to-r from-green-50/95 via-white to-green-50/65 text-green-700'
-                } ${isToastVisible ? 'translate-y-0 opacity-100' : '-translate-y-1 opacity-0'}`}
-              >
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${
-                      toast.kind === 'error'
-                        ? 'border-red-200 bg-red-100/90 text-red-600'
-                        : 'border-green-200 bg-green-100/90 text-green-600'
-                    }`}
-                  >
-                    {toast.kind === 'error' ? <AlertCircle size={14} strokeWidth={2.25} /> : <CheckCircle2 size={14} strokeWidth={2.25} />}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className={`truncate text-[13px] font-medium tracking-[0.01em] ${
-                        toast.kind === 'error' ? 'text-red-700' : 'text-green-700'
-                      }`}
-                    >
-                      {toast.message}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex items-center gap-3">
-          <div className="h-10 flex items-center bg-gray-100 rounded-lg px-1.5">
-            <button
-              onClick={() => setShowApiKey((prev) => !prev)}
-              className={`h-8 w-8 flex items-center justify-center rounded-md transition-colors ${showApiKey ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500 hover:text-gray-900'}`}
-              title="配置 AI Key"
-            >
-              <Key size={16} />
-            </button>
-            <div className={`h-full overflow-hidden transition-all duration-300 ease-in-out flex items-center ${showApiKey ? 'w-[26rem] opacity-100 ml-1.5' : 'w-0 opacity-0'}`}>
-              <input
-                type="password"
-                placeholder="输入 AI API Key..."
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                className="h-8 bg-transparent border-none focus:outline-none text-sm px-2 w-full text-gray-700 placeholder:text-gray-400"
-              />
-              {desktopBridge?.isDesktop && (
-                <label className={`h-8 flex items-center gap-1.5 px-2 text-xs whitespace-nowrap ${supportsSecureStorage ? 'text-gray-600' : 'text-gray-400'}`}>
-                  <input
-                    type="checkbox"
-                    checked={rememberApiKey}
-                    disabled={!supportsSecureStorage}
-                    onChange={(event) => setRememberApiKey(event.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-gray-300"
-                  />
-                  记住
-                </label>
-              )}
-              {desktopBridge?.isDesktop && apiKey && (
-                <button
-                  onClick={handleClearSavedApiKey}
-                  className="h-8 w-8 flex items-center justify-center rounded-md text-gray-400 hover:text-gray-700 transition-colors"
-                  title="清除已保存的 API Key"
-                >
-                  <XCircle size={14} />
-                </button>
-              )}
-              {desktopBridge?.isDesktop && supportsSecureStorage && (
-                <span className="h-8 flex items-center px-2 text-[11px] text-gray-400 whitespace-nowrap">
-                  {isPersistingApiKey ? '保存中...' : rememberApiKey ? '已安全保存' : '仅本次使用'}
-                </span>
-              )}
-            </div>
-          </div>
-
-          <div className="w-px h-6 bg-gray-300 mx-1"></div>
-
-          <input
-            ref={fileInputRef}
-            data-testid="import-file-input"
-            type="file"
-            accept="video/*,.mp4,.mov,.mkv,.avi,.flv,.wmv"
-            multiple
-            className="hidden"
-            onChange={(event) => {
-              if (event.target.files) {
-                void handleImportFiles(event.target.files, 'full_video');
-              }
-              event.target.value = '';
-            }}
-          />
-
-          <input
-            ref={directClipFileInputRef}
-            data-testid="import-file-input-direct-clip"
-            type="file"
-            accept="video/*,.mp4,.mov,.mkv,.avi,.flv,.wmv"
-            multiple
-            className="hidden"
-            onChange={(event) => {
-              if (event.target.files) {
-                void handleImportFiles(event.target.files, 'direct_clip');
-              }
-              event.target.value = '';
-            }}
-          />
-
-          <button
-            data-testid="import-trigger"
-            onClick={() => void openImportSourcePicker('full_video')}
-            className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium flex items-center justify-center gap-2 whitespace-nowrap transition-colors disabled:opacity-50"
-            disabled={isImporting}
-          >
-            <Upload size={16} />
-            {isImporting && importMode === 'full_video' ? '导入中...' : '导入原视频'}
-          </button>
-          <button
-            data-testid="import-trigger-direct-clip"
-            onClick={() => void openImportSourcePicker('direct_clip')}
-            className="w-36 h-10 px-3 py-1.5 text-sm rounded-lg bg-white hover:bg-gray-50 text-gray-700 font-medium flex items-center justify-center gap-2 whitespace-nowrap transition-colors border border-gray-200 disabled:opacity-50"
-            disabled={isImporting}
-          >
-            <FileVideo size={16} />
-            {isImporting && importMode === 'direct_clip' ? '导入中...' : '导入已有片段'}
-          </button>
-          {activeDetectJob ? (
-            <button
-              onClick={() => activeVideo && void handleCancelDetect(activeVideo.id)}
-              className="px-3 py-1.5 text-sm rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700 font-medium flex items-center gap-2 border border-amber-200 shadow-sm transition-colors disabled:opacity-50"
-              disabled={!activeVideo || activeDetectCancelRequested}
-            >
-              <XCircle size={16} />
-              {activeDetectCancelRequested
-                ? '取消中...'
-                : activeDetectJob.status === 'queued'
-                  ? '取消排队'
-                  : '取消检测'}
-            </button>
-          ) : shouldShowDetectControls ? (
-            <button
-              onClick={() => void handleDetectPrimaryAction()}
-              className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-gray-900 hover:bg-black text-white font-medium flex items-center justify-center gap-2 whitespace-nowrap shadow-sm transition-colors disabled:opacity-50"
-              disabled={startDetectCount === 0 || isBatchDetecting}
-            >
-              <CheckCircle2 size={16} />
-              {isBatchDetecting
-                ? '加入队列中...'
-                : shouldUseSelectedVideosForDetect && startDetectCount > 0
-                  ? `开始检测 (${startDetectCount})`
-                  : '开始检测'}
-            </button>
-          ) : (
-            <div className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-gray-100 text-gray-500 font-medium flex items-center justify-center whitespace-nowrap">
-              无需检测
-            </div>
-          )}
-          <button
-            data-testid="export-trigger"
-            onClick={() => {
-              exportApi.setExportOperation('export_and_upload');
-              exportApi.setIsOssCredentialsExpanded(!hasOssCredentials);
-              exportApi.setIsUploadSettingsExpanded(false);
-              setShowExport(true);
-            }}
-            className="w-32 h-10 px-3 py-1.5 text-sm rounded-lg bg-red-500 hover:bg-red-600 text-white font-medium flex items-center justify-center gap-2 whitespace-nowrap shadow-sm transition-colors disabled:opacity-50"
-            disabled={Boolean(activeExportJob)}
-          >
-            <Download size={16} />
-            {activeExportJob ? '导出中...' : '导出片段'}
-          </button>
-        </div>
-      </header>
+      <AppHeader
+        desktopBridge={desktopBridge}
+        toast={toast}
+        isToastVisible={isToastVisible}
+        showApiKey={showApiKey}
+        setShowApiKey={setShowApiKey}
+        apiKey={apiKey}
+        setApiKey={setApiKey}
+        rememberApiKey={rememberApiKey}
+        setRememberApiKey={setRememberApiKey}
+        supportsSecureStorage={supportsSecureStorage}
+        isPersistingApiKey={isPersistingApiKey}
+        handleClearSavedApiKey={handleClearSavedApiKey}
+        importApi={importApi}
+        activeVideo={activeVideo}
+        activeDetectJob={activeDetectJob}
+        activeDetectCancelRequested={activeDetectCancelRequested}
+        shouldShowDetectControls={shouldShowDetectControls}
+        startDetectCount={startDetectCount}
+        isBatchDetecting={isBatchDetecting}
+        shouldUseSelectedVideosForDetect={shouldUseSelectedVideosForDetect}
+        handleCancelDetect={(videoId) => void handleCancelDetect(videoId)}
+        handleDetectPrimaryAction={() => void handleDetectPrimaryAction()}
+        exportApi={exportApi}
+        hasOssCredentials={hasOssCredentials}
+        activeExportJob={activeExportJob}
+      />
 
       {activeJobs.length > 0 && (
         <div className="border-b border-gray-200 bg-gray-50 px-4 py-2">
@@ -2795,1025 +2427,101 @@ export default function App() {
       )}
 
       <main className="flex-1 flex overflow-hidden">
-        <aside className={`${isVideoSidebarCollapsed ? 'w-14' : 'w-72'} border-r border-gray-200 bg-gray-50/50 flex flex-col shrink-0 transition-all duration-300`}>
-          <div className={`border-b border-gray-200 ${isVideoSidebarCollapsed ? 'p-2' : 'p-4 space-y-3'}`}>
-            <div className="flex items-center justify-between gap-3">
-              {!isVideoSidebarCollapsed ? (
-                <>
-                  <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">视频任务 ({videos.length})</h2>
-                  <div className="flex items-center gap-2">
-                    {selectedVideoIds.size > 0 && (
-                      <span className="text-[11px] font-medium text-gray-500">已选 {selectedVideoIds.size}</span>
-                    )}
-                    <button
-                      onClick={() => setIsVideoSidebarCollapsed(true)}
-                      className="rounded-lg p-1 text-gray-400 hover:bg-white hover:text-gray-700"
-                      title="收起视频栏"
-                    >
-                      <ChevronLeft size={16} />
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <button
-                  onClick={() => setIsVideoSidebarCollapsed(false)}
-                  className="mx-auto flex h-9 w-9 items-center justify-center rounded-lg bg-white text-gray-500 shadow-sm hover:text-gray-900"
-                  title="展开视频栏"
-                >
-                  <ChevronRight size={16} />
-                </button>
-              )}
-            </div>
-            {!isVideoSidebarCollapsed && videos.length > 0 && (
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={toggleSelectAllVideos}
-                  className="min-w-0 flex-1 px-2 py-1 text-[11px] rounded-lg bg-white border border-gray-200 text-gray-600 hover:border-gray-300 hover:text-gray-900 transition-colors disabled:opacity-50"
-                  disabled={videos.length === 0}
-                >
-                  {selectedVideoIds.size === videos.length ? '取消全选' : '全选'}
-                </button>
-                <button
-                  onClick={() => void handleCancelSelectedVideos()}
-                  className="min-w-0 flex-1 px-2 py-1 text-[11px] rounded-lg bg-white border border-gray-200 text-amber-700 hover:border-amber-200 hover:bg-amber-50 transition-colors disabled:opacity-50"
-                  disabled={selectedCancellableVideos.length === 0}
-                >
-                  批量取消
-                </button>
-                <button
-                  onClick={() => void handleDeleteSelectedVideos()}
-                  className="min-w-0 flex-1 px-2 py-1 text-[11px] rounded-lg bg-white border border-gray-200 text-red-600 hover:border-red-200 hover:bg-red-50 transition-colors disabled:opacity-50"
-                  disabled={selectedDeletableVideos.length === 0}
-                >
-                  批量删除
-                </button>
-              </div>
-            )}
-          </div>
-          <div className={`flex-1 overflow-y-auto ${isVideoSidebarCollapsed ? 'p-2' : 'p-3 space-y-2'}`}>
-            {isLoading && !isVideoSidebarCollapsed && <p className="text-sm text-gray-400 px-2">加载项目中...</p>}
-            {!isLoading && videos.length === 0 && !isVideoSidebarCollapsed && (
-              <div className="text-sm text-gray-400 px-2 py-4">拖拽视频到窗口，或点击顶部“导入视频”。</div>
-            )}
-            {videoFolders.map((folder) => {
-              const folderVideoIds = folder.videos.map((video) => video.id);
-              const folderSelectionState = getVideoFolderSelectionState(folderVideoIds);
-              const isFolderCollapsed = collapsedVideoFolderIds.includes(folder.id);
-              const hasActiveVideo = folder.videos.some((video) => video.id === activeVideoId);
+        <VideoListPanel
+          local={videoListLocal}
+          isLoading={isLoading}
+          videos={videos}
+          videoFolders={videoFolders}
+          detectJobsByVideoId={detectJobsByVideoId}
+          selectedCancellableVideos={selectedCancellableVideos}
+          selectedDeletableVideos={selectedDeletableVideos}
+          toggleSelectAllVideos={toggleSelectAllVideos}
+          toggleVideoFolder={toggleVideoFolder}
+          getVideoFolderSelectionState={getVideoFolderSelectionState}
+          toggleSelectAllVideosInFolder={toggleSelectAllVideosInFolder}
+          toggleVideoSelection={toggleVideoSelection}
+          onCancelSelectedVideos={() => void handleCancelSelectedVideos()}
+          onDeleteSelectedVideos={() => void handleDeleteSelectedVideos()}
+          onCancelDetect={(videoId) => void handleCancelDetect(videoId)}
+          onDeleteVideo={(videoId) => void handleDeleteVideo(videoId)}
+          renderVideoProgress={renderVideoProgress}
+        />
 
-              if (isVideoSidebarCollapsed) {
-                const firstVideo = folder.videos[0];
-                return (
-                  <button
-                    key={folder.id}
-                    onClick={() => {
-                      setActiveVideoId(firstVideo?.id ?? null);
-                      setIsVideoSidebarCollapsed(false);
-                    }}
-                    className={`mb-2 flex h-10 w-10 items-center justify-center rounded-xl border ${
-                      hasActiveVideo ? 'bg-white border-gray-300 shadow-sm text-gray-900' : 'border-transparent text-gray-500 hover:bg-white'
-                    }`}
-                    title={folder.title}
-                  >
-                    <FileVideo size={16} />
-                  </button>
-                );
-              }
+        <ClipListPanel
+          clips={clips}
+          filteredClips={filteredClips}
+          groupedFilteredClips={groupedFilteredClips}
+          collapsedClipGroupIds={collapsedClipGroupIds}
+          activeClipId={activeClipId}
+          selectedClipIds={selectedClipIdSet}
+          exportTargetClipsCount={exportTargetClipsCount}
+          videoById={videoById}
+          platformRecordById={platformRecordById}
+          clipOrdinalById={clipOrdinalById}
+          activeExportJob={activeExportJob}
+          lockedExportClipIdSet={lockedExportClipIdSet}
+          savedOutputDir={savedOutputDir}
+          ossAccessKeyId={ossAccessKeyId}
+          ossAccessKeySecret={ossAccessKeySecret}
+          searchQuery={searchQuery}
+          filterStatus={filterStatus}
+          onSearchQuery={setSearchQuery}
+          onFilterStatus={setFilterStatus}
+          toggleClipGroup={toggleClipGroup}
+          getClipGroupSelectionState={getClipGroupSelectionState}
+          toggleSelectAllClipsInGroup={toggleSelectAllClipsInGroup}
+          handleClipCardClick={handleClipCardClick}
+          onProjectFromRetry={setProjectState}
+        />
 
-              return (
-                <div key={folder.id} className="rounded-xl border border-gray-200 overflow-hidden bg-white">
-                  <div className={`w-full px-2.5 py-1.5 flex items-center justify-between gap-2 ${hasActiveVideo ? 'bg-gray-100' : 'bg-gray-50'}`}>
-                    <div className="min-w-0 flex flex-1 items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => toggleVideoFolder(folder.id)}
-                        className="flex items-center justify-center rounded p-0.5 text-gray-400 transition-colors hover:bg-white hover:text-gray-700"
-                        title={isFolderCollapsed ? '展开文件夹' : '收起文件夹'}
-                      >
-                        {isFolderCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-                      </button>
-                      <TriStateCheckboxButton
-                        state={folderSelectionState}
-                        disabled={folderVideoIds.length === 0}
-                        onClick={() => toggleSelectAllVideosInFolder(folderVideoIds)}
-                        title="全选当前文件夹"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => toggleVideoFolder(folder.id)}
-                        className="min-w-0 flex-1 text-left"
-                      >
-                        <span className="text-sm font-medium text-gray-700 truncate">{folder.title}</span>
-                      </button>
-                    </div>
-                    <span className="text-[10px] font-medium text-gray-500 shrink-0">{folder.videos.length} 个</span>
-                  </div>
-                  {!isFolderCollapsed && (
-                    <div className="p-2 space-y-2 border-t border-gray-100">
-                      {folder.videos.map((video) => {
-                        const videoDetectJob = detectJobsByVideoId.get(video.id) ?? null;
-                        const isCancellingVideoDetect =
-                          videoDetectJob != null && String(videoDetectJob.progress.stage || '') === 'cancel_requested';
-                        const isSelected = selectedVideoIdSet.has(video.id);
-                        return (
-                          <div
-                            key={video.id}
-                            data-testid={`video-item-${video.id}`}
-                            onClick={() => setActiveVideoId(video.id)}
-                            onContextMenu={(event) => {
-                              event.preventDefault();
-                              event.stopPropagation();
-                              setVideoContextMenu({x: event.clientX, y: event.clientY, videoId: video.id});
-                            }}
-                            className={`w-full cursor-pointer text-left p-3 rounded-xl border transition-all ${
-                              activeVideoId === video.id
-                                ? 'bg-white border-gray-200 shadow-sm'
-                                : 'border-transparent hover:bg-gray-100/80'
-                            } ${isSelected ? 'ring-1 ring-gray-300' : ''}`}
-                          >
-                            <div className="flex items-start gap-3">
-                              <label
-                                className="mt-0.5 flex items-center cursor-pointer"
-                                title="选择该视频"
-                              >
-                                <input
-                                  data-testid={`video-select-${video.id}`}
-                                  type="checkbox"
-                                  checked={isSelected}
-                                  onClick={(event) => event.stopPropagation()}
-                                  onChange={(event) => {
-                                    event.stopPropagation();
-                                    toggleVideoSelection(video.id);
-                                  }}
-                                  className="h-4 w-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900"
-                                />
-                              </label>
-                              <div className={`mt-0.5 ${videoStatusClass(video.status, video.source_kind)}`}>
-                                <FileVideo size={18} />
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-start justify-between gap-2">
-                                  <p className={`text-sm truncate ${activeVideoId === video.id ? 'text-gray-900 font-semibold' : 'text-gray-700 font-medium'}`}>
-                                    {video.file_name}
-                                  </p>
-                                  <div className="flex shrink-0 items-center gap-1">
-                                    {videoDetectJob && (
-                                      <button
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          void handleCancelDetect(video.id);
-                                        }}
-                                        disabled={isCancellingVideoDetect}
-                                        className="rounded-lg p-1 text-amber-600 hover:bg-amber-50 disabled:opacity-40 disabled:hover:bg-transparent"
-                                        title={isCancellingVideoDetect ? '正在取消检测' : videoDetectJob.status === 'queued' ? '取消排队检测' : '取消当前检测'}
-                                      >
-                                        <XCircle size={14} />
-                                      </button>
-                                    )}
-                                    <button
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        void handleDeleteVideo(video.id);
-                                      }}
-                                      disabled={video.status === 'detecting'}
-                                      className="rounded-lg p-1 text-gray-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-gray-400"
-                                      title={video.status === 'detecting' ? '检测中无法删除' : '删除视频任务'}
-                                    >
-                                      <Trash2 size={14} />
-                                    </button>
-                                  </div>
-                                </div>
-                                <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-500">
-                                  <span className="flex items-center gap-1">
-                                    <Clock size={12} /> {formatDuration(video.duration)}
-                                  </span>
-                                  <span>{videoStatusLabel(video)}</span>
-                                </div>
-                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-400">
-                                  {video.category && (
-                                    <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500">{categoryLabel(video.category)}</span>
-                                  )}
-                                  {video.venue && (
-                                    <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500">{video.venue}</span>
-                                  )}
-                                  {video.sport_item_ids.map((id) => (
-                                    <span key={`${video.id}-${id}`} className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500">
-                                      {formatSportItemLabel(id, video.sex)}
-                                    </span>
-                                  ))}
-                                  {video.team_country && (
-                                    <span className="rounded bg-gray-100 px-1.5 py-0.5 text-gray-500">{video.team_country}</span>
-                                  )}
-                                </div>
-                                <div className={`mt-1 text-xs ${video.status === 'detecting' ? 'text-orange-500' : video.status === 'error' ? 'text-red-500' : 'text-gray-400'}`}>
-                                  {renderVideoProgress(video)}
-                                </div>
-                                {video.error_message && <div className="mt-1 text-xs text-red-500 truncate">{video.error_message}</div>}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </aside>
+        <ReviewPanel
+          activeClip={activeClip}
+          activeVideo={activeVideo}
+          streamUrl={streamUrl}
+          activeClipSegments={activeClipSegments}
+          activeSegment={activeSegment}
+          activeClipDisplayName={activeClipDisplayName}
+          activeClipDisplayCountry={activeClipDisplayCountry}
+          activeClipPipelineBadges={activeClipPipelineBadges}
+          videoClips={videoClips}
+          clipWindowStart={clipWindowStart}
+          clipWindowEnd={clipWindowEnd}
+          clipWindowVersion={clipWindowVersion}
+          trimStart={trimStart}
+          trimEnd={trimEnd}
+          isSavingTrim={isSavingTrim}
+          activeClipLockedByExport={activeClipLockedByExport}
+          videoPlaybackError={videoPlaybackError}
+          setVideoPlaybackError={setVideoPlaybackError}
+          togglePlayPause={togglePlayPause}
+          beginScrub={beginScrub}
+          endScrub={endScrub}
+          syncVideoTime={syncVideoTime}
+          handleTrimDragStart={handleTrimDragStart}
+          selectActiveSegment={selectActiveSegment}
+          handleSplitActiveClip={handleSplitActiveClip}
+          handleExtractActiveSegment={handleExtractActiveSegment}
+          handleDeleteActiveSegment={handleDeleteActiveSegment}
+          handleStatusChange={handleStatusChange}
+        />
 
-        <section className="w-96 border-r border-gray-200 bg-white flex flex-col shrink-0">
-          <div className="p-4 border-b border-gray-200 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">候选片段</h2>
-              <div className="flex items-center gap-2 text-xs text-gray-500 font-medium">
-                {exportTargetClipsCount > 0 && <span>已选 {exportTargetClipsCount}</span>}
-                <span>{filteredClips.length} 个结果</span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <div className="relative flex-1">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-                <input
-                  type="text"
-                  placeholder="搜索运动员..."
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  className="w-full bg-gray-100 border-transparent rounded-lg py-1.5 pl-9 pr-3 text-sm focus:outline-none focus:bg-white focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
-                />
-              </div>
-              <button className="p-1.5 rounded-lg bg-gray-100 text-gray-600 transition-colors cursor-default">
-                <Filter size={16} />
-              </button>
-            </div>
-
-            <div className="flex p-1 bg-gray-100/80 rounded-lg">
-              {(['all', 'pending', 'kept', 'deleted', 'exported'] as const).map((status) => (
-                <button
-                  key={status}
-                  onClick={() => setFilterStatus(status)}
-                  className={`flex-1 text-xs py-1.5 rounded-md capitalize font-medium transition-all ${
-                    filterStatus === status
-                      ? 'bg-white text-gray-900 shadow-sm'
-                      : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                >
-                  {status === 'all' ? '全部' : statusLabel(status)}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-3 space-y-2">
-            {clips.length === 0 && (
-              <div className="text-sm text-gray-400 px-2 py-4">导入原视频并完成检测，或直接导入已有片段后，候选片段会显示在这里。</div>
-            )}
-            {clips.length > 0 && filteredClips.length === 0 && (
-              <div className="text-sm text-gray-400 px-2 py-4">当前筛选条件下没有候选片段。</div>
-            )}
-            {groupedFilteredClips.map(({id, title, video, clips: groupedClips}) => {
-              const isCollapsed = collapsedClipGroupIds.includes(id);
-              const hasActiveClip = groupedClips.some((clip) => clip.id === activeClipId);
-              const groupExportableClipIds = groupedClips
-                .filter((clip) => isClipExportSelectable(clip.status))
-                .map((clip) => clip.id);
-              const groupSelectionState = getClipGroupSelectionState(groupExportableClipIds);
-
-              return (
-                <div key={id} className="rounded-xl border border-gray-200 overflow-hidden bg-white">
-                  <div
-                    className={`w-full px-2.5 py-1.5 flex items-center justify-between gap-2 transition-colors ${
-                      hasActiveClip ? 'bg-gray-100' : 'bg-gray-50 hover:bg-gray-100'
-                    }`}
-                  >
-                    <div className="min-w-0 flex flex-1 items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => toggleClipGroup(id)}
-                        className="flex items-center justify-center rounded p-0.5 text-gray-400 transition-colors hover:bg-white hover:text-gray-700"
-                        title={isCollapsed ? '展开分组' : '收起分组'}
-                      >
-                        {isCollapsed ? <ChevronDown size={14} className="shrink-0" /> : <ChevronUp size={14} className="shrink-0" />}
-                      </button>
-                      <TriStateCheckboxButton
-                        state={groupSelectionState}
-                        disabled={groupExportableClipIds.length === 0}
-                        onClick={() => toggleSelectAllClipsInGroup(groupExportableClipIds)}
-                        title={groupExportableClipIds.length === 0 ? '当前分组没有可导出的片段' : '全选当前分组可导出的片段'}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => toggleClipGroup(id)}
-                        className="min-w-0 flex-1 text-left"
-                      >
-                        <span className="text-sm font-medium text-gray-700 truncate">{title}</span>
-                      </button>
-                    </div>
-                    <span className="text-[10px] font-medium text-gray-500 shrink-0">{groupedClips.length} 个</span>
-                  </div>
-
-                  {!isCollapsed && (
-                    <div className="p-2 space-y-2 border-t border-gray-100">
-                      {groupedClips.map((clip) => (
-                        (() => {
-                          const clipVideo = videoById.get(clip.video_id) ?? null;
-                          const linkedRecord = clip.linked_platform_record_id
-                            ? platformRecordById.get(clip.linked_platform_record_id) ?? null
-                            : null;
-                          const theme = linkedRecord ? bindingTheme(linkedRecord.id) : null;
-                          const displayName = getClipDisplayName(clip, linkedRecord, clipVideo);
-                          const displayCountry = getClipDisplayCountry(clip, linkedRecord);
-                          const linkedLabel = linkedRecord
-                            ? firstDisplayText(
-                              displayName === linkedRecord.english_name ? linkedRecord.user_name : linkedRecord.english_name,
-                              linkedRecord.user_name,
-                            ) || '已绑定卡片'
-                            : null;
-                          const isExportSelected = selectedClipIdSet.has(clip.id);
-                          const runtimeStatusText = getClipRuntimeStatusText(clip, activeExportJob, lockedExportClipIdSet);
-
-                          return (
-                            <button
-                              key={clip.id}
-                              data-testid={`clip-item-${clip.id}`}
-                              onClick={(event) => handleClipCardClick(clip, event)}
-                              className={`relative w-full text-left p-2.5 rounded-xl border transition-all flex gap-3 ${
-                                activeClipId === clip.id
-                                  ? 'bg-red-50/60 border-red-200 shadow-sm ring-1 ring-red-100'
-                                  : isExportSelected
-                                    ? 'bg-red-50/40 border-red-100 shadow-sm hover:bg-red-50/50'
-                                    : 'border-transparent hover:bg-gray-50'
-                              }`}
-                            >
-                              {linkedRecord && theme && (
-                                <span
-                                  className="absolute left-1 top-2 bottom-2 w-1 rounded-full"
-                                  style={{backgroundColor: theme.accent}}
-                                />
-                              )}
-
-                              <div className="relative w-24 h-14 rounded-lg bg-gray-100 shrink-0 overflow-hidden border border-gray-200/50 flex items-center justify-center">
-                                <FileVideo size={20} className="text-gray-300" />
-                                <div className="absolute bottom-1 right-1 bg-black/60 backdrop-blur-md px-1.5 py-0.5 rounded text-[10px] font-mono text-white font-medium">
-                                  {formatDuration(clipEffectiveDuration(clip))}
-                                </div>
-                              </div>
-
-                              <div className="flex-1 min-w-0 py-0.5 flex flex-col justify-between">
-                                <div className="flex items-start justify-between gap-2">
-                                  <div className="min-w-0">
-                                    <p className={`text-sm truncate ${activeClipId === clip.id ? 'text-gray-900 font-semibold' : 'text-gray-700 font-medium'}`}>
-                                      {displayName}
-                                    </p>
-                                    {!linkedRecord && clipVideo?.source_kind === 'direct_clip' && (
-                                      <div className="mt-1 text-[11px] text-gray-400 truncate">{clipVideo.file_name}</div>
-                                    )}
-                                    {linkedLabel && theme && (
-                                      <div
-                                        className="mt-1 inline-flex max-w-full items-center gap-1.5 text-[11px] font-medium"
-                                        style={{
-                                          color: theme.text,
-                                        }}
-                                      >
-                                        <span
-                                          className="h-2 w-2 rounded-full shrink-0"
-                                          style={{backgroundColor: theme.accent}}
-                                        />
-                                        <span className="truncate">{linkedLabel}</span>
-                                      </div>
-                                    )}
-                                  </div>
-                                  <span className="text-xs font-mono text-gray-400 shrink-0">{displayCountry}</span>
-                                </div>
-
-                                <div className="flex items-center justify-between mt-1 gap-2">
-                                  <div className="flex items-center gap-2 min-w-0">
-                                    <span className="text-xs text-gray-500 font-mono">{formatClock(clip.review_start)}</span>
-                                    {linkedRecord && theme && (
-                                      <span
-                                        className="truncate text-[11px] font-medium"
-                                        style={{
-                                          color: theme.text,
-                                        }}
-                                      >
-                                        片段#{clipOrdinalById.get(clip.id) ?? '--'}
-                                      </span>
-                                    )}
-                                  </div>
-                                  {(() => {
-                                    const uploadItem = getClipUploadItem(activeExportJob, clip.id);
-                                    const activeJobClipId = String(activeExportJob?.progress.clip_id || '');
-                                    const activeStage = activeJobClipId === clip.id ? String(activeExportJob?.progress.stage || '') : '';
-                                    const failureStage = getClipFailureStage(clip);
-
-                                    if (failureStage) {
-                                      const failLabels: Record<string, string> = {export: '导出失败', oss: 'OSS失败', platform: '回写失败'};
-                                      return (
-                                        <span className="inline-flex items-center gap-0.5">
-                                          <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('danger')}`}>
-                                            {failLabels[failureStage] ?? '失败'}
-                                          </span>
-                                          <button
-                                            type="button"
-                                            className="p-0.5 rounded hover:bg-gray-100 text-red-500"
-                                            title="重试"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              void retryClipStage(clip.id, failureStage as 'export' | 'oss' | 'platform', {
-                                                output_dir: savedOutputDir || undefined,
-                                                oss_access_key_id: ossAccessKeyId.trim() || undefined,
-                                                oss_access_key_secret: ossAccessKeySecret.trim() || undefined,
-                                              }).then((res) => {
-                                                if (res.project) setProjectState(res.project);
-                                              }).catch(() => undefined);
-                                            }}
-                                          >
-                                            <RefreshCw size={12} />
-                                          </button>
-                                        </span>
-                                      );
-                                    }
-
-                                    if (activeStage === 'local_export') {
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>导出中</span>;
-                                    }
-                                    if (uploadItem?.stage === 'oss_upload' || activeStage === 'oss_upload') {
-                                      const pct = uploadItem && uploadItem.percent > 0 ? ` ${Math.round(uploadItem.percent)}%` : '';
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>OSS上传中{pct}</span>;
-                                    }
-                                    if (uploadItem?.stage === 'platform_callback' || activeStage === 'platform_callback') {
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>回写中</span>;
-                                    }
-
-                                    if (clip.platform_sync_status === 'synced') {
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('success')}`}>已回写</span>;
-                                    }
-                                    if (clip.uploaded_url || clip.platform_sync_status === 'uploading_done') {
-                                      if (uploadItem?.stage === 'queued' || lockedExportClipIdSet.has(clip.id)) {
-                                        return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>回写队列中</span>;
-                                      }
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('success')}`}>已上传</span>;
-                                    }
-                                    if (clip.exported_path) {
-                                      if (uploadItem?.stage === 'queued' || lockedExportClipIdSet.has(clip.id)) {
-                                        return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>上传队列中</span>;
-                                      }
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('success')}`}>已导出</span>;
-                                    }
-                                    if (lockedExportClipIdSet.has(clip.id)) {
-                                      return <span className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10px] font-medium ${pipelineToneClass('warning')}`}>导出队列中</span>;
-                                    }
-
-                                    return <StatusBadge status={clip.status} />;
-                                  })()}
-                                </div>
-                                {runtimeStatusText && (
-                                  <div className="mt-1 text-[11px] text-amber-600 truncate">{runtimeStatusText}</div>
-                                )}
-                              </div>
-                            </button>
-                          );
-                        })()
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="flex-1 bg-gray-50/30 flex flex-col min-w-0">
-          {activeClip && activeVideo ? (
-            <>
-              <div className="flex-1 p-8 flex flex-col min-h-0">
-                <div className="flex-1 min-h-0 w-full flex items-center justify-center">
-                  <div className="w-full max-h-full max-w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-xl border border-gray-200/50 relative group">
-                    <video
-                      key={streamUrl}
-                      ref={videoRef}
-                      src={streamUrl}
-                      className="w-full h-full object-contain bg-black"
-                      controls={false}
-                      preload="auto"
-                      onError={() => setVideoPlaybackError(activeVideo.error_message || '视频加载失败，请确认源文件仍存在。')}
-                    />
-
-
-                    {videoPlaybackError && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-black/75 px-6 text-center">
-                        <div>
-                          <AlertCircle size={36} className="mx-auto mb-3 text-white/80" />
-                          <p className="text-sm font-medium text-white">{videoPlaybackError}</p>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-6 pointer-events-none">
-                      <div className="flex items-center gap-4">
-                        <button
-                          data-testid="player-play-toggle"
-                          onClick={togglePlayPause}
-                          className="w-12 h-12 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center text-white backdrop-blur-md transition-colors pointer-events-auto"
-                        >
-                          {isPlaying ? <Pause size={24} /> : <Play size={24} className="ml-1" />}
-                        </button>
-                        <div className="flex-1 h-1.5 bg-white/30 rounded-full overflow-hidden">
-                          <div className="h-full bg-white rounded-full transition-all duration-75" style={{width: `${playheadPercent}%`}}></div>
-                        </div>
-                        <span className="text-sm font-mono text-white drop-shadow-md">
-                          {formatClock(playheadLocal)} / {formatDuration(clipWindowDuration)}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="absolute top-4 right-4">
-                      <StatusBadge status={activeClip.status} size="lg" />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="w-full mt-6 flex items-end justify-between px-2">
-                  <div>
-                    <div className="flex items-center gap-3 mb-1.5">
-                      <h2 className="text-2xl font-bold text-gray-900 tracking-tight">{activeClipDisplayName}</h2>
-                      <span className="px-2 py-0.5 rounded-md bg-gray-100 text-gray-600 text-sm font-mono font-medium border border-gray-200">
-                        {activeClipDisplayCountry}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                      <span>片段 #{videoClips.findIndex((clip) => clip.id === activeClip.id) + 1}</span>
-                    {activeClipPipelineBadges.map((item) => (
-                        <span
-                          key={item.key}
-                          className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${pipelineToneClass(item.tone)}`}
-                        >
-                          {item.text}
-                        </span>
-                      ))}
-                      {isSavingTrim && (
-                        <span className="text-red-500">保存中...</span>
-                      )}
-                      {activeClipLockedByExport && (
-                        <span className="text-amber-600">当前片段在导出批次中，只读</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div className="h-auto pt-6 pb-6 px-8 border-t border-gray-200 bg-white flex flex-col shrink-0 shadow-[0_-4px_20px_rgba(0,0,0,0.02)] z-10 overflow-hidden">
-                <div className="mb-4 relative">
-                  <div
-                    className="w-full h-16 bg-gray-100 rounded-xl border border-gray-200/80 overflow-hidden relative shadow-inner select-none"
-                    ref={(el) => { if (el) el.dataset.timelineContainer = 'true'; }}
-                    onPointerDown={(e) => {
-                      if ((e.target as HTMLElement).dataset.handleEdge) return;
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                      const time = clipWindowStart + fraction * clipWindowDuration;
-                      beginScrub();
-                      syncVideoTime(time, {force: false});
-
-                      const onMove = (ev: PointerEvent) => {
-                        const f = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-                        const t = clipWindowStart + f * clipWindowDuration;
-                        syncVideoTime(t, {force: false});
-                      };
-                      const onUp = () => {
-                        document.removeEventListener('pointermove', onMove);
-                        document.removeEventListener('pointerup', onUp);
-                        endScrub();
-                      };
-                      document.addEventListener('pointermove', onMove);
-                      document.addEventListener('pointerup', onUp);
-                      e.preventDefault();
-                    }}
-                  >
-                    <div className="absolute inset-0 flex pointer-events-none">
-                      {timelineThumbnails.length > 0 ? (
-                        timelineThumbnails.map((frame) => (
-                          <img
-                            key={`${frame.url}-${frame.time_seconds}`}
-                            src={frame.url}
-                            alt=""
-                            className="h-full min-w-0 flex-1 object-cover"
-                            draggable={false}
-                          />
-                        ))
-                      ) : (
-                        <div className="flex w-full items-center justify-center text-xs text-gray-400">
-                          {isLoadingThumbnails ? '生成缩略图中...' : '暂无缩略图'}
-                        </div>
-                      )}
-                    </div>
-                    <div className="absolute inset-0 bg-black/10 pointer-events-none" />
-                    {activeClipSegments.map((segment) => {
-                      const isCurrent = activeSegment?.id === segment.id;
-                      const displayStart = isCurrent ? trimStart : segment.start;
-                      const displayEnd = isCurrent ? trimEnd : segment.end;
-                      const left = clipWindowDuration > 0 ? ((displayStart - clipWindowStart) / clipWindowDuration) * 100 : 0;
-                      const right = clipWindowDuration > 0 ? 100 - (((displayEnd - clipWindowStart) / clipWindowDuration) * 100) : 0;
-                      return (
-                        <div
-                          key={segment.id}
-                          className={`absolute top-0 bottom-0 pointer-events-none ${
-                            isCurrent
-                              ? 'bg-red-500/20 border-y-2 border-red-500 z-20'
-                              : 'bg-white/30 border-y-2 border-white/80 z-10'
-                          }`}
-                          style={{left: `${left}%`, right: `${right}%`}}
-                        >
-                          {isCurrent && !activeClipLockedByExport && (
-                            <>
-                              <div
-                                data-handle-edge="left"
-                                data-testid="trim-handle-start"
-                                className="absolute -left-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                                title="拖动调整起点"
-                                onPointerDown={(e) => {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                                  if (!containerEl) return;
-                                  trimRectRef.current = containerEl.getBoundingClientRect();
-                                  trimPointerXRef.current = e.clientX;
-                                  beginScrub();
-                                  startTrimScroll('left');
-                                  const onMove = (ev: PointerEvent) => {
-                                    trimPointerXRef.current = ev.clientX;
-                                    trimRectRef.current = containerEl.getBoundingClientRect();
-                                  };
-                                  const onUp = () => {
-                                    document.removeEventListener('pointermove', onMove);
-                                    document.removeEventListener('pointerup', onUp);
-                                    stopTrimScroll();
-                                    endScrub();
-                                  };
-                                  document.addEventListener('pointermove', onMove);
-                                  document.addEventListener('pointerup', onUp);
-                                }}
-                              >
-                                <div className="absolute inset-y-0 left-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:left-0.5 transition-all" />
-                              </div>
-                              <div
-                                data-handle-edge="right"
-                                data-testid="trim-handle-end"
-                                className="absolute -right-1.5 top-0 bottom-0 w-3 cursor-ew-resize z-40 pointer-events-auto group/handle"
-                                title="拖动调整终点"
-                                onPointerDown={(e) => {
-                                  e.stopPropagation();
-                                  e.preventDefault();
-                                  const containerEl = e.currentTarget.closest('[data-timeline-container]') as HTMLElement;
-                                  if (!containerEl) return;
-                                  trimRectRef.current = containerEl.getBoundingClientRect();
-                                  trimPointerXRef.current = e.clientX;
-                                  beginScrub();
-                                  startTrimScroll('right');
-                                  const onMove = (ev: PointerEvent) => {
-                                    trimPointerXRef.current = ev.clientX;
-                                    trimRectRef.current = containerEl.getBoundingClientRect();
-                                  };
-                                  const onUp = () => {
-                                    document.removeEventListener('pointermove', onMove);
-                                    document.removeEventListener('pointerup', onUp);
-                                    stopTrimScroll();
-                                    endScrub();
-                                  };
-                                  document.addEventListener('pointermove', onMove);
-                                  document.addEventListener('pointerup', onUp);
-                                }}
-                              >
-                                <div className="absolute inset-y-0 right-1 w-1 rounded-full bg-red-500/50 group-hover/handle:bg-red-500 group-hover/handle:w-1.5 group-hover/handle:right-0.5 transition-all" />
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
-                    <div
-                      className="absolute top-0 bottom-0 w-0.5 bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)] z-30 pointer-events-none"
-                      style={{left: `${playheadPercent}%`}}
-                    />
-                  </div>
-                </div>
-
-                {activeClipSegments.length > 1 && (
-                  <div className="flex flex-wrap gap-2 mb-4">
-                    {activeClipSegments.map((segment, index) => (
-                      <button
-                        key={segment.id}
-                        type="button"
-                        onClick={() => selectActiveSegment(segment.id)}
-                        className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
-                          activeSegment?.id === segment.id
-                            ? 'bg-red-50 border-red-200 text-red-700'
-                            : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-                        }`}
-                      >
-                        选区 {String.fromCharCode(65 + index)}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                <div className="flex items-center justify-between mb-5">
-                  <div className="flex items-center gap-4">
-                    <button
-                      data-testid="player-play-toggle-trim"
-                      type="button"
-                      onClick={() => {
-                        const video = videoRef.current;
-                        if (!video) return;
-                        if (video.paused) {
-                          void video.play().catch(() => undefined);
-                        } else {
-                          video.pause();
-                        }
-                      }}
-                      className="w-10 h-10 flex items-center justify-center rounded-full bg-red-500 hover:bg-red-600 text-white shadow-md transition-colors"
-                    >
-                      {isPlaying ? <Pause size={18} /> : <Play size={18} className="ml-0.5" />}
-                    </button>
-                    <div className="flex gap-6 text-xs text-gray-500 font-mono">
-                      <span>起点 <span className="text-gray-800 font-semibold">{formatClock(trimStart)}</span></span>
-                      <span>播放 <span className="text-red-600 font-semibold">{formatClock(playhead)}</span></span>
-                      <span>终点 <span className="text-gray-800 font-semibold">{formatClock(trimEnd)}</span></span>
-                    </div>
-                  </div>
-                  <div className="text-xs text-gray-400">
-                    时长 {formatClock(Math.max(0, trimEnd - trimStart))}
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-start justify-end gap-x-4 gap-y-1 mb-4 text-[10px] text-gray-400">
-                  {[
-                    {keys: ['Space'], label: '播放'},
-                    {keys: ['←', '→'], label: '快进退'},
-                    {keys: ['↑', '↓'], label: '切换'},
-                    {keys: ['A', 'D'], label: '左边界'},
-                    {keys: ['J', 'L'], label: '右边界'},
-                    {keys: ['B'], label: '拆分'},
-                    {keys: ['C'], label: '删除'},
-                    {keys: ['N'], label: '独立'},
-                  ].map(({keys, label}) => (
-                    <span key={label} className="flex flex-col items-center gap-0.5">
-                      <span className="flex gap-0.5">
-                        {keys.map((k) => (
-                          <kbd key={k} className="bg-gray-100 border border-gray-200 rounded px-1.5 py-0.5 text-gray-500 font-sans font-medium shadow-sm text-[11px] leading-tight">{k}</kbd>
-                        ))}
-                      </span>
-                      <span>{label}</span>
-                    </span>
-                  ))}
-                </div>
-
-                <div className="flex flex-wrap items-center justify-end gap-2.5">
-                  <button
-                    onClick={() => void handleSplitActiveClip()}
-                    disabled={activeClipLockedByExport}
-                    className="px-4 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-1.5 transition-all shadow-sm bg-white hover:bg-gray-50 text-gray-700 border border-gray-200"
-                  >
-                    <CheckCircle2 size={16} />
-                    拆分选区
-                  </button>
-                  <button
-                    onClick={() => void handleExtractActiveSegment()}
-                    disabled={activeClipLockedByExport || activeClipSegments.length <= 1}
-                    className="px-4 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-1.5 transition-all shadow-sm bg-white hover:bg-gray-50 text-gray-700 border border-gray-200"
-                  >
-                    <CheckCircle2 size={16} />
-                    独立片段
-                  </button>
-                  <button
-                    onClick={() => void handleDeleteActiveSegment()}
-                    disabled={activeClipLockedByExport || activeClipSegments.length <= 1}
-                    className="px-4 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-1.5 transition-all shadow-sm bg-white hover:bg-red-50 hover:text-red-600 hover:border-red-200 text-gray-600 border border-gray-200"
-                  >
-                    <Trash2 size={16} />
-                    删除选区
-                  </button>
-                  <button
-                    onClick={() => void handleStatusChange(activeClip.id, 'kept')}
-                    disabled={activeClipLockedByExport}
-                    className={`px-5 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-1.5 transition-all shadow-sm ${
-                      activeClip.status === 'kept'
-                        ? 'bg-gray-900 text-white border border-gray-900 shadow-md'
-                        : 'bg-gray-800 hover:bg-gray-900 text-white border border-gray-800'
-                    }`}
-                  >
-                    <Check size={16} />
-                    保留片段
-                  </button>
-                </div>
-              </div>
-            </>
-          ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-gray-400">
-              <AlertCircle size={48} className="mb-4 opacity-20" />
-              <p className="font-medium">
-                {activeVideo ? '请在中间选择一个候选片段进行审核' : '请先导入原视频或已有片段'}
-              </p>
-            </div>
-          )}
-        </section>
-
-        <aside className={`${activeClip ? 'w-[19rem] border-l border-gray-200' : 'w-0'} bg-white flex flex-col shrink-0 overflow-hidden transition-all duration-300`}>
-          {activeClip && (
-            <>
-              <div className="p-4 border-b border-gray-200 space-y-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">成绩卡片</h2>
-                    <div className="mt-1 text-sm font-medium text-gray-900">
-                      {activeVideo ? `${activeScopeSummary.matchText} · ${activeScopeSummary.venueText}` : '未选择视频'}
-                    </div>
-                    <div className="mt-1 text-xs text-gray-500">
-                      {activeVideo ? `${categoryLabel(activeVideo.category)} · ${activeVideo.file_name}` : '平台成绩卡片'}
-                    </div>
-                  </div>
-                  {activeVideo && (
-                    <button
-                      type="button"
-                      onClick={localCardApi.beginCreateDraft}
-                      disabled={localCardApi.localCardDraft != null}
-                      title="新增本地补录卡片"
-                      className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50"
-                    >
-                      + 本地补录
-                    </button>
-                  )}
-                </div>
-
-                <div className="relative">
-                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-                  <input
-                    type="text"
-                    placeholder="搜索姓名或国家..."
-                    value={scoreSearchQuery}
-                    onChange={(event) => setScoreSearchQuery(event.target.value)}
-                    className="w-full bg-gray-100 border-transparent rounded-lg py-2 pl-9 pr-3 text-sm focus:outline-none focus:bg-white focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
-                  />
-                </div>
-
-                <div className="grid grid-cols-3 gap-1.5">
-                  <ScoreFilterDropdown
-                    id="apparatus"
-                    placeholder="项目"
-                    allLabel="全部项目"
-                    value={scoreApparatusFilter}
-                    options={scoreApparatusOptions}
-                    openFilter={openScoreFilter}
-                    onToggle={setOpenScoreFilter}
-                    onChange={setScoreApparatusFilter}
-                  />
-                  <ScoreFilterDropdown
-                    id="sex"
-                    placeholder="性别"
-                    allLabel="全部性别"
-                    value={scoreSexFilter}
-                    options={scoreSexOptions}
-                    openFilter={openScoreFilter}
-                    onToggle={setOpenScoreFilter}
-                    onChange={setScoreSexFilter}
-                  />
-                  <ScoreFilterDropdown
-                    id="country"
-                    placeholder="国家"
-                    allLabel="全部国家"
-                    value={scoreCountryFilter}
-                    options={scoreCountryOptions}
-                    openFilter={openScoreFilter}
-                    onToggle={setOpenScoreFilter}
-                    onChange={setScoreCountryFilter}
-                  />
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-3 space-y-3 bg-gray-50/40">
-                {!activeVideo && (
-                  <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
-                    当前没有选中视频。
-                  </div>
-                )}
-                {activeVideo && videoScopedPlatformRecords.length === 0 && !localCardApi.localCardDraft && (
-                  <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
-                    当前视频上下文没有查到平台成绩卡片。请检查导入时选择的比赛、场次和项目；或点击右上角「+ 本地补录」手动添加。
-                  </div>
-                )}
-                {activeVideo && videoScopedPlatformRecords.length > 0 && filteredPlatformRecords.length === 0 && localPlatformRecords.length === 0 && (
-                  <div className="rounded-2xl border border-dashed border-gray-300 bg-white p-5 text-sm text-gray-500">
-                    当前筛选条件下没有命中的成绩卡片。
-                  </div>
-                )}
-                <LocalCardPanel
-                  api={localCardApi}
-                  activeClip={activeClip}
-                  activeClipLockedByExport={activeClipLockedByExport}
-                  clipOrdinalById={clipOrdinalById}
-                  onBindScoreCard={(recordId) => void handleBindScoreCard(recordId)}
-                />
-                {groupedPlatformRecords.map((matchGroup) => (
-                  <div key={matchGroup.matchName} className="space-y-2">
-                    <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
-                      {matchGroup.matchName}
-                    </div>
-                    {matchGroup.venues.map((venueGroup) => (
-                      <div key={`${matchGroup.matchName}-${venueGroup.venue}`} className="space-y-2">
-                        <div className="px-1 text-[11px] text-gray-400">{venueGroup.venue}</div>
-                        {venueGroup.records.map((entry) => {
-                          const isActive = activeClip.linked_platform_record_id === entry.id;
-                          const isBound = entry.linked_clip_ids.length > 0;
-                          const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
-                          const theme = bindingTheme(entry.id);
-                          const linkedClipLabels = entry.linked_clip_ids
-                            .map((clipId) => clipOrdinalById.get(clipId))
-                            .filter((value): value is number => value != null)
-                            .map((value) => `#${value}`);
-                          const displayVenue = entry.category === 'EF' ? '' : (entry.venue || activeVideo?.venue || '');
-                          const bindingLabel = isActive
-                            ? `片段${linkedClipLabels[0] ?? `#${clipOrdinalById.get(activeClip.id) ?? '--'}`}`
-                            : isBoundElsewhere
-                              ? `片段${linkedClipLabels[0]}`
-                              : null;
-
-                          return (
-                            <button
-                              key={entry.id}
-                              type="button"
-                              disabled={isBoundElsewhere || activeClipLockedByExport}
-                              onClick={(event) => {
-                                event.currentTarget.blur();
-                                if (isBoundElsewhere || activeClipLockedByExport) return;
-                                void handleBindScoreCard(isActive ? null : entry.id);
-                              }}
-                              className={`relative w-full rounded-2xl border border-gray-200/80 bg-white px-3 py-2.5 text-left transition-all shadow-[0_6px_18px_rgba(15,23,42,0.05)] ${
-                                isActive
-                                  ? 'hover:border-gray-200'
-                                  : isBoundElsewhere || activeClipLockedByExport
-                                    ? 'cursor-not-allowed opacity-90'
-                                    : 'hover:border-gray-200 hover:shadow-[0_10px_24px_rgba(15,23,42,0.08)]'
-                              }`}
-                            >
-                              {(isActive || isBound) && (
-                                <span
-                                  className="absolute left-1 top-2 bottom-2 w-1 rounded-full"
-                                  style={{backgroundColor: theme.accent}}
-                                />
-                              )}
-                              <div className="flex items-start justify-between gap-3">
-                                <div className="min-w-0">
-                                  <p className="text-[15px] font-semibold leading-5 text-gray-900 truncate">
-                                    {entry.english_name || entry.user_name || '未命名'}
-                                  </p>
-                                  {entry.user_name && (
-                                    <div className="mt-0.5 text-[11px] text-gray-500 truncate">{entry.user_name}</div>
-                                  )}
-                                  <div className="mt-1 text-[11px] text-gray-500 truncate">
-                                    {(entry.country || '--')} · {(entry.sport_item_label || '--')}
-                                  </div>
-                                  {displayVenue && (
-                                    <div className="mt-0.5 text-[11px] text-gray-400 truncate">{displayVenue}</div>
-                                  )}
-                                  <div className="mt-2 text-[11px] font-semibold text-black whitespace-nowrap overflow-hidden text-ellipsis">
-                                    {scoreFormulaLabel(entry)}
-                                  </div>
-                                </div>
-                                <div className="shrink-0 text-right">
-                                  <div className="text-xl font-bold text-black">{primaryScoreValue(entry)}</div>
-                                  {entry.vault_attempt != null && (
-                                    <div className="text-[11px] text-gray-500">第 {entry.vault_attempt} 跳</div>
-                                  )}
-                                  {entry.single_score && (
-                                    <div className="text-[11px] text-gray-500">单跳 {formatScoreValue(entry.single_score)}</div>
-                                  )}
-                                  {bindingLabel && (
-                                    <div
-                                      className="mt-1 text-[11px] font-medium"
-                                      style={{color: theme.text}}
-                                    >
-                                      {bindingLabel}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                              {!isBound && (
-                                <div className="mt-2 text-[11px] text-gray-400">
-                                  {activeClipLockedByExport ? '导出批次中，只读' : '可绑定'}
-                                </div>
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </aside>
+        <PlatformMatchPanel
+          local={platformMatchLocal}
+          activeClip={activeClip}
+          activeVideo={activeVideo}
+          activeClipLockedByExport={activeClipLockedByExport}
+          activeScopeSummary={activeScopeSummary}
+          videoScopedPlatformRecords={videoScopedPlatformRecords}
+          filteredPlatformRecords={filteredPlatformRecords}
+          groupedPlatformRecords={groupedPlatformRecords}
+          scoreApparatusOptions={scoreApparatusOptions}
+          scoreSexOptions={scoreSexOptions}
+          scoreCountryOptions={scoreCountryOptions}
+          clipOrdinalById={clipOrdinalById}
+          localCardApi={localCardApi}
+          localPlatformRecords={localCardApi.localPlatformRecords}
+          onBindScoreCard={(recordId) => void handleBindScoreCard(recordId)}
+        />
       </main>
 
       {isDragging && (
