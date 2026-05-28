@@ -3,6 +3,8 @@ node_modules/
 # but keep tracked signing resources (entitlements plist, icons) committed.
 build/*
 !build/entitlements.mac.plist
+!build/icon.icns
+!build/icon.png
 dist/
 coverage/
 .DS_Store
