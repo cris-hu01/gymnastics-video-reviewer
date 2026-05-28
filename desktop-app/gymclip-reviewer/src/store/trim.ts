@@ -38,6 +38,16 @@
  * can skip writing to the backend while the user is still dragging — same
  * role as the old `trimDraggingRef`, but readable from any component
  * without prop drilling.
+ *
+ * TODO(v1.3.1): updateStart / updateEnd / setRange are documented above
+ * but currently have NO callers — App.tsx still uses local useState for
+ * trimStart/trimEnd (legacy `setTrimStart` / `setTrimEnd` via `updateTrimRange`
+ * around App.tsx:1605). Only `setActiveClip` (called from
+ * `setActiveSegmentId` wrapper) writes the slice's `startMs`/`endMs`,
+ * meaning the slice's bounds drift out of sync with the legacy useState.
+ * Wiring is intentionally deferred — runtime correctness is preserved
+ * because every reader still goes through the legacy useState. The slice
+ * is in place ready for the migration. See Review A finding M1.
  */
 import type { StateCreator } from 'zustand';
 

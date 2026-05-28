@@ -87,6 +87,10 @@ export function PlayerSurface({
     const {nonce, timeMs} = pendingSeek;
     if (nonce === lastAppliedNonceRef.current) return;
 
+    // Tracks any one-shot `loadedmetadata` listener so a superseded seek
+    // can remove it before a newer-nonce seek attaches its own (M2 fix).
+    let metadataCleanup: (() => void) | null = null;
+
     const apply = () => {
       rafRef.current = null;
       const video = videoRef.current;
@@ -102,6 +106,7 @@ export function PlayerSurface({
       if (video.readyState < 1) {
         const onLoaded = () => {
           video.removeEventListener('loadedmetadata', onLoaded);
+          metadataCleanup = null;
           try {
             video.currentTime = targetSeconds;
           } catch {
@@ -111,6 +116,7 @@ export function PlayerSurface({
           consumeSeek(nonce);
         };
         video.addEventListener('loadedmetadata', onLoaded);
+        metadataCleanup = () => video.removeEventListener('loadedmetadata', onLoaded);
         return;
       }
       if (Math.abs(video.currentTime - targetSeconds) > SEEK_PRECISION_S) {
@@ -141,6 +147,14 @@ export function PlayerSurface({
       if (rafRef.current != null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
+      }
+      // M2 fix: a newer-nonce seek (or unmount / streamUrl change) supersedes
+      // any one-shot loadedmetadata listener parked by the previous nonce —
+      // without this cleanup the stale targetSeconds would land on the
+      // newer video and consume the newer nonce as if it were itself.
+      if (metadataCleanup) {
+        metadataCleanup();
+        metadataCleanup = null;
       }
     };
   }, [pendingSeek, consumeSeek]);
