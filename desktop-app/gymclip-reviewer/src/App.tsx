@@ -1602,7 +1602,7 @@ export default function App() {
     useStore.getState().setSelectedVideoIds(new Set(videos.map((video) => video.id)));
   }
 
-  function updateTrimRange(nextStart: number, nextEnd: number, syncTarget: 'start' | 'end' | null = null) {
+  function updateTrimRange(nextStart: number, nextEnd: number, syncTarget: 'start' | 'end' | null = null, skipSeek = false) {
     if (!activeClip || !activeSegment) return;
     const videoDuration = activeVideo?.duration ?? clipWindowEnd;
     const safeStart = Math.max(0, Math.min(nextStart, nextEnd - CLIP_STEP));
@@ -1615,6 +1615,16 @@ export default function App() {
     trimStartRef.current = nextTrimStart;
     trimEndRef.current = nextTrimEnd;
 
+    if (skipSeek) {
+      // Trim-drag path (startTrimScroll's rAF tick): do NOT enqueue a seek
+      // every animation frame. A per-frame pendingSeek change makes
+      // PlayerSurface's seek-apply effect cleanup cancel its pending apply rAF
+      // before it can execute — starving the seek so the preview stayed frozen
+      // on the playhead until release. The trim drag now dispatches its seek
+      // from the pointermove handler (pointer cadence, gappy like the playhead
+      // scrubber) plus one exact seek on release.
+      return;
+    }
     if (syncTarget === 'start' || syncTarget === 'end') {
       const boundaryTime = syncTarget === 'start' ? nextTrimStart : nextTrimEnd;
       syncVideoTime(boundaryTime, {force: false});
@@ -1773,9 +1783,9 @@ export default function App() {
       const clampedF = Math.max(0, Math.min(1, fraction));
       const t = clipWindowStart + clampedF * clipWindowDuration;
       if (edge === 'left') {
-        updateTrimRange(t, trimEndRef.current, 'start');
+        updateTrimRange(t, trimEndRef.current, 'start', true);
       } else {
-        updateTrimRange(trimStartRef.current, t, 'end');
+        updateTrimRange(trimStartRef.current, t, 'end', true);
       }
 
       trimScrollRafRef.current = requestAnimationFrame(tick);
@@ -1820,11 +1830,21 @@ export default function App() {
     const onMove = (ev: PointerEvent) => {
       trimPointerXRef.current = ev.clientX;
       trimRectRef.current = containerEl.getBoundingClientRect();
+      // Dispatch the preview seek HERE — at pointermove cadence, which is gappy
+      // and not rAF-locked (exactly like the playhead scrubber) — instead of
+      // from the per-frame rAF tick, whose every-frame enqueue starved
+      // PlayerSurface's apply. trimStart/EndRef hold the latest clamped boundary
+      // the tick just computed, so we seek to where the handle actually is.
+      syncVideoTime(edge === 'start' ? trimStartRef.current : trimEndRef.current, {force: false});
     };
     const onUp = () => {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
       stopTrimScroll();
+      // Land the preview exactly on the final boundary. The per-frame tick
+      // suppresses seeks and the last pointermove seek can trail the final
+      // boundary by up to ~1 frame, so snap to the exact trim edge on release.
+      syncVideoTime(edge === 'start' ? trimStartRef.current : trimEndRef.current, {force: false});
       endScrub();
     };
     document.addEventListener('pointermove', onMove);

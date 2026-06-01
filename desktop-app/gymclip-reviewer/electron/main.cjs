@@ -10,6 +10,12 @@ const { autoUpdater } = require('electron-updater');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-accelerated-video-decode');
 app.commandLine.appendSwitch('enable-zero-copy');
+// Enable VideoToolbox hardware AV1 decode. Chromium ships this OFF by default
+// (added M120, needs Apple Silicon M3+). Our competition sources are AV1-in-MP4,
+// so without this the renderer falls back to software dav1d → expensive
+// frame-accurate seeks → laggy scrub/trim on short clips. H.264 already HW-decodes
+// via the switches above, which is why manually-cut H.264 clips scrub smoothly.
+app.commandLine.appendSwitch('enable-features', 'VideoToolboxAv1Decoding');
 
 // === Telemetry consent (C-5) ===
 // 持久化匿名 UUID + 用户上报开关到 userData/telemetry.json。
