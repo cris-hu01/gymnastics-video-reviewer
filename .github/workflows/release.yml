@@ -83,3 +83,135 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release edit ${{ github.ref_name }} --prerelease --draft=false
+
+  build-win:
+    needs: build-mac
+    # Sequential -> build-win publishes into the Release that build-mac already
+    # created for this tag. This eliminates the electron-builder duplicate-draft
+    # race (#6676, only with truly-concurrent jobs) and lets win deterministically
+    # REUSE the existing release. electron-builder sets draft/prerelease only at
+    # createRelease() time and never PATCHes them on a reused release, so
+    # publishing the win assets will NOT reset the mac job's flags.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop-app/gymclip-reviewer/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install FFmpeg (full static, with dav1d AV1 decode)
+        # build:media-tools resolves ffmpeg + ffprobe via shutil.which() and copies
+        # them into bundled extraResources/media-tools/. windows-latest does NOT
+        # ship ffmpeg. Use the gyan.dev FULL STATIC build (pinned): single
+        # self-contained exes (no sibling DLLs) that INCLUDE libdav1d for AV1
+        # decode — required because competition sources are AV1-in-MP4. We prepend
+        # its bin/ to PATH so shutil.which('ffmpeg') returns the REAL static exe.
+        # Do NOT use `choco install ffmpeg-full`: choco only puts a ShimGen shim on
+        # PATH and shutil.which() would bundle that broken launcher. Because the
+        # build is static, the *.dll copy loop in _bundle_windows() finds zero DLLs
+        # to copy — expected and correct.
+        shell: pwsh
+        run: |
+          $ver = "8.1.1"
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/$ver/ffmpeg-$ver-full_build.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg" -Force
+          $bin = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Fail fast (clearer than a late RuntimeError from _resolve_tool) if the
+          # bundled ffmpeg lacks an AV1 decoder or ffprobe.exe is missing.
+          if (-not (& "$bin\ffmpeg.exe" -hide_banner -decoders | Select-String -Quiet 'av1')) { throw 'bundled ffmpeg lacks an AV1 decoder' }
+          & "$bin\ffprobe.exe" -version | Out-Null
+
+      - name: Install ossutil (best-effort, for build:oss-tools)
+        # build_oss_tools.py resolves via shutil.which('ossutil') and SKIPS
+        # gracefully if absent (runtime can still use PATH / GYMCLIP_OSSUTIL_PATH),
+        # so this is best-effort (continue-on-error). The aliyun ossutil v2 zip
+        # nests the binary in a versioned subfolder; flatten it to ossutil.exe in a
+        # dedicated dir and add that dir to PATH so shutil.which('ossutil') resolves
+        # it via PATHEXT. The aliyun CDN has no 'latest' alias, so the version is
+        # pinned.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ver = "2.1.1"
+          $url = "https://gosspublic.alicdn.com/ossutil/v2/$ver/ossutil-$ver-windows-amd64.zip"
+          $zip = "$env:RUNNER_TEMP\ossutil.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ossutil" -Force
+          $src = (Get-ChildItem "$env:RUNNER_TEMP\ossutil" -Recurse -Filter ossutil.exe | Select-Object -First 1).FullName
+          $dst = "$env:RUNNER_TEMP\ossutil-bin"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item $src "$dst\ossutil.exe" -Force
+          "$dst" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install backend deps
+        working-directory: desktop-app/backend
+        run: pip install -r requirements.txt
+
+      - name: Install frontend deps
+        working-directory: desktop-app/gymclip-reviewer
+        run: npm ci
+
+      - name: Build frontend
+        # The vite bundle is byte-identical across platforms and the mac job
+        # already uploaded sourcemaps for this Sentry release. Pass the runtime
+        # Sentry vars (DSN + release + environment) for parity, but DROP
+        # SENTRY_AUTH_TOKEN/SENTRY_ORG/SENTRY_PROJECT_FRONTEND so @sentry/vite-plugin
+        # skips the redundant (dedup'd) sourcemap upload — saving CI time and
+        # avoiding a release-finalization race between the two jobs. Runtime error
+        # reporting on Windows stays wired identically to mac via the baked DSN.
+        working-directory: desktop-app/gymclip-reviewer
+        run: npm run build
+        env:
+          VITE_SENTRY_DSN_FRONTEND: ${{ secrets.VITE_SENTRY_DSN_FRONTEND }}
+          VITE_SENTRY_RELEASE: ${{ github.ref_name }}
+          VITE_SENTRY_ENVIRONMENT: production
+
+      - name: Build backend (PyInstaller)
+        working-directory: desktop-app/gymclip-reviewer
+        run: npm run build:backend
+
+      - name: Build media tools
+        working-directory: desktop-app/gymclip-reviewer
+        run: npm run build:media-tools
+
+      - name: Build oss tools
+        working-directory: desktop-app/gymclip-reviewer
+        run: npm run build:oss-tools
+
+      - name: Build Electron app (unsigned + publish)
+        # UNSIGNED NSIS installer for now (no Windows Authenticode cert yet). Omit
+        # every mac-only APPLE_*/CSC_* secret — reusing the mac CSC_LINK here would
+        # make electron-builder try to use a mac cert as a Windows cert and fail.
+        # CSC_IDENTITY_AUTO_DISCOVERY=false stops it from probing the Windows cert
+        # store, producing a deterministic unsigned build. EP_GH_IGNORE_TIME=true
+        # defends against the publisher's >2h "reused release already published"
+        # skip if the mac job was slow or retried.
+        working-directory: desktop-app/gymclip-reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SENTRY_DSN_ELECTRON: ${{ secrets.SENTRY_DSN_ELECTRON }}
+          SENTRY_DSN_BACKEND: ${{ secrets.SENTRY_DSN_BACKEND }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          EP_GH_IGNORE_TIME: "true"
+        run: npx electron-builder --win --publish always
+
+      - name: Mark Release as pre-release for rc/beta/alpha tags
+        # Duplicated from build-mac and run LAST (build-win is the final job).
+        # electron-builder never resets draft/prerelease on a reused release and
+        # `gh release edit` is idempotent, so running it here guarantees the final
+        # prerelease/draft state regardless of job ordering or a partial mac run.
+        if: contains(github.ref_name, '-rc.') || contains(github.ref_name, '-beta.') || contains(github.ref_name, '-alpha.')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release edit ${{ github.ref_name }} --prerelease --draft=false
