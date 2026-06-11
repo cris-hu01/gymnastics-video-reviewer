@@ -46,6 +46,10 @@ def save_project_state(project_file: str | os.PathLike[str], state: ProjectState
         tmp_path = Path(tmp.name)
         try:
             json.dump(state.to_dict(), tmp, ensure_ascii=False, indent=2)
+            # Flush + fsync before the atomic replace so a power loss can't leave
+            # a truncated/zero-byte project file behind the rename.
+            tmp.flush()
+            os.fsync(tmp.fileno())
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise

@@ -27,7 +27,16 @@ CancelRequestedCallback = Callable[[], bool]
 
 
 class ExportCancelledError(RuntimeError):
-    """Raised when an export run is cancelled at a clip/upload boundary."""
+    """Raised when an export run is cancelled at a clip/upload boundary.
+
+    ``touched_clip_ids`` records exactly which clips the run had already
+    processed before the cancel boundary, so the caller persists only those and
+    never clobbers clips a concurrent request changed mid-export.
+    """
+
+    def __init__(self, message: str, touched_clip_ids: set[str] | None = None) -> None:
+        super().__init__(message)
+        self.touched_clip_ids: set[str] = set(touched_clip_ids or ())
 
 
 DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS = 3
@@ -208,7 +217,9 @@ class ExportService:
 
         def _ensure_not_cancelled() -> None:
             if is_cancel_requested is not None and is_cancel_requested():
-                raise ExportCancelledError("导出已取消")
+                with runtime_lock:
+                    touched = set(results_by_clip_id.keys())
+                raise ExportCancelledError("导出已取消", touched_clip_ids=touched)
 
         output_path = Path(output_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
@@ -534,6 +545,9 @@ class ExportService:
                     success=True,
                     output_file=str(output_file),
                 )
+            except ExportCancelledError:
+                # Cancellation must never be swallowed into a per-clip failure.
+                raise
             except Exception as error:
                 with runtime_lock:
                     result = self._mark_export_failed(clip=clip, error_message=str(error))
@@ -672,6 +686,9 @@ class ExportService:
                     uploaded_url=uploaded_url,
                 )
                 return result
+            except ExportCancelledError:
+                # Cancellation must never be swallowed into an upload failure.
+                raise
             except Exception as error:
                 logger.exception(
                     "clip upload/platform-callback failed: clip_id=%s file=%s: %s",
@@ -1016,6 +1033,27 @@ class ExportService:
         raise RuntimeError(f"无法生成唯一文件名: {target.name}")
 
     def _export_clip_media(
+        self,
+        video_path: str,
+        clip: CandidateClip,
+        output_file: Path,
+        export_mode: str,
+    ) -> None:
+        # On any ffmpeg failure (incl. timeout) the partially-written output_file
+        # would otherwise linger and be mistaken for a valid export. Remove it so
+        # callers only ever see a complete file or nothing.
+        try:
+            self._export_clip_media_unguarded(
+                video_path=video_path,
+                clip=clip,
+                output_file=output_file,
+                export_mode=export_mode,
+            )
+        except BaseException:
+            output_file.unlink(missing_ok=True)
+            raise
+
+    def _export_clip_media_unguarded(
         self,
         video_path: str,
         clip: CandidateClip,

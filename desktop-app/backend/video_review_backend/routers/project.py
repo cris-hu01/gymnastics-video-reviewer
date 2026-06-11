@@ -372,12 +372,10 @@ async def export_project(request: Request):
                 is_cancel_requested=is_cancel_requested,
             )
         except ExportCancelledError as error:
-            # Persist whatever clips finished before the cancel boundary so the
-            # project reflects the partial export, then surface cancellation.
-            _merge_and_persist(
-                {clip.id for clip in current_state.candidate_clips},
-                current_state,
-            )
+            # Persist ONLY the clips this run actually touched before the cancel
+            # boundary. Merging the full clip set would clobber the status/export
+            # fields of clips a concurrent request changed mid-export.
+            _merge_and_persist(error.touched_clip_ids, current_state)
             raise JobCancelledError(str(error))
         _merge_and_persist({item.clip_id for item in result.clips}, current_state)
         logger.info(

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -33,7 +34,12 @@ from video_review_backend.export_service import (
     ExportService,
     _estimate_ffmpeg_timeout,
 )
-from video_review_backend.models import CandidateClip, ProjectState, VideoTask
+from video_review_backend.models import (
+    CandidateClip,
+    PlatformRecord,
+    ProjectState,
+    VideoTask,
+)
 from video_review_backend.storage import load_project_state, save_project_state
 from video_review_backend.video_import import (
     import_videos_into_project,
@@ -68,10 +74,17 @@ def _make_video(*, duration: float = 120.0) -> VideoTask:
     )
 
 
-def _make_clip(*, clip_id: str = "clip_exp", review_start: float = 0.0, review_end: float = 10.0) -> CandidateClip:
+def _make_clip(
+    *,
+    clip_id: str = "clip_exp",
+    review_start: float = 0.0,
+    review_end: float = 10.0,
+    platform_record_id: str | None = None,
+) -> CandidateClip:
     return CandidateClip(
         id=clip_id,
         video_id="video_exp",
+        linked_platform_record_id=platform_record_id,
         athlete_name="ZHANG Wei",
         country="CHN",
         candidate_start=review_start,
@@ -82,6 +95,23 @@ def _make_clip(*, clip_id: str = "clip_exp", review_start: float = 0.0, review_e
         subtitle_end=review_end,
         segments=[],
         status="kept",
+    )
+
+
+def _make_record(*, record_id: str, is_local: bool = False) -> PlatformRecord:
+    return PlatformRecord(
+        id=record_id,
+        video_id="video_exp",
+        platform_scope_id="scope",
+        match_name="测试比赛",
+        category="EF",
+        sport_item_label="FX",
+        user_name="张伟",
+        english_name="ZHANG Wei",
+        difficulty_score="5.6",
+        execution_score="8.500",
+        total_score="14.100",
+        is_local=is_local,
     )
 
 
@@ -275,6 +305,166 @@ class TestExportCancellation:
         assert result.attempted == 2
         assert result.failed == 0
 
+    def test_cancel_exposes_only_touched_clip_ids(self, tmp_path: Path):
+        """Scoped persistence: the cancel error must carry only processed clips."""
+        service = _make_service()
+        state = ProjectState()
+        state.videos.append(_make_video())
+        state.candidate_clips.append(_make_clip(clip_id="clip_a"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_b"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_c"))
+        # Cancel only after the first clip has been exported.
+        flags = iter([False, True, True, True, True])
+
+        with patch.object(service, "_ensure_ffmpeg"), patch.object(
+            service, "_export_clip_media", side_effect=lambda **kw: None
+        ):
+            with pytest.raises(ExportCancelledError) as exc:
+                service.export_kept_clips(
+                    state,
+                    output_dir=str(tmp_path / "out"),
+                    operation="export_only",
+                    is_cancel_requested=lambda: next(flags),
+                )
+        # Only clip_a was processed; clip_b / clip_c untouched -> must NOT be merged.
+        assert exc.value.touched_clip_ids == {"clip_a"}
+
+    def test_upload_path_cancel_raises_not_swallowed(self, tmp_path: Path):
+        """export_and_upload with multiple upload futures: cancelling at the upload
+        boundary must raise ExportCancelledError (-> JobCancelledError / cancelled),
+        not be swallowed into a failed/completed upload result.
+        """
+        service = _make_service()
+        out_dir = tmp_path / "out"
+
+        state = ProjectState()
+        state.videos.append(_make_video())
+        state.platform_records.append(_make_record(record_id="rec_a"))
+        state.platform_records.append(_make_record(record_id="rec_b"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_a", platform_record_id="rec_a"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_b", platform_record_id="rec_b"))
+
+        # _export_clip_media must produce a real file (the upload path stat()s it).
+        def fake_export(*, video_path, clip, output_file, export_mode):
+            Path(output_file).write_bytes(b"fake-mp4")
+
+        upload_calls: list[str] = []
+
+        def fake_upload(**kwargs):
+            upload_calls.append(kwargs["clip"].id)
+            return ("object/key", "https://example.com/clip.mp4")
+
+        # Two clips -> two clip-loop boundary checks (both must pass so both get
+        # queued for upload), then the upload-worker boundary fires the cancel.
+        uploads_phase = {"flag": False}
+
+        def cancel() -> bool:
+            return uploads_phase["flag"]
+
+        with patch.object(service, "_ensure_ffmpeg"), patch.object(
+            service, "_export_clip_media", side_effect=fake_export
+        ), patch.object(
+            service, "_upload_clip_output", side_effect=fake_upload
+        ), patch.object(
+            service, "_sync_platform_video_url"
+        ):
+            # The clip loop runs first (cancel False -> both exported + queued).
+            # Patch the executor's submit so we flip the cancel flag right before
+            # any upload worker starts, exercising the upload boundary.
+            real_submit = ThreadPoolExecutor.submit
+
+            def flip_then_submit(self, fn, *a, **kw):
+                uploads_phase["flag"] = True
+                return real_submit(self, fn, *a, **kw)
+
+            with patch.object(ThreadPoolExecutor, "submit", flip_then_submit):
+                with pytest.raises(ExportCancelledError):
+                    service.export_kept_clips(
+                        state,
+                        output_dir=str(out_dir),
+                        operation="export_and_upload",
+                        upload_parallel_files=2,
+                        is_cancel_requested=cancel,
+                    )
+        # Both local exports completed, but no upload ran: cancelled at the upload
+        # boundary (inside _process_upload, before _upload_clip_output).
+        assert upload_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 2b) half-written output cleanup on ffmpeg failure / timeout
+# ---------------------------------------------------------------------------
+
+
+class TestHalfWrittenOutputCleanup:
+    def test_single_segment_failure_removes_partial_output(self, tmp_path: Path):
+        service = _make_service()
+        clip = _make_clip(review_start=0.0, review_end=5.0)
+        output_file = tmp_path / "out.mp4"
+
+        # Simulate ffmpeg writing a partial file then failing (e.g. timeout).
+        def boom(cmd, timeout=None):
+            output_file.write_bytes(b"half-written-garbage")
+            raise RuntimeError("ffmpeg 导出超时（超过 15 秒）")
+
+        with patch.object(service, "_run_ffmpeg", side_effect=boom):
+            with pytest.raises(RuntimeError):
+                service._export_clip_media(
+                    video_path="/tmp/movie.mp4",
+                    clip=clip,
+                    output_file=output_file,
+                    export_mode="standard",
+                )
+        # The corrupt partial file must be gone.
+        assert not output_file.exists()
+
+    def test_multi_segment_concat_failure_removes_partial_output(self, tmp_path: Path):
+        from video_review_backend.models import ClipSegment
+
+        service = _make_service()
+        clip = _make_clip(review_start=0.0, review_end=20.0)
+        clip.segments = [
+            ClipSegment(id="s1", start=0.0, end=5.0),
+            ClipSegment(id="s2", start=10.0, end=15.0),
+        ]
+        output_file = tmp_path / "out.mp4"
+        calls = {"n": 0}
+
+        def run(cmd, timeout=None):
+            calls["n"] += 1
+            # First two calls are the per-segment exports (into a temp dir);
+            # the third is the concat into output_file -> fail after partial write.
+            if calls["n"] >= 3:
+                output_file.write_bytes(b"half-written-concat")
+                raise RuntimeError("ffmpeg 导出失败")
+
+        with patch.object(service, "_run_ffmpeg", side_effect=run):
+            with pytest.raises(RuntimeError):
+                service._export_clip_media(
+                    video_path="/tmp/movie.mp4",
+                    clip=clip,
+                    output_file=output_file,
+                    export_mode="standard",
+                )
+        assert not output_file.exists()
+
+    def test_success_leaves_output_in_place(self, tmp_path: Path):
+        service = _make_service()
+        clip = _make_clip(review_start=0.0, review_end=5.0)
+        output_file = tmp_path / "out.mp4"
+
+        def run(cmd, timeout=None):
+            output_file.write_bytes(b"complete-mp4")
+
+        with patch.object(service, "_run_ffmpeg", side_effect=run):
+            service._export_clip_media(
+                video_path="/tmp/movie.mp4",
+                clip=clip,
+                output_file=output_file,
+                export_mode="standard",
+            )
+        assert output_file.read_bytes() == b"complete-mp4"
+
 
 # ---------------------------------------------------------------------------
 # 3) lock-scope refactor — probe outside lock, import result unchanged
@@ -401,3 +591,12 @@ class TestSaveProjectStateTempLeak:
         assert load_project_state(project_file).name == "测试项目"
         # Only the final file remains, no temp residue.
         assert {p.name for p in tmp_path.iterdir()} == {"project_state.json"}
+
+    def test_fsync_called_before_replace(self, tmp_path: Path):
+        """Durability: the temp file is fsync'd before the atomic replace."""
+        project_file = tmp_path / "project_state.json"
+        with patch.object(storage_module.os, "fsync") as mock_fsync:
+            save_project_state(project_file, ProjectState())
+        mock_fsync.assert_called_once()
+        # File still written correctly.
+        assert project_file.exists()
