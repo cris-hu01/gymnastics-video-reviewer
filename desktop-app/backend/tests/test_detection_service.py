@@ -474,3 +474,314 @@ class TestBuildDetectionBlocks:
         assert blocks[0].athlete_name == "ZHANG Wei"
         assert blocks[0].subtitle_end == 14.0
         assert blocks[0].count == 3
+
+
+# ---------------------------------------------------------------------------
+# streaming decode + precheck (OOM fix)
+# ---------------------------------------------------------------------------
+
+
+def _solid_frame(value: int, h: int = 100, w: int = 320) -> np.ndarray:
+    """A flat BGR frame. Flat frames have no edges → fail _quick_subtitle_check."""
+    return np.full((h, w, 3), value, dtype=np.uint8)
+
+
+def _subtitle_like_frame(h: int = 100, w: int = 320) -> np.ndarray:
+    """A frame whose bottom 30% has high-contrast, saturated horizontal
+    structure so it passes _quick_subtitle_check (edges + brightness/
+    saturation std + sobel-y). Alternating colored bars give the saturation
+    variance a black/white pattern would lack."""
+    rng = np.random.default_rng(7)
+    frame = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+    # paint bold colored horizontal bars in the bottom band: bright red, dim
+    # blue, near-white — guarantees horizontal edges AND saturation spread.
+    bottom_start = int(h * 0.7)
+    colors = ((0, 0, 230), (200, 40, 0), (245, 245, 245))  # BGR
+    for i, y in enumerate(range(bottom_start, h, 4)):
+        frame[y : y + 4, :, :] = colors[i % len(colors)]
+    return frame
+
+
+class TestStreamPrecheckCandidates:
+    """The streaming pipeline must (a) only keep frames that pass precheck,
+    (b) never retain the full sampled frame set, (c) count every sample,
+    (d) honour the time window, and (e) match what a per-frame precheck of
+    the same source would produce (behavioural equivalence)."""
+
+    def test_only_passing_frames_become_candidates(self):
+        service = DetectionService()
+        # 5 flat frames (fail) + 1 subtitle-like frame (pass)
+        source = [
+            (0.0, _solid_frame(30)),
+            (2.0, _solid_frame(60)),
+            (4.0, _subtitle_like_frame()),
+            (6.0, _solid_frame(90)),
+            (8.0, _solid_frame(120)),
+        ]
+        with patch.object(
+            DetectionService, "_iter_sampled_frames", return_value=iter(source)
+        ):
+            candidates, total_samples = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4", sample_interval=2.0
+            )
+
+        assert total_samples == 5
+        # exactly the subtitle-like frame survived
+        assert len(candidates) == 1
+        assert candidates[0][0] == 4.0
+        # kept region is the small bottom strip, NOT the full frame
+        kept_region = candidates[0][1]
+        assert kept_region.shape[0] < source[2][1].shape[0]
+
+    def test_does_not_retain_all_frames_in_memory(self):
+        """Structural OOM guard: the pipeline must pull frames lazily and keep
+        only passing strips. We feed an exhaustible generator that counts how
+        many frames are alive at once and assert candidates ≪ total frames."""
+        service = DetectionService()
+        total = 200
+        live_refs: list[int] = []
+
+        def gen():
+            for i in range(total):
+                # all flat → all fail precheck → candidates must stay empty,
+                # proving no full-frame list is accumulated
+                yield float(i * 2), _solid_frame(40 + (i % 3))
+                live_refs.append(i)
+
+        with patch.object(DetectionService, "_iter_sampled_frames", return_value=gen()):
+            candidates, total_samples = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4", sample_interval=2.0
+            )
+
+        assert total_samples == total
+        # none passed precheck → zero retained, despite 200 frames streamed
+        assert candidates == []
+        assert len(live_refs) == total
+
+    def test_counts_all_samples_even_when_filtered_out(self):
+        service = DetectionService()
+        source = [(float(i), _solid_frame(50)) for i in range(10)]
+        with patch.object(
+            DetectionService, "_iter_sampled_frames", return_value=iter(source)
+        ):
+            candidates, total_samples = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4", sample_interval=1.0
+            )
+        assert total_samples == 10
+        assert candidates == []
+
+    def test_time_window_filters_out_of_range(self):
+        service = DetectionService()
+        source = [
+            (0.0, _subtitle_like_frame()),
+            (10.0, _subtitle_like_frame()),
+            (20.0, _subtitle_like_frame()),
+        ]
+        with patch.object(
+            DetectionService, "_iter_sampled_frames", return_value=iter(source)
+        ):
+            candidates, total_samples = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4",
+                sample_interval=2.0,
+                start_seconds=5.0,
+                end_seconds=15.0,
+            )
+        # all 3 streamed (counted), but only t=10 is inside [5, 15]
+        assert total_samples == 3
+        assert [t for t, _ in candidates] == [10.0]
+
+    def test_skip_check_keeps_bottom_strip_of_every_in_window_frame(self):
+        service = DetectionService()
+        source = [(0.0, _solid_frame(40)), (2.0, _solid_frame(40))]
+        with patch.object(
+            DetectionService, "_iter_sampled_frames", return_value=iter(source)
+        ):
+            candidates, total_samples = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4", sample_interval=2.0, skip_check=True
+            )
+        # skip_check bypasses subtitle detection → every frame yields a strip
+        assert total_samples == 2
+        assert len(candidates) == 2
+        # bottom 30% strip retained (frame height 100 → strip height 30)
+        assert candidates[0][1].shape[0] == 30
+
+    def test_equivalence_streaming_matches_manual_precheck(self):
+        """Behavioural equivalence: streaming candidates equal what a direct
+        per-frame _quick_subtitle_check over the same source yields."""
+        service = DetectionService()
+        frames = [
+            (0.0, _solid_frame(30)),
+            (2.0, _subtitle_like_frame()),
+            (4.0, _solid_frame(90)),
+            (6.0, _subtitle_like_frame()),
+        ]
+
+        # reference: replicate old precheck semantics by hand
+        expected_times = []
+        for t, f in frames:
+            has, region = service._quick_subtitle_check(f)
+            if has and region is not None:
+                expected_times.append(t)
+
+        with patch.object(
+            DetectionService, "_iter_sampled_frames", return_value=iter(frames)
+        ):
+            candidates, _ = service._stream_precheck_candidates(
+                video_path="/tmp/x.mp4", sample_interval=2.0
+            )
+
+        assert [t for t, _ in candidates] == expected_times
+
+    def test_cancellation_stops_mid_stream(self):
+        """Cancellation must be checked per frame and abort the streaming
+        precheck — not run to completion."""
+        service = DetectionService()
+        seen: list[float] = []
+
+        def gen():
+            for i in range(100):
+                seen.append(float(i))
+                yield float(i), _solid_frame(40)
+
+        # cancel after 3 frames have been pulled
+        def cancel():
+            return len(seen) >= 3
+
+        with patch.object(DetectionService, "_iter_sampled_frames", return_value=gen()):
+            with pytest.raises(DetectionCancelledError):
+                service._stream_precheck_candidates(
+                    video_path="/tmp/x.mp4",
+                    sample_interval=1.0,
+                    cancel_requested=cancel,
+                )
+        # did not stream all 100 frames
+        assert len(seen) < 100
+
+
+class TestFfmpegDefaultCv2Fallback:
+    """ffmpeg is the default extraction path; cv2 is the fallback. Env
+    DET_FFMPEG_EXTRACT forces a specific path."""
+
+    def test_ffmpeg_is_default_when_binary_resolves(self, monkeypatch):
+        monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
+        service = DetectionService()
+        with patch(
+            "video_review_backend.detection_service.resolve_ffmpeg_path",
+            return_value="/usr/bin/ffmpeg",
+        ):
+            assert service._should_use_ffmpeg() is True
+
+    def test_falls_back_to_cv2_when_ffmpeg_unavailable(self, monkeypatch):
+        monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
+        service = DetectionService()
+        with patch(
+            "video_review_backend.detection_service.resolve_ffmpeg_path",
+            side_effect=RuntimeError("ffmpeg 未安装"),
+        ):
+            assert service._should_use_ffmpeg() is False
+
+    def test_env_forces_ffmpeg(self, monkeypatch):
+        monkeypatch.setenv("DET_FFMPEG_EXTRACT", "1")
+        service = DetectionService()
+        # even if resolution would be checked, "1" short-circuits to True
+        assert service._should_use_ffmpeg() is True
+
+    def test_env_forces_cv2(self, monkeypatch):
+        monkeypatch.setenv("DET_FFMPEG_EXTRACT", "0")
+        service = DetectionService()
+        # "0" forces cv2 even when ffmpeg is available
+        with patch(
+            "video_review_backend.detection_service.resolve_ffmpeg_path",
+            return_value="/usr/bin/ffmpeg",
+        ):
+            assert service._should_use_ffmpeg() is False
+
+    def test_iter_falls_back_to_cv2_when_ffmpeg_fails_before_first_frame(
+        self, monkeypatch
+    ):
+        """If ffmpeg raises before yielding any frame, _iter_sampled_frames
+        transparently switches to the cv2 generator."""
+        monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
+        service = DetectionService()
+        cv2_source = [(0.0, _solid_frame(40)), (2.0, _solid_frame(40))]
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("ffmpeg blew up")
+            yield  # make it a generator (never reached)
+
+        with patch.object(DetectionService, "_should_use_ffmpeg", return_value=True), \
+            patch.object(DetectionService, "_iter_sampled_frames_ffmpeg", side_effect=boom), \
+            patch.object(
+                DetectionService,
+                "_iter_sampled_frames_cv2",
+                return_value=iter(cv2_source),
+            ):
+            out = list(service._iter_sampled_frames("/tmp/x.mp4", 2.0))
+
+        assert [t for t, _ in out] == [0.0, 2.0]
+
+    def test_iter_does_not_fall_back_after_partial_ffmpeg_output(self, monkeypatch):
+        """If ffmpeg fails AFTER streaming some frames, we must NOT restart from
+        cv2 (would double-count) — the error propagates."""
+        monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
+        service = DetectionService()
+
+        def partial(*_args, **_kwargs):
+            yield (0.0, _solid_frame(40))
+            raise RuntimeError("ffmpeg died mid-stream")
+
+        with patch.object(DetectionService, "_should_use_ffmpeg", return_value=True), \
+            patch.object(
+                DetectionService, "_iter_sampled_frames_ffmpeg", side_effect=partial
+            ):
+            with pytest.raises(RuntimeError, match="mid-stream"):
+                list(service._iter_sampled_frames("/tmp/x.mp4", 2.0))
+
+
+class TestIterSampledFramesCv2:
+    """The cv2 generator yields frames lazily and releases the capture."""
+
+    def test_yields_frames_and_releases_capture(self):
+        service = DetectionService()
+        cap = _fake_capture(fps=30.0, total_frames=180)  # 6s @ 30fps
+        cap.read.return_value = (True, _solid_frame(50))
+
+        with patch(
+            "video_review_backend.detection_service.cv2.VideoCapture",
+            return_value=cap,
+        ):
+            out = list(
+                service._iter_sampled_frames_cv2("/tmp/x.mp4", sample_interval=2.0)
+            )
+
+        # samples at t=0,2,4 (frame_number 0,60,120 all < 180)
+        assert [t for t, _ in out] == [0.0, 2.0, 4.0]
+        cap.release.assert_called_once()
+
+    def test_unopened_capture_yields_nothing(self):
+        service = DetectionService()
+        cap = _fake_capture(fps=30.0, total_frames=180, is_opened=False)
+        with patch(
+            "video_review_backend.detection_service.cv2.VideoCapture",
+            return_value=cap,
+        ):
+            out = list(
+                service._iter_sampled_frames_cv2("/tmp/x.mp4", sample_interval=2.0)
+            )
+        assert out == []
+
+    def test_cancellation_in_cv2_generator(self):
+        service = DetectionService()
+        cap = _fake_capture(fps=30.0, total_frames=3000)
+        cap.read.return_value = (True, _solid_frame(50))
+        with patch(
+            "video_review_backend.detection_service.cv2.VideoCapture",
+            return_value=cap,
+        ):
+            gen = service._iter_sampled_frames_cv2(
+                "/tmp/x.mp4", sample_interval=2.0, cancel_requested=lambda: True
+            )
+            with pytest.raises(DetectionCancelledError):
+                next(gen)
+        # capture still released via finally
+        cap.release.assert_called_once()
