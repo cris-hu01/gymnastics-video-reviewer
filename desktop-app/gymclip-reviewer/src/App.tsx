@@ -1304,6 +1304,9 @@ export default function App() {
       if (!activeClip || !activeVideo) return;
       if (showExport) return;
       if (showImportModal) return;
+      // Right-click menu's own effect only handles Escape and doesn't
+      // stopPropagation, so global hotkeys would otherwise pass through it.
+      if (videoContextMenu) return;
       const activeElement = document.activeElement;
       const isUndoShortcut = (event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z';
       if (
@@ -1419,7 +1422,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeClip, activeVideo, showExport, showImportModal, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
+  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
 
   function setProjectState(nextProject: ProjectState) {
     setProject(nextProject);
