@@ -53,10 +53,23 @@ def create_app():
 if __name__ == "__main__":
     log_path = _setup_logging()
     logging.getLogger(__name__).info("backend log file: %s", log_path)
+
+    # Fail-closed: refuse to boot if GYMCLIP_API_TOKEN is set but weak/empty.
+    # No-op when unset (dev) or valid. Crashes here rather than silently
+    # serving /api with a bad token.
+    from video_review_backend.api import validate_api_token_config
+
+    validate_api_token_config()
+
     reload_enabled = os.environ.get("GYMCLIP_BACKEND_RELOAD", "0") == "1"
     uvicorn.run(
         "video_review_backend.api:app" if reload_enabled else create_app(),
         host=os.environ.get("GYMCLIP_BACKEND_HOST", "127.0.0.1"),
         port=int(os.environ.get("GYMCLIP_BACKEND_PORT", "8000")),
         reload=reload_enabled,
+        # Disable uvicorn HTTP access log: media URLs carry the API token as a
+        # `?token=` query param, which the access log would write verbatim to
+        # disk (token leak). A local single-user desktop backend has no need
+        # for per-request access logging anyway.
+        access_log=False,
     )

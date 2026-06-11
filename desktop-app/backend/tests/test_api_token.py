@@ -39,6 +39,17 @@ def no_token_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(api.API_TOKEN_ENV_VAR, raising=False)
 
 
+@pytest.fixture
+def empty_token_env(monkeypatch: pytest.MonkeyPatch):
+    # Distinct from unset: must NOT be treated as dev mode (fail-closed).
+    monkeypatch.setenv(api.API_TOKEN_ENV_VAR, "")
+
+
+@pytest.fixture
+def short_token_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(api.API_TOKEN_ENV_VAR, "tooshort")  # len 8 < 32
+
+
 # ---------------------------------------------------------------------------
 # Token enforced when env var is set
 # ---------------------------------------------------------------------------
@@ -100,6 +111,46 @@ def test_cors_preflight_bypasses_token_check(token_env, client: TestClient):
 def test_no_env_token_allows_unauthenticated(no_token_env, client: TestClient):
     response = client.get("/api/health")
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Misconfiguration: env set but empty / too short -> fail-closed (NOT dev mode)
+# ---------------------------------------------------------------------------
+
+def test_empty_token_env_fails_closed_503(empty_token_env, client: TestClient):
+    # Empty string is a config error, not "auth disabled". Must NOT 200.
+    response = client.get("/api/health")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Server API token misconfigured"
+
+
+def test_short_token_env_fails_closed_503(short_token_env, client: TestClient):
+    response = client.get("/api/health")
+    assert response.status_code == 503
+
+
+def test_short_token_even_with_matching_token_still_503(short_token_env, client: TestClient):
+    # A weak token is rejected outright; presenting it does not unlock /api.
+    response = client.get("/api/health", headers={api.API_TOKEN_HEADER: "tooshort"})
+    assert response.status_code == 503
+
+
+def test_validate_api_token_config_raises_on_empty(empty_token_env):
+    with pytest.raises(RuntimeError):
+        api.validate_api_token_config()
+
+
+def test_validate_api_token_config_raises_on_short(short_token_env):
+    with pytest.raises(RuntimeError):
+        api.validate_api_token_config()
+
+
+def test_validate_api_token_config_noop_when_unset(no_token_env):
+    api.validate_api_token_config()  # must not raise
+
+
+def test_validate_api_token_config_noop_when_valid(token_env):
+    api.validate_api_token_config()  # 64-char token must not raise
 
 
 # ---------------------------------------------------------------------------

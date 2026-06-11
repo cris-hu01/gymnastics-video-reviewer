@@ -699,8 +699,17 @@ async function startBackend() {
 // window.open must never spawn an in-app browser. External http(s) links are
 // handed to the OS default browser instead.
 function isAllowedAppNavigation(url) {
-  if (RENDERER_URL && url.startsWith(RENDERER_URL)) {
-    return true; // dev: vite renderer (incl. HMR reloads)
+  if (RENDERER_URL) {
+    // dev: compare full origins, not a string prefix. `startsWith(RENDERER_URL)`
+    // would let `http://localhost:3000.evil.com/...` through; origin equality
+    // does not. Malformed URLs throw in the URL ctor -> treated as disallowed.
+    try {
+      if (new URL(url).origin === new URL(RENDERER_URL).origin) {
+        return true; // vite renderer (incl. HMR reloads)
+      }
+    } catch (_) {
+      return false;
+    }
   }
   // Packaged: only the bundled dist/index.html file URL (allow ?query/#hash).
   const entryUrl = pathToFileURL(resolveRendererEntry()).href;

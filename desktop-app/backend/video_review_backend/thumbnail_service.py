@@ -23,6 +23,22 @@ class ThumbnailService:
         self.url_prefix = url_prefix.rstrip("/")
         self.cache_root.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _validate_component(component: str) -> None:
+        """Reject a path component that is empty or could traverse the FS.
+
+        Shared by the read path (resolve_file) and the write path
+        (build_timeline) so both ends of the cache tree enforce the same
+        rule — no `/`, `\\`, `..`, or empty segment.
+        """
+        if (
+            not component
+            or ".." in component
+            or "/" in component
+            or "\\" in component
+        ):
+            raise ValueError("invalid thumbnail path component")
+
     def build_timeline(
         self,
         *,
@@ -33,6 +49,9 @@ class ThumbnailService:
         count: int = 12,
         width: int = 160,
     ) -> list[ThumbnailFrame]:
+        # video_id is internally generated, but validate the write-side join
+        # too so the cache tree stays symmetric with resolve_file's checks.
+        self._validate_component(video_id)
         safe_start = max(0.0, float(start))
         safe_end = max(safe_start + 0.1, float(end))
         safe_count = max(3, min(int(count), 24))
@@ -74,13 +93,7 @@ class ThumbnailService:
         escape the cache root.
         """
         for component in (video_id, file_name):
-            if (
-                not component
-                or ".." in component
-                or "/" in component
-                or "\\" in component
-            ):
-                raise ValueError("invalid thumbnail path component")
+            self._validate_component(component)
 
         cache_root = self.cache_root.resolve()
         candidate = (cache_root / video_id / file_name).resolve()

@@ -61,6 +61,19 @@ def test_resolve_file_returns_path_inside_cache_root(service: ThumbnailService):
     assert resolved.read_bytes() == THUMB_CONTENT
 
 
+@pytest.mark.parametrize("video_id", ["..", "../x", "..\\x", "a/b", "a\\b", ""])
+def test_build_timeline_validates_video_id(service: ThumbnailService, video_id: str):
+    # Write path is symmetric with the read path: a traversal video_id must
+    # be rejected before any cache_root join / mkdir happens.
+    with pytest.raises(ValueError):
+        service.build_timeline(
+            video_id=video_id,
+            video_path="/nonexistent.mp4",
+            start=0.0,
+            end=1.0,
+        )
+
+
 @pytest.mark.parametrize(
     ("video_id", "file_name"),
     [
