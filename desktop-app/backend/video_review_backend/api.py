@@ -7,6 +7,8 @@ routers extracted in the B-router refactor. Endpoint implementations live under
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,14 +32,66 @@ from .routers import (clips as clips_router, jobs as jobs_router,
 ensure_workspace_dirs()
 
 app = FastAPI(title="GymClip Reviewer API", version="1.2.1")
+
+_api_logger = logging.getLogger("gymclip.api.exception_handler")
+_security_logger = logging.getLogger("gymclip.api.security")
+
+# --- Local API token auth -------------------------------------------------
+# The Electron main process generates a random token per app launch and
+# injects it via the GYMCLIP_API_TOKEN env var when spawning this backend.
+# When the env var is set, every /api request must present the token either
+# as the X-Gymclip-Token header (XHR/fetch) or as a `?token=` query param
+# (media elements like <video>/<img> cannot attach headers).
+# When the env var is NOT set (pytest, bare `python3 main.py` development),
+# auth is disabled and a startup warning is emitted instead.
+API_TOKEN_ENV_VAR = "GYMCLIP_API_TOKEN"
+API_TOKEN_HEADER = "X-Gymclip-Token"
+
+
+@app.middleware("http")
+async def _enforce_local_api_token(request: Request, call_next):
+    expected = os.environ.get(API_TOKEN_ENV_VAR, "")
+    if expected and request.url.path.startswith("/api"):
+        provided = (
+            request.headers.get(API_TOKEN_HEADER)
+            or request.query_params.get("token")
+            or ""
+        )
+        if not secrets.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        ):
+            _security_logger.warning(
+                "rejected unauthenticated request %s %s",
+                request.method,
+                request.url.path,
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API token"},
+            )
+    return await call_next(request)
+
+
+# CORSMiddleware MUST be added AFTER the token middleware above: in Starlette
+# the last-added middleware is the outermost, and CORS has to answer OPTIONS
+# preflights before the token check runs (preflights cannot carry the custom
+# token header, so an inner CORS layer would see them 401 first).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        # Vite dev server (npm run dev:web / electron:dev) — both spellings.
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        # Packaged Electron renderer is loaded from file://. Per the Fetch
+        # spec an opaque origin serializes to "null"; in practice Electron's
+        # file:// fetches omit the Origin header entirely, so the CORS layer
+        # never engages for the packaged app. This entry is defensive for
+        # engines that do send `Origin: null`.
+        "null",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-_api_logger = logging.getLogger("gymclip.api.exception_handler")
 
 
 @app.exception_handler(APIError)
@@ -76,6 +130,15 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+def warn_if_api_token_disabled():
+    if not os.environ.get(API_TOKEN_ENV_VAR):
+        _security_logger.warning(
+            "GYMCLIP_API_TOKEN is not set — local API token auth is DISABLED. "
+            "This is expected for pytest / bare development runs only."
+        )
 
 
 @app.on_event("startup")

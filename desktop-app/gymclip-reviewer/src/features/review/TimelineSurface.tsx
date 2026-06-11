@@ -39,7 +39,7 @@
  */
 import {useEffect, useRef, useState, type ReactNode} from 'react';
 
-import {fetchVideoThumbnails} from '../../api';
+import {buildMediaUrl, fetchVideoThumbnails} from '../../api';
 import {useStore} from '../../store';
 import type {ClipSegment, ThumbnailFrame} from '../../types';
 
@@ -189,7 +189,7 @@ export function TimelineSurface({
             thumbnails.map((frame) => (
               <img
                 key={`${frame.url}-${frame.time_seconds}`}
-                src={frame.url}
+                src={buildMediaUrl(frame.url)}
                 alt=""
                 className="h-full min-w-0 flex-1 object-cover"
                 draggable={false}
