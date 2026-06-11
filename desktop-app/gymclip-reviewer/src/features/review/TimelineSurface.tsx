@@ -177,10 +177,14 @@ export function TimelineSurface({
           const onUp = () => {
             document.removeEventListener('pointermove', onMove);
             document.removeEventListener('pointerup', onUp);
+            document.removeEventListener('pointercancel', onUp);
             onScrubEnd();
           };
           document.addEventListener('pointermove', onMove);
           document.addEventListener('pointerup', onUp);
+          // pointercancel (e.g. the OS steals the pointer mid-drag) must run
+          // the same cleanup as pointerup, otherwise scrub state leaks.
+          document.addEventListener('pointercancel', onUp);
           e.preventDefault();
         }}
       >
