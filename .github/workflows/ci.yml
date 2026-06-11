@@ -82,6 +82,13 @@ jobs:
     # exercises the real Electron + native dialogs path.
     runs-on: macos-latest
     if: github.event_name == 'pull_request'
+    env:
+      # Point electron's install.js at a stable, cacheable directory so the
+      # postinstall download survives across runs. Without this the binary is
+      # re-downloaded from GitHub releases on every cold npm cache, and that
+      # download is flaky -> Playwright's electron.launch then fails with
+      # "Electron failed to install correctly". See the verify-and-retry step.
+      ELECTRON_CACHE: ~/Library/Caches/electron
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,6 +105,21 @@ jobs:
         with:
           python-version: '3.10'
 
+      # Cache the Electron binary download (and Playwright browsers) keyed on
+      # the lockfile. The npm cache restores node_modules metadata but NOT the
+      # out-of-tree binary in ~/Library/Caches/electron, which is what the
+      # postinstall step fetches. Caching it removes the flaky network hop on
+      # cold runs; install.js reuses the cached zip via ELECTRON_CACHE.
+      - name: Cache Electron & Playwright binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-e2e-binaries-${{ hashFiles('desktop-app/gymclip-reviewer/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-binaries-
+
       - name: Install backend dependencies
         working-directory: desktop-app/backend
         run: pip install -r requirements.txt
@@ -105,6 +127,50 @@ jobs:
       - name: Install frontend dependencies
         working-directory: desktop-app/gymclip-reviewer
         run: npm ci
+
+      - name: Verify Electron binary (retry on cold-cache flake)
+        working-directory: desktop-app/gymclip-reviewer
+        # npm ci's postinstall downloads the Electron binary; on a cold npm
+        # cache that download is flaky and can leave node_modules/electron
+        # without a binary, which makes Playwright's electron.launch fail
+        # before any assertion runs. Verify the binary resolves AND its dist
+        # exists; if not, reinstall it (install.js, then npm rebuild) with
+        # backoff, up to 3 attempts. Only fail the step if all attempts fail.
+        run: |
+          set -u
+          ELECTRON_CACHE=~/Library/Caches/electron
+          export ELECTRON_CACHE
+
+          verify() {
+            # require('electron') must resolve to a path AND dist/ must exist
+            node -e "const p=require('electron'); if (typeof p!=='string'||!p) process.exit(1)" \
+              && [ -d node_modules/electron/dist ]
+          }
+
+          if verify; then
+            echo "Electron binary present on first check."
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            echo "Electron binary missing/invalid; reinstall attempt ${attempt}/3..."
+            if [ -f node_modules/electron/install.js ]; then
+              node node_modules/electron/install.js || true
+            fi
+            if verify; then
+              echo "Electron binary ready after install.js (attempt ${attempt})."
+              exit 0
+            fi
+            npm rebuild electron || true
+            if verify; then
+              echo "Electron binary ready after npm rebuild (attempt ${attempt})."
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+
+          echo "ERROR: Electron binary could not be installed after 3 attempts." >&2
+          exit 1
 
       - name: Install Playwright browsers
         working-directory: desktop-app/gymclip-reviewer
