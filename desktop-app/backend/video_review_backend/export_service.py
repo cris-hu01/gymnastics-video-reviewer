@@ -23,10 +23,41 @@ logger = logging.getLogger(__name__)
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+CancelRequestedCallback = Callable[[], bool]
+
+
+class ExportCancelledError(RuntimeError):
+    """Raised when an export run is cancelled at a clip/upload boundary."""
 
 
 DEFAULT_PLATFORM_SYNC_RETRY_ATTEMPTS = 3
 DEFAULT_PLATFORM_SYNC_RETRY_BACKOFF_SECONDS = (1, 2, 4)
+
+# Subprocess timeouts (seconds). A hung ffmpeg/ffprobe must never block a job
+# worker forever — we cap each invocation and surface a failure instead.
+FFMPEG_VERSION_PROBE_TIMEOUT_SECONDS = 30
+# Export/transcode runtime scales with clip length. We allow ~3x realtime plus a
+# generous floor, capped so a wildly wrong duration can't ask for an unbounded wait.
+FFMPEG_EXPORT_TIMEOUT_FLOOR_SECONDS = 60
+FFMPEG_EXPORT_TIMEOUT_PER_SECOND = 3
+FFMPEG_EXPORT_TIMEOUT_CAP_SECONDS = 3600
+
+
+def _estimate_ffmpeg_timeout(duration_seconds: float | None) -> float:
+    """Estimate a wall-clock timeout for an export/transcode ffmpeg call.
+
+    ``max(floor, duration * 3)`` capped at an hour. ``None``/invalid durations
+    fall back to the floor.
+    """
+    try:
+        duration = float(duration_seconds) if duration_seconds is not None else 0.0
+    except (TypeError, ValueError):
+        duration = 0.0
+    estimate = max(
+        FFMPEG_EXPORT_TIMEOUT_FLOOR_SECONDS,
+        duration * FFMPEG_EXPORT_TIMEOUT_PER_SECOND,
+    )
+    return min(estimate, FFMPEG_EXPORT_TIMEOUT_CAP_SECONDS)
 
 
 def _clean_path_component(value: str) -> str:
@@ -168,11 +199,16 @@ class ExportService:
         state_change_callback: Callable[[set[str]], None] | None = None,
         upload_parallel_files: int = 2,
         upload_part_threads: int = 4,
+        is_cancel_requested: CancelRequestedCallback | None = None,
     ) -> ExportRunResult:
         if operation not in {"export_only", "upload_only", "export_and_upload"}:
             raise RuntimeError(f"不支持的导出执行模式: {operation}")
         if operation != "upload_only":
             self._ensure_ffmpeg()
+
+        def _ensure_not_cancelled() -> None:
+            if is_cancel_requested is not None and is_cancel_requested():
+                raise ExportCancelledError("导出已取消")
 
         output_path = Path(output_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
@@ -318,6 +354,9 @@ class ExportService:
 
         upload_work: list[dict[str, Any]] = []
         for clip in ordered_clips:
+            # Cancellation boundary: stop before starting the next clip's local
+            # export/queueing. The active clip (if any) is allowed to finish.
+            _ensure_not_cancelled()
             video = state.get_video(clip.video_id)
             if video is None:
                 with runtime_lock:
@@ -510,6 +549,9 @@ class ExportService:
 
         def _process_upload(work_item: dict[str, Any]) -> ExportedClipResult:
             nonlocal platform_completed
+            # Cancellation boundary: skip starting this upload if cancel was
+            # requested. Raises out through future.result() to stop the run.
+            _ensure_not_cancelled()
             clip = work_item["clip"]
             video = work_item["video"]
             platform_record = work_item["platform_record"]
@@ -863,9 +905,17 @@ class ExportService:
 
     def _ensure_ffmpeg(self) -> None:
         try:
-            subprocess.run([self.ffmpeg_path, "-version"], capture_output=True, check=True, text=True)
+            subprocess.run(
+                [self.ffmpeg_path, "-version"],
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=FFMPEG_VERSION_PROBE_TIMEOUT_SECONDS,
+            )
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise RuntimeError("ffmpeg 未安装或不可用")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg 版本探测超时（可执行文件可能已挂起）")
 
     def _build_output_file(
         self,
@@ -974,14 +1024,15 @@ class ExportService:
     ) -> None:
         segments = self._clip_segments(clip)
         if len(segments) == 1:
+            start, end = segments[0]
             cmd = self._build_ffmpeg_command(
                 video_path=video_path,
-                start=segments[0][0],
-                end=segments[0][1],
+                start=start,
+                end=end,
                 output_file=output_file,
                 export_mode=export_mode,
             )
-            self._run_ffmpeg(cmd)
+            self._run_ffmpeg(cmd, timeout=_estimate_ffmpeg_timeout(end - start))
             return
 
         with tempfile.TemporaryDirectory(prefix="gymclip-export-") as temp_dir_name:
@@ -996,7 +1047,7 @@ class ExportService:
                     output_file=segment_file,
                     export_mode=export_mode,
                 )
-                self._run_ffmpeg(cmd)
+                self._run_ffmpeg(cmd, timeout=_estimate_ffmpeg_timeout(end - start))
                 segment_files.append(segment_file)
 
             list_file = temp_dir / "concat.txt"
@@ -1019,7 +1070,8 @@ class ExportService:
                 "warning",
                 str(output_file),
             ]
-            self._run_ffmpeg(concat_cmd)
+            total_duration = sum(max(0.0, end - start) for start, end in segments)
+            self._run_ffmpeg(concat_cmd, timeout=_estimate_ffmpeg_timeout(total_duration))
 
     def _build_ffmpeg_command(
         self,
@@ -1103,8 +1155,13 @@ class ExportService:
             (gap_end, end),
         ]
 
-    def _run_ffmpeg(self, cmd: list[str]) -> None:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+    def _run_ffmpeg(self, cmd: list[str], timeout: float | None = None) -> None:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # TimeoutExpired already SIGKILLs the child and reaps it (no zombie),
+            # so we only need to translate it into a normal export failure.
+            raise RuntimeError(f"ffmpeg 导出超时（超过 {int(timeout or 0)} 秒）")
         if result.returncode != 0:
             error_message = result.stderr.strip() or "ffmpeg 导出失败"
             raise RuntimeError(error_message)

@@ -29,6 +29,9 @@ DEFAULT_BUCKET = "team-gymnastics"
 DEFAULT_REGION = "cn-beijing"
 DEFAULT_ENDPOINT = "https://oss-cn-beijing.aliyuncs.com"
 DEFAULT_OSS_CONNECT_TIMEOUT_SECONDS = 30
+# Wall-clock cap for the ossutil CLI fallback. Generous (1h) so legitimate large
+# uploads finish, but bounded so a wedged CLI can't block the upload thread forever.
+DEFAULT_OSSUTIL_TIMEOUT_SECONDS = 3600
 DEFAULT_OSS_RETRY_ATTEMPTS = 3
 DEFAULT_OSS_PART_RETRY_BACKOFF_SECONDS = (1, 2, 4)
 DEFAULT_MULTIPART_THRESHOLD = 8 * 1024 * 1024
@@ -130,10 +133,19 @@ class OSSUploadService:
             "-f",
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, env=env)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=DEFAULT_OSSUTIL_TIMEOUT_SECONDS,
+            )
         except FileNotFoundError:
             logger.exception("ossutil binary not found at %s", ossutil_path)
             raise OSSUploadError("ossutil 不可用，且未安装 oss2，无法上传 OSS")
+        except subprocess.TimeoutExpired:
+            logger.error("ossutil upload timed out after %ss: %s", DEFAULT_OSSUTIL_TIMEOUT_SECONDS, object_uri)
+            raise OSSUploadError(f"ossutil 上传超时（超过 {DEFAULT_OSSUTIL_TIMEOUT_SECONDS} 秒）")
         if result.returncode != 0:
             logger.error(
                 "ossutil upload failed: rc=%s stderr=%s stdout=%s",
