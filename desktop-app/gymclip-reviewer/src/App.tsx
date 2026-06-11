@@ -271,6 +271,7 @@ export default function App() {
   const setIsPlayingStore = useStore((s) => s.setIsPlaying);
   const enqueueSeekStore = useStore((s) => s.enqueueSeek);
   const [isSavingTrim, setIsSavingTrim] = useState(false);
+  const [trimJustSaved, setTrimJustSaved] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
   const [isScrubbing, setIsScrubbing] = useState(false);
   // A4-3: timelineThumbnails / isLoadingThumbnails moved into TimelineSurface
@@ -286,6 +287,7 @@ export default function App() {
   const trimStartRef = useRef(0);
   const trimEndRef = useRef(0);
   const trimAutoSaveTimerRef = useRef<number | null>(null);
+  const trimSavedIndicatorTimerRef = useRef<number | null>(null);
   const trimScrollRafRef = useRef<number | null>(null);
   const trimPointerXRef = useRef(0);
   const trimRectRef = useRef<DOMRect | null>(null);
@@ -1246,6 +1248,9 @@ export default function App() {
       if (trimAutoSaveTimerRef.current != null) {
         window.clearTimeout(trimAutoSaveTimerRef.current);
       }
+      if (trimSavedIndicatorTimerRef.current != null) {
+        window.clearTimeout(trimSavedIndicatorTimerRef.current);
+      }
     };
   }, []);
 
@@ -1459,6 +1464,17 @@ export default function App() {
       window.clearTimeout(trimAutoSaveTimerRef.current);
       trimAutoSaveTimerRef.current = null;
     }
+  }
+
+  function showTrimSavedIndicator() {
+    setTrimJustSaved(true);
+    if (trimSavedIndicatorTimerRef.current != null) {
+      window.clearTimeout(trimSavedIndicatorTimerRef.current);
+    }
+    trimSavedIndicatorTimerRef.current = window.setTimeout(() => {
+      trimSavedIndicatorTimerRef.current = null;
+      setTrimJustSaved(false);
+    }, 1000);
   }
 
   async function handleUndoClipStructure() {
@@ -2201,6 +2217,7 @@ export default function App() {
           ?? activeSegment;
         setActiveSegmentId(nextSegment.id);
         setErrorMessage(null);
+        showTrimSavedIndicator();
         return {
           clip: nextClip,
           segment: nextSegment,
@@ -2551,6 +2568,7 @@ export default function App() {
           trimStart={trimStart}
           trimEnd={trimEnd}
           isSavingTrim={isSavingTrim}
+          trimJustSaved={trimJustSaved}
           activeClipLockedByExport={activeClipLockedByExport}
           videoPlaybackError={videoPlaybackError}
           setVideoPlaybackError={setVideoPlaybackError}

@@ -63,6 +63,7 @@ export interface ReviewPanelProps {
   trimStart: number;
   trimEnd: number;
   isSavingTrim: boolean;
+  trimJustSaved: boolean;
   activeClipLockedByExport: boolean;
   videoPlaybackError: string | null;
   setVideoPlaybackError: (msg: string | null) => void;
@@ -110,6 +111,7 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
     trimStart,
     trimEnd,
     isSavingTrim,
+    trimJustSaved,
     activeClipLockedByExport,
     videoPlaybackError,
     setVideoPlaybackError,
@@ -217,6 +219,14 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
                 </span>
               ))}
               {isSavingTrim && <span className="text-red-500">保存中...</span>}
+              {!isSavingTrim && (
+                <span
+                  className={`text-emerald-600 transition-opacity duration-500 ${trimJustSaved ? 'opacity-100' : 'opacity-0'}`}
+                  aria-hidden={!trimJustSaved}
+                >
+                  已保存 ✓
+                </span>
+              )}
               {activeClipLockedByExport && (
                 <span className="text-amber-600">当前片段在导出批次中，只读</span>
               )}
