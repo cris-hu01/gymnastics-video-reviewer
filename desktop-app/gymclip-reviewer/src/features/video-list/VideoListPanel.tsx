@@ -243,6 +243,9 @@ export function VideoListPanel(props: VideoListPanelProps) {
                               onChange={(event) => {
                                 event.stopPropagation();
                                 toggleVideoSelection(video.id);
+                                // Drop focus so Space keeps controlling play/pause
+                                // instead of re-toggling the checkbox.
+                                event.currentTarget.blur();
                               }}
                               className="h-4 w-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900"
                             />

@@ -188,6 +188,7 @@ export default function App() {
   const {
     isImporting,
     importMode,
+    showImportModal,
     openImportSourcePicker,
     handleImportFiles,
     fileInputRef,
@@ -898,7 +899,9 @@ export default function App() {
       setProject(nextProject);
       setErrorMessage(null);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '无法读取项目状态');
+      if (!options?.silent) {
+        setErrorMessage(error instanceof Error ? error.message : '无法读取项目状态');
+      }
     } finally {
       if (!options?.silent) {
         setIsLoading(false);
@@ -1300,6 +1303,7 @@ export default function App() {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!activeClip || !activeVideo) return;
       if (showExport) return;
+      if (showImportModal) return;
       const activeElement = document.activeElement;
       const isUndoShortcut = (event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === 'z';
       if (
@@ -1415,7 +1419,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeClip, activeVideo, showExport, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
+  }, [activeClip, activeVideo, showExport, showImportModal, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
 
   function setProjectState(nextProject: ProjectState) {
     setProject(nextProject);
@@ -1840,6 +1844,7 @@ export default function App() {
     const onUp = () => {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
+      document.removeEventListener('pointercancel', onUp);
       stopTrimScroll();
       // Land the preview exactly on the final boundary. The per-frame tick
       // suppresses seeks and the last pointermove seek can trail the final
@@ -1849,6 +1854,9 @@ export default function App() {
     };
     document.addEventListener('pointermove', onMove);
     document.addEventListener('pointerup', onUp);
+    // pointercancel (e.g. the OS steals the pointer mid-drag) must run the
+    // same cleanup as pointerup, otherwise the drag state leaks.
+    document.addEventListener('pointercancel', onUp);
   }
 
   async function handleBindScoreCard(platformRecordId: string | null) {
