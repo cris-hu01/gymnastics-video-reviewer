@@ -61,7 +61,32 @@ class ThumbnailService:
         return frames
 
     def resolve_file(self, video_id: str, file_name: str) -> Path:
-        return self.cache_root / video_id / file_name
+        """Resolve a cached thumbnail path, rejecting path traversal.
+
+        `video_id` / `file_name` arrive straight from URL path segments.
+        uvicorn percent-decodes before routing, so multi-segment payloads
+        (`..%2f..`) already 404 at the router — but encoded backslashes
+        (`..%5c`) survive routing as a single segment and would traverse on
+        Windows. Hence the explicit `/`, `\\` and `..` rejections, plus a
+        post-resolve containment assertion as defense in depth.
+
+        Raises ValueError for any component that is empty or attempts to
+        escape the cache root.
+        """
+        for component in (video_id, file_name):
+            if (
+                not component
+                or ".." in component
+                or "/" in component
+                or "\\" in component
+            ):
+                raise ValueError("invalid thumbnail path component")
+
+        cache_root = self.cache_root.resolve()
+        candidate = (cache_root / video_id / file_name).resolve()
+        if not candidate.is_relative_to(cache_root):
+            raise ValueError("thumbnail path escapes cache root")
+        return candidate
 
     def _sample_times(self, *, start: float, end: float, count: int) -> list[float]:
         duration = max(0.1, end - start)

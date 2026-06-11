@@ -336,7 +336,17 @@ def get_video_thumbnails(
 
 @thumbnail_router.get("/{video_id}/{file_name}")
 def get_thumbnail_file(video_id: str, file_name: str):
-    path = get_thumbnail_service().resolve_file(video_id, file_name)
+    try:
+        path = get_thumbnail_service().resolve_file(video_id, file_name)
+    except ValueError:
+        # Traversal attempt (e.g. `..%5c` sequences). Respond identically to
+        # a missing thumbnail so the rejection leaks nothing about the FS.
+        logger.warning(
+            "get_thumbnail_file rejected suspicious path video_id=%r file_name=%r",
+            video_id,
+            file_name,
+        )
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail not found")
     return FileResponse(path)
