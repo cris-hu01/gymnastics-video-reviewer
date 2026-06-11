@@ -91,3 +91,6 @@ desktop-app/planning/
 desktop-app/backend/experiments/
 专利交底书/
 测试/
+
+# Claude Code 本地配置
+.claude/
