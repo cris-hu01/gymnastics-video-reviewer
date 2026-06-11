@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+from .media_binaries import resolve_ffmpeg_path
 from .models import CandidateClip, ClipSegment, DetectionBlock, ProjectState, VideoTask, new_id, utc_now_iso
 
 
@@ -122,9 +123,23 @@ class DetectionService:
                 api_key=api_key,
             )
             video_info = self._get_video_info(video.file_path)
-            frames, frame_times = self._extract_all_frames(
-                video.file_path,
-                settings.sampling_interval,
+            sample_interval = settings.sampling_interval
+            total_samples_hint = (
+                int(max(0, video_info["duration"] // sample_interval))
+                if sample_interval > 0
+                else 0
+            )
+
+            # Streaming decode + precheck: frames are pulled one at a time and
+            # only the small bottom-strip regions that pass precheck are kept.
+            # The full sampled frame set is never materialised — peak memory
+            # scales with the number of passing candidates, not the video.
+            candidates, total_samples = self._stream_precheck_candidates(
+                video_path=video.file_path,
+                sample_interval=sample_interval,
+                start_seconds=0,
+                end_seconds=None,
+                skip_check=False,
                 cancel_requested=cancel_requested,
                 progress_callback=lambda completed, total: self._emit(
                     progress_callback,
@@ -133,20 +148,11 @@ class DetectionService:
                     completed=completed,
                     total=total,
                 ),
+                total_samples_hint=total_samples_hint,
             )
-            if not frames:
+            if total_samples == 0:
                 raise RuntimeError("无法读取视频帧")
-            total_samples = len(frames)
 
-            self._ensure_not_cancelled(cancel_requested)
-            candidates = self._precheck_candidates(
-                frames=frames,
-                frame_times=frame_times,
-                start_seconds=0,
-                end_seconds=None,
-                skip_check=False,
-                cancel_requested=cancel_requested,
-            )
             precheck_passed = len(candidates)
             self._emit(
                 progress_callback,
@@ -155,8 +161,6 @@ class DetectionService:
                 total_samples=total_samples,
                 precheck_passed=precheck_passed,
             )
-            frames.clear()
-            frame_times.clear()
 
             detections = self._run_ai_detection(
                 client=client,
@@ -350,42 +354,87 @@ class DetectionService:
             "duration": duration,
         }
 
-    def _extract_all_frames(
+    def _should_use_ffmpeg(self) -> bool:
+        """Decide whether to use the ffmpeg streaming path.
+
+        ffmpeg is the **default** because it decodes sequentially at a low
+        sample fps and downscales to 540p — far cheaper in memory and faster
+        than OpenCV's seek-per-sample, full-resolution reads. cv2 is the
+        fallback when ffmpeg is unavailable or fails mid-stream.
+
+        ``DET_FFMPEG_EXTRACT`` forces a path: ``1`` → ffmpeg, ``0`` → cv2.
+        Unset → ffmpeg if the binary resolves, else cv2.
+        """
+        forced = os.environ.get("DET_FFMPEG_EXTRACT")
+        if forced == "1":
+            return True
+        if forced == "0":
+            return False
+        try:
+            resolve_ffmpeg_path()
+        except Exception:  # noqa: BLE001 — any resolution failure → cv2 fallback
+            return False
+        return True
+
+    def _iter_sampled_frames(
         self,
         video_path: str,
         sample_interval: float,
         cancel_requested: CancelRequestedCallback | None = None,
-        progress_callback: ExtractProgressCallback | None = None,
-    ) -> tuple[list[np.ndarray], list[float]]:
-        if os.environ.get("DET_FFMPEG_EXTRACT") == "1":
-            try:
-                return self._extract_all_frames_ffmpeg(
-                    video_path,
-                    sample_interval,
-                    cancel_requested=cancel_requested,
-                    progress_callback=progress_callback,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[detection] ffmpeg extraction failed, falling back to cv2: {exc}", flush=True)
+    ):
+        """Yield ``(time_sec, frame)`` one at a time, never materialising the
+        full sampled set in memory.
 
+        Default path is ffmpeg (540p, sequential). If ffmpeg is unavailable
+        the cv2 path is used directly; if ffmpeg fails *before producing any
+        frame*, we transparently fall back to cv2. Per-frame cancellation is
+        preserved in both paths.
+        """
+        if self._should_use_ffmpeg():
+            produced = 0
+            try:
+                for item in self._iter_sampled_frames_ffmpeg(
+                    video_path, sample_interval, cancel_requested=cancel_requested
+                ):
+                    produced += 1
+                    yield item
+                return
+            except DetectionCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if produced > 0:
+                    # Already streamed partial output downstream — cannot safely
+                    # restart from cv2 without double-counting. Re-raise.
+                    raise
+                print(
+                    f"[detection] ffmpeg extraction failed, falling back to cv2: {exc}",
+                    flush=True,
+                )
+
+        yield from self._iter_sampled_frames_cv2(
+            video_path, sample_interval, cancel_requested=cancel_requested
+        )
+
+    def _iter_sampled_frames_cv2(
+        self,
+        video_path: str,
+        sample_interval: float,
+        cancel_requested: CancelRequestedCallback | None = None,
+    ):
+        """cv2 fallback: seek to each sample timestamp and yield the full-res
+        BGR frame. Memory stays flat because callers consume one frame at a
+        time (precheck keeps only the small bottom strip)."""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return [], []
+            return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps
         sample_times = np.arange(0, duration, sample_interval)
-        total_samples = int(len(sample_times))
-
-        frames: list[np.ndarray] = []
-        frame_times: list[float] = []
-
-        if progress_callback is not None and total_samples > 0:
-            progress_callback(0, total_samples)
 
         try:
-            for index, time_sec in enumerate(sample_times, start=1):
+            for time_sec in sample_times:
                 self._ensure_not_cancelled(cancel_requested)
                 frame_number = int(time_sec * fps)
                 if frame_number >= total_frames:
@@ -393,26 +442,21 @@ class DetectionService:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
                 ret, frame = cap.read()
                 if ret:
-                    frames.append(frame)
-                    frame_times.append(float(time_sec))
-                if progress_callback is not None and (index % 30 == 0 or index == total_samples):
-                    progress_callback(index, total_samples)
+                    yield float(time_sec), frame
         finally:
             cap.release()
 
-        return frames, frame_times
-
-    def _extract_all_frames_ffmpeg(
+    def _iter_sampled_frames_ffmpeg(
         self,
         video_path: str,
         sample_interval: float,
         cancel_requested: CancelRequestedCallback | None = None,
-        progress_callback: ExtractProgressCallback | None = None,
-    ) -> tuple[list[np.ndarray], list[float]]:
+    ):
         """Use ffmpeg (hardware-accelerated when available) to decode frames
         sequentially at ``1/sample_interval`` fps, scaled so the short edge is
         540 px. Much faster than OpenCV's seek-per-sample approach on long
-        H.264/H.265 videos. Produces BGR24 raw frames on stdout.
+        H.264/H.265 videos. Yields ``(time_sec, frame)`` for each BGR24 raw
+        frame read off stdout — never accumulates them in a list.
         """
         info = self._get_video_info(video_path)
         src_w = int(info["resolution"].split("x")[0])
@@ -423,13 +467,9 @@ class DetectionService:
             target_w -= 1
         frame_bytes = target_w * target_h * 3
 
-        duration = info["duration"]
-        total_samples = int(max(0, duration // sample_interval))
-        if progress_callback is not None and total_samples > 0:
-            progress_callback(0, total_samples)
-
+        ffmpeg_bin = resolve_ffmpeg_path()
         cmd = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-hide_banner",
             "-loglevel",
             "error",
@@ -448,8 +488,6 @@ class DetectionService:
             "pipe:1",
         ]
 
-        frames: list[np.ndarray] = []
-        frame_times: list[float] = []
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert proc.stdout is not None
         try:
@@ -459,12 +497,13 @@ class DetectionService:
                 buf = proc.stdout.read(frame_bytes)
                 if not buf or len(buf) < frame_bytes:
                     break
-                frame = np.frombuffer(buf, dtype=np.uint8).reshape((target_h, target_w, 3)).copy()
-                frames.append(frame)
-                frame_times.append(float(index * sample_interval))
+                frame = (
+                    np.frombuffer(buf, dtype=np.uint8)
+                    .reshape((target_h, target_w, 3))
+                    .copy()
+                )
+                yield float(index * sample_interval), frame
                 index += 1
-                if progress_callback is not None and total_samples > 0 and (index % 30 == 0 or index == total_samples):
-                    progress_callback(min(index, total_samples), total_samples)
         finally:
             try:
                 proc.stdout.close()
@@ -476,36 +515,64 @@ class DetectionService:
             err = (proc.stderr.read().decode("utf-8", "ignore") if proc.stderr else "").strip()
             raise RuntimeError(f"ffmpeg exited with {proc.returncode}: {err[:400]}")
 
-        return frames, frame_times
-
-    def _precheck_candidates(
+    def _stream_precheck_candidates(
         self,
-        frames: list[np.ndarray],
-        frame_times: list[float],
-        start_seconds: float,
-        end_seconds: float | None,
-        skip_check: bool,
+        video_path: str,
+        sample_interval: float,
+        start_seconds: float = 0.0,
+        end_seconds: float | None = None,
+        skip_check: bool = False,
         cancel_requested: CancelRequestedCallback | None = None,
-    ) -> list[tuple[float, np.ndarray]]:
+        progress_callback: ExtractProgressCallback | None = None,
+        total_samples_hint: int = 0,
+    ) -> tuple[list[tuple[float, np.ndarray]], int]:
+        """Decode-and-precheck in one streaming pass.
+
+        Pulls frames one at a time from :meth:`_iter_sampled_frames`, runs
+        :meth:`_quick_subtitle_check` on each, and retains **only** the small
+        bottom-strip regions of frames that pass precheck. Full-resolution
+        frames are released as soon as they are checked — no list of all
+        sampled frames is ever built, so peak memory scales with the number of
+        *passing* candidates (the small strips), not the whole video.
+
+        Returns ``(candidates, total_samples)`` where ``candidates`` is the
+        same ``list[(time_sec, bottom_region)]`` shape the AI stage expects.
+        """
         candidates: list[tuple[float, np.ndarray]] = []
+        total_samples = 0
 
-        for frame, time_sec in zip(frames, frame_times):
+        if progress_callback is not None and total_samples_hint > 0:
+            progress_callback(0, total_samples_hint)
+
+        for time_sec, frame in self._iter_sampled_frames(
+            video_path, sample_interval, cancel_requested=cancel_requested
+        ):
             self._ensure_not_cancelled(cancel_requested)
-            if time_sec < start_seconds:
-                continue
-            if end_seconds is not None and time_sec > end_seconds:
-                continue
+            total_samples += 1
 
-            if skip_check:
-                h = frame.shape[0]
-                candidates.append((time_sec, frame[int(h * 0.7) :, :].copy()))
-                continue
+            in_window = time_sec >= start_seconds and (
+                end_seconds is None or time_sec <= end_seconds
+            )
+            if in_window:
+                if skip_check:
+                    h = frame.shape[0]
+                    candidates.append((time_sec, frame[int(h * 0.7):, :].copy()))
+                else:
+                    has_subtitle, bottom_region = self._quick_subtitle_check(frame)
+                    if has_subtitle and bottom_region is not None:
+                        candidates.append((time_sec, bottom_region))
 
-            has_subtitle, bottom_region = self._quick_subtitle_check(frame)
-            if has_subtitle and bottom_region is not None:
-                candidates.append((time_sec, bottom_region))
+            if progress_callback is not None and (
+                total_samples % 30 == 0 or total_samples == total_samples_hint
+            ):
+                denom = max(total_samples_hint, total_samples)
+                progress_callback(total_samples, denom)
 
-        return candidates
+        if progress_callback is not None:
+            denom = max(total_samples_hint, total_samples, 1)
+            progress_callback(total_samples, denom)
+
+        return candidates, total_samples
 
     def _quick_subtitle_check(
         self,
