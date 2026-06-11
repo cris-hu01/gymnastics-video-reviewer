@@ -646,6 +646,11 @@ async function startBackend() {
 
   backendProcess = spawn(backendCommand.command, backendCommand.args, {
     cwd: backendRoot,
+    // Suppress the PyInstaller backend's console window on Windows (the backend
+    // is built --onedir with no --console/--windowed, so a packaged spawn would
+    // otherwise flash a cmd window). This is a strict no-op on macOS/Linux —
+    // libuv only consults windowsHide on win32 — so the mac build is unaffected.
+    windowsHide: true,
     stdio: 'inherit',
     env: {
       ...process.env,
