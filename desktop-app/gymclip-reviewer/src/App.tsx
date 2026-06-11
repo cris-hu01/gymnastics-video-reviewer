@@ -1547,12 +1547,23 @@ export default function App() {
     setClipSelectionBatch(clipIds, selectionState !== 'checked');
   }
 
-  function handleClipCardClick(clip: CandidateClip, event: React.MouseEvent<HTMLButtonElement>) {
+  async function handleClipCardClick(clip: CandidateClip, event: React.MouseEvent<HTMLButtonElement>) {
     if ((event.metaKey || event.ctrlKey) && isClipExportSelectable(clip.status)) {
       event.preventDefault();
       event.stopPropagation();
       toggleClipSelection(clip.id);
       return;
+    }
+    // Clicking another clip card switches the active clip; flush the pending
+    // trim edit first so the 800ms debounce isn't cancelled by the auto-save
+    // effect cleanup. Skip when clicking the already-active clip (no switch).
+    if (activeClip && clip.id !== activeClip.id) {
+      try {
+        await flushActiveSegmentEdits();
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
+        return;
+      }
     }
     setActiveVideoId(clip.video_id);
     setActiveClipId(clip.id);
@@ -1662,7 +1673,7 @@ export default function App() {
     syncVideoTime(nextTime, {force: true});
   }
 
-  function selectClipByOffset(offset: -1 | 1) {
+  async function selectClipByOffset(offset: -1 | 1) {
     const idx = filteredClips.findIndex((clip) => clip.id === activeClipId);
     if (idx < 0) {
       if (filteredClips[0]) {
@@ -1671,9 +1682,16 @@ export default function App() {
       return;
     }
     const nextClip = filteredClips[idx + offset];
-    if (nextClip) {
-      setActiveClipId(nextClip.id);
+    if (!nextClip) return;
+    // Flush the pending trim edit before ↑/↓ moves the active clip away, so the
+    // 800ms debounce isn't cancelled mid-flight by the auto-save effect cleanup.
+    try {
+      await flushActiveSegmentEdits();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
+      return;
     }
+    setActiveClipId(nextClip.id);
   }
 
   function togglePlayPause() {
@@ -2110,6 +2128,18 @@ export default function App() {
 
   async function handleStatusChange(clipId: string, status: ClipStatus) {
     if (guardClipMutation(clipId)) return;
+    // Flush any pending trim edit before switching away (Enter/Delete on the
+    // active clip would otherwise trigger the auto-save effect cleanup and
+    // silently drop the in-flight 800ms debounce). No-op when there is nothing
+    // pending or when this status change targets a non-active clip.
+    if (activeClip?.id === clipId) {
+      try {
+        await flushActiveSegmentEdits();
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
+        return;
+      }
+    }
     const currentIndex = filteredClips.findIndex((clip) => clip.id === clipId);
     const nextClipId = filteredClips[currentIndex + 1]?.id ?? filteredClips[currentIndex - 1]?.id ?? null;
 
