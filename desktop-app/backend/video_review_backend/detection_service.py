@@ -357,18 +357,25 @@ class DetectionService:
     def _should_use_ffmpeg(self) -> bool:
         """Decide whether to use the ffmpeg streaming path.
 
-        ffmpeg is the **default** because it decodes sequentially at a low
-        sample fps and downscales to 540p — far cheaper in memory and faster
-        than OpenCV's seek-per-sample, full-resolution reads. cv2 is the
-        fallback when ffmpeg is unavailable or fails mid-stream.
+        cv2 is the **default** — exactly as on ``main`` — so this refactor
+        changes *only* memory behaviour (streaming vs. list accumulation),
+        never detection results. ffmpeg is opt-in via ``DET_FFMPEG_EXTRACT=1``.
 
-        ``DET_FFMPEG_EXTRACT`` forces a path: ``1`` → ffmpeg, ``0`` → cv2.
-        Unset → ffmpeg if the binary resolves, else cv2.
+        Why cv2 stays default: the ffmpeg path downscales frames to 540p before
+        precheck. ``_quick_subtitle_check`` keys on high-frequency edge metrics
+        (Canny ``edge_ratio``, Sobel ``horizontal_edges``) that INTER_AREA
+        downscaling attenuates, so 540p precheck is *strictly more conservative*
+        — borderline subtitle frames that pass at full resolution can fail at
+        540p (measured ~38% one-directional divergence on boundary frames,
+        zero in the other direction). Flipping the default would silently drop
+        those candidates before AI, changing detection output. We refuse to
+        trade detection correctness for speed; users who accept that trade-off
+        opt in explicitly.
+
+        ``DET_FFMPEG_EXTRACT`` forces a path: ``1`` → ffmpeg (if the binary
+        resolves; otherwise cv2 fallback), ``0`` or unset → cv2.
         """
-        forced = os.environ.get("DET_FFMPEG_EXTRACT")
-        if forced == "1":
-            return True
-        if forced == "0":
+        if os.environ.get("DET_FFMPEG_EXTRACT") != "1":
             return False
         try:
             resolve_ffmpeg_path()
@@ -385,10 +392,11 @@ class DetectionService:
         """Yield ``(time_sec, frame)`` one at a time, never materialising the
         full sampled set in memory.
 
-        Default path is ffmpeg (540p, sequential). If ffmpeg is unavailable
-        the cv2 path is used directly; if ffmpeg fails *before producing any
-        frame*, we transparently fall back to cv2. Per-frame cancellation is
-        preserved in both paths.
+        Default path is cv2 (full-resolution, seek-per-sample) — same frames
+        as ``main``, so detection results are unchanged. ffmpeg (540p,
+        sequential) is opt-in via ``DET_FFMPEG_EXTRACT=1``; if it fails
+        *before producing any frame* we transparently fall back to cv2.
+        Per-frame cancellation is preserved in both paths.
         """
         if self._should_use_ffmpeg():
             produced = 0

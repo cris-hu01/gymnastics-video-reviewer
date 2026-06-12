@@ -659,19 +659,25 @@ class TestStreamPrecheckCandidates:
 
 
 class TestFfmpegDefaultCv2Fallback:
-    """ffmpeg is the default extraction path; cv2 is the fallback. Env
-    DET_FFMPEG_EXTRACT forces a specific path."""
+    """cv2 is the DEFAULT extraction path (same frames as ``main`` → unchanged
+    detection results). ffmpeg (540p) is opt-in via ``DET_FFMPEG_EXTRACT=1``,
+    because 540p downscaling makes precheck strictly more conservative and
+    would silently drop borderline subtitle candidates if it were the default.
+    """
 
-    def test_ffmpeg_is_default_when_binary_resolves(self, monkeypatch):
+    def test_cv2_is_default_even_when_ffmpeg_binary_resolves(self, monkeypatch):
+        """Contract: with no env override, cv2 is used even if ffmpeg exists.
+        Flipping this default would change detection output (see precision
+        rationale in ``_should_use_ffmpeg`` docstring)."""
         monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
         service = DetectionService()
         with patch(
             "video_review_backend.detection_service.resolve_ffmpeg_path",
             return_value="/usr/bin/ffmpeg",
         ):
-            assert service._should_use_ffmpeg() is True
+            assert service._should_use_ffmpeg() is False
 
-    def test_falls_back_to_cv2_when_ffmpeg_unavailable(self, monkeypatch):
+    def test_cv2_is_default_when_ffmpeg_unavailable(self, monkeypatch):
         monkeypatch.delenv("DET_FFMPEG_EXTRACT", raising=False)
         service = DetectionService()
         with patch(
@@ -680,11 +686,25 @@ class TestFfmpegDefaultCv2Fallback:
         ):
             assert service._should_use_ffmpeg() is False
 
-    def test_env_forces_ffmpeg(self, monkeypatch):
+    def test_env_forces_ffmpeg_when_binary_resolves(self, monkeypatch):
         monkeypatch.setenv("DET_FFMPEG_EXTRACT", "1")
         service = DetectionService()
-        # even if resolution would be checked, "1" short-circuits to True
-        assert service._should_use_ffmpeg() is True
+        # opt-in: "1" selects ffmpeg, but only if the binary actually resolves
+        with patch(
+            "video_review_backend.detection_service.resolve_ffmpeg_path",
+            return_value="/usr/bin/ffmpeg",
+        ):
+            assert service._should_use_ffmpeg() is True
+
+    def test_env_ffmpeg_opt_in_falls_back_to_cv2_when_binary_missing(self, monkeypatch):
+        """Even with DET_FFMPEG_EXTRACT=1, an unresolvable binary → cv2."""
+        monkeypatch.setenv("DET_FFMPEG_EXTRACT", "1")
+        service = DetectionService()
+        with patch(
+            "video_review_backend.detection_service.resolve_ffmpeg_path",
+            side_effect=RuntimeError("ffmpeg 未安装"),
+        ):
+            assert service._should_use_ffmpeg() is False
 
     def test_env_forces_cv2(self, monkeypatch):
         monkeypatch.setenv("DET_FFMPEG_EXTRACT", "0")
@@ -695,6 +715,45 @@ class TestFfmpegDefaultCv2Fallback:
             return_value="/usr/bin/ffmpeg",
         ):
             assert service._should_use_ffmpeg() is False
+
+    def test_540p_precheck_is_no_less_conservative_than_full_res(self):
+        """Locks the precision rationale for keeping cv2 default: downscaling a
+        frame to the ffmpeg target (540p short edge) must never turn a
+        precheck FAIL into a PASS. The risky direction (pass→fail, i.e. silently
+        dropping a real candidate) is exactly why ffmpeg is opt-in, not default.
+        This asserts the *safe* invariant: 540p never invents candidates."""
+        import cv2  # local import; module already depends on cv2
+
+        service = DetectionService()
+        rng = np.random.default_rng(7)
+        full_pass_540_fail = 0
+        full_fail_540_pass = 0
+        for trial in range(120):
+            sw, sh = 1920, 1080
+            frame = rng.integers(0, 40, (sh, sw, 3)).astype(np.uint8)
+            y0 = int(sh * 0.75)
+            n = int(sw * (sh - y0) * rng.uniform(0.004, 0.045) / 4)
+            ys = rng.integers(y0, sh, n)
+            xs = rng.integers(0, sw, n)
+            frame[ys, xs] = rng.integers(80, 255, (n, 3))
+
+            has_full, _ = service._quick_subtitle_check(frame)
+            th = 540
+            tw = int(round(sw * th / sh))
+            tw -= tw % 2
+            small = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA)
+            has_small, _ = service._quick_subtitle_check(small)
+
+            if has_full and not has_small:
+                full_pass_540_fail += 1
+            elif has_small and not has_full:
+                full_fail_540_pass += 1
+
+        # 540p must never PASS something full-res rejected (no phantom candidates)
+        assert full_fail_540_pass == 0
+        # and the conservative direction does occur — proving the two paths are
+        # NOT interchangeable, justifying cv2-as-default
+        assert full_pass_540_fail > 0
 
     def test_iter_falls_back_to_cv2_when_ffmpeg_fails_before_first_frame(
         self, monkeypatch
