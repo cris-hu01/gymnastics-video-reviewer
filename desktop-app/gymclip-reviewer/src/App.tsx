@@ -1493,8 +1493,10 @@ export default function App() {
     // Undo restores a different clip structure (a switch-away). Flush any
     // pending trim edit through the same serializer first, so an in-flight
     // 800ms debounce isn't dropped by the upcoming activeClip change. Bail only
-    // on re-entrancy; a flush failure still lets undo proceed (must-fix 2).
-    if (!(await flushTrimBeforeSwitch())) return;
+    // on re-entrancy; a flush failure still lets undo proceed (must-fix 2), and
+    // we keep its "unsaved trim" notice visible instead of wiping it (R3 #2).
+    const {proceed, flushFailed} = await flushTrimBeforeSwitch();
+    if (!proceed) return; // re-entrant: guard owned elsewhere, don't release
 
     try {
       const response = await restoreCandidateClips(snapshot.candidateClips);
@@ -1505,10 +1507,20 @@ export default function App() {
         ? response.project.candidate_clips.find((clip) => clip.id === snapshot.activeClipId) ?? null
         : null;
       setActiveVideoId(restoredClip?.video_id ?? activeVideoId);
-      setErrorMessage(null);
-      setSuccessMessage('已撤销上一步结构编辑');
+      // Toast is single-slot and the success effect itself clears errorMessage,
+      // so when the trim flush failed we surface the "unsaved trim" notice and
+      // skip the success toast (the dropped edit is the more important signal —
+      // R3 #2). Otherwise show the normal undo-success toast.
+      if (flushFailed) {
+        setErrorMessage('裁剪范围未保存（保存失败），已撤销结构编辑');
+      } else {
+        setErrorMessage(null);
+        setSuccessMessage('已撤销上一步结构编辑');
+      }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '撤销失败');
+    } finally {
+      releaseSwitchGuard();
     }
   }
 
@@ -1576,29 +1588,42 @@ export default function App() {
 
   /**
    * Gate every "switch the active clip" entry point (Enter/Delete mark, ↑/↓
-   * step, click another card) through this serializer.
+   * step, click another card, undo) through this serializer.
    *
-   * Returns `false` when a switch is already in flight — the caller must abort
-   * its switch (re-entrancy guard, must-fix 1). Returns `true` when the caller
-   * may proceed; by then any pending trim edit has been flushed to the backend.
+   * Acquires the switch guard and flushes any pending trim edit. The caller
+   * decides what to do from `proceed`:
+   *   - `proceed === false` → a switch is already in flight; this call did NOT
+   *     acquire the guard. The caller MUST abort its switch and MUST NOT release
+   *     the guard (it belongs to the other in-flight switch). (must-fix 1)
+   *   - `proceed === true` → this call acquired the guard. The caller MUST run
+   *     its switch and then release the guard via `releaseSwitchGuard()` in a
+   *     `finally`, so the guard stays held until `setActiveClipId` is committed
+   *     — covering the whole critical section, not just the flush (R3 #1).
    *
    * Switching is prioritized over trim saving (must-fix 2): if the flush throws
-   * (network blip, backend validation), we DON'T block the switch — we surface
-   * a non-blocking notice and still return `true`, so the user is never locked
-   * onto one clip. A dropped trim the user is told about beats a frozen queue.
+   * we DON'T block the switch — we post a non-blocking notice and return
+   * `proceed: true` with `flushFailed: true`. The caller keeps that notice
+   * visible (must not let a later `setErrorMessage(null)` wipe it — R3 #2).
    */
-  async function flushTrimBeforeSwitch(): Promise<boolean> {
-    if (isSwitchingRef.current) return false;
+  async function flushTrimBeforeSwitch(): Promise<{proceed: boolean; flushFailed: boolean}> {
+    if (isSwitchingRef.current) return {proceed: false, flushFailed: false};
     isSwitchingRef.current = true;
     try {
       await flushActiveSegmentEdits();
+      return {proceed: true, flushFailed: false};
     } catch (error) {
       const reason = error instanceof Error ? error.message : '未知错误';
       setErrorMessage(`裁剪范围未保存（${reason}），已切换片段`);
-    } finally {
-      isSwitchingRef.current = false;
+      return {proceed: true, flushFailed: true};
     }
-    return true;
+    // NOTE: no finally-release here. The guard is released by the caller AFTER
+    // it commits the switch (releaseSwitchGuard), so the guard's lifetime spans
+    // the whole flush→switch critical section. If the flush itself rejects we
+    // still return proceed:true above, so the caller's finally always releases.
+  }
+
+  function releaseSwitchGuard() {
+    isSwitchingRef.current = false;
   }
 
   async function handleClipCardClick(clip: CandidateClip, event: React.MouseEvent<HTMLButtonElement>) {
@@ -1612,7 +1637,15 @@ export default function App() {
     // trim edit first so the 800ms debounce isn't cancelled by the auto-save
     // effect cleanup. Skip when clicking the already-active clip (no switch).
     if (activeClip && clip.id !== activeClip.id) {
-      if (!(await flushTrimBeforeSwitch())) return;
+      const {proceed} = await flushTrimBeforeSwitch();
+      if (!proceed) return; // re-entrant: guard owned elsewhere, don't release
+      try {
+        setActiveVideoId(clip.video_id);
+        setActiveClipId(clip.id);
+      } finally {
+        releaseSwitchGuard();
+      }
+      return;
     }
     setActiveVideoId(clip.video_id);
     setActiveClipId(clip.id);
@@ -1726,7 +1759,8 @@ export default function App() {
     // Re-entrancy guard FIRST: a rapid second ↑/↓ arriving while the previous
     // switch's flush is still in flight must be ignored here, before we read
     // activeClipId (still un-updated) and compute a stale nextClip that would
-    // only jump one grid. flushTrimBeforeSwitch returns false in that case.
+    // only jump one grid. (flushTrimBeforeSwitch would also return proceed:false
+    // here, but bailing early avoids computing a stale candidate at all.)
     if (isSwitchingRef.current) return;
     const idx = filteredClips.findIndex((clip) => clip.id === activeClipId);
     if (idx < 0) {
@@ -1739,8 +1773,13 @@ export default function App() {
     if (!nextClip) return;
     // Flush the pending trim edit before ↑/↓ moves the active clip away, so the
     // 800ms debounce isn't cancelled mid-flight by the auto-save effect cleanup.
-    if (!(await flushTrimBeforeSwitch())) return;
-    setActiveClipId(nextClip.id);
+    const {proceed} = await flushTrimBeforeSwitch();
+    if (!proceed) return; // re-entrant: guard owned elsewhere, don't release
+    try {
+      setActiveClipId(nextClip.id);
+    } finally {
+      releaseSwitchGuard();
+    }
   }
 
   function togglePlayPause() {
@@ -2182,14 +2221,19 @@ export default function App() {
     // and silently drop the in-flight 800ms debounce). Only when this targets
     // the active clip; no-op when nothing is pending.
     //
-    // flushTrimBeforeSwitch returns false ONLY for re-entrancy (a switch is
-    // already in flight) — in that case bail so we don't double-mark/double-
-    // switch racing the first press (must-fix 1). It NEVER returns false for a
-    // flush failure: on failure it surfaces a notice and returns true, so the
-    // mark — the primary action the user pressed Enter for — still proceeds and
-    // is never swallowed by a trim-save error (must-fix 2).
+    // proceed===false ONLY for re-entrancy (a switch already in flight) — bail
+    // so we don't double-mark/double-switch racing the first press (must-fix 1).
+    // proceed stays true on flush failure: the mark — the primary action the
+    // user pressed Enter for — still runs and is never swallowed by a trim-save
+    // error (must-fix 2). flushFailed tells us to KEEP the "unsaved trim" notice
+    // visible, i.e. NOT wipe it with setErrorMessage(null) below (R3 #2).
+    let flushFailed = false;
+    let acquiredGuard = false;
     if (activeClip?.id === clipId) {
-      if (!(await flushTrimBeforeSwitch())) return;
+      const result = await flushTrimBeforeSwitch();
+      if (!result.proceed) return; // re-entrant: guard owned elsewhere
+      acquiredGuard = true;
+      flushFailed = result.flushFailed;
     }
     const currentIndex = filteredClips.findIndex((clip) => clip.id === clipId);
     const nextClipId = filteredClips[currentIndex + 1]?.id ?? filteredClips[currentIndex - 1]?.id ?? null;
@@ -2200,9 +2244,15 @@ export default function App() {
       if (nextClipId) {
         setActiveClipId(nextClipId);
       }
-      setErrorMessage(null);
+      // Preserve the "裁剪范围未保存…" notice when the trim flush failed; only
+      // clear stale errors when nothing needed surfacing (R3 #2).
+      if (!flushFailed) {
+        setErrorMessage(null);
+      }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '更新片段状态失败');
+    } finally {
+      if (acquiredGuard) releaseSwitchGuard();
     }
   }
 
