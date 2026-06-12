@@ -406,3 +406,42 @@ async def export_project(request: Request):
         job.id, operation, len(selected_clips),
     )
     return {"job": job.to_dict(), "project": project_payload(state)}
+
+
+@router.post("/cancel-export")
+def cancel_export():
+    """Cancel the in-flight export job.
+
+    PR5 wired the cancellation primitives (ExportCancelledError + per-clip /
+    per-upload boundary checks) but never exposed an HTTP entrypoint, so the
+    cancel path was dead code. Mirrors videos.py::cancel_detect: a queued job is
+    cancelled outright; a running job gets a cooperative cancel flag that the
+    export runner observes at the next clip/upload boundary.
+    """
+    export_jobs = [
+        job
+        for job in export_job_manager.list_jobs()
+        if job.kind == "export" and job.status in {"queued", "running"}
+    ]
+    if not export_jobs:
+        raise HTTPException(status_code=409, detail="当前没有可取消的导出任务")
+
+    # Prefer a queued job (cancellable outright) over a running one, mirroring
+    # videos.py::cancel_detect. has_active_job normally keeps this to a single
+    # export job, but preferring queued keeps the choice deterministic.
+    target = next(
+        (job for job in export_jobs if job.status == "queued"), export_jobs[0]
+    )
+    requested = export_job_manager.request_cancel(target.id)
+    if requested is None:
+        raise HTTPException(status_code=409, detail="导出任务状态已变化，请刷新后重试")
+
+    logger.info(
+        "cancel_export requested job=%s status=%s", target.id, requested.status
+    )
+    message = (
+        "已取消排队中的导出任务"
+        if requested.status == "cancelled"
+        else "已请求取消导出任务"
+    )
+    return {"job": requested.to_dict(), "message": message}

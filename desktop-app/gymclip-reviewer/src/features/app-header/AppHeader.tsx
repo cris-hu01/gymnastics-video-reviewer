@@ -180,6 +180,7 @@ export interface AppHeaderProps {
   exportApi: ExportJobsApi;
   hasOssCredentials: boolean;
   activeExportJob: AppJob | null;
+  onCancelExport: () => void;
 }
 
 export function AppHeader(props: AppHeaderProps) {
@@ -209,6 +210,7 @@ export function AppHeader(props: AppHeaderProps) {
     exportApi,
     hasOssCredentials,
     activeExportJob,
+    onCancelExport,
   } = props;
   const {
     isImporting,
@@ -386,6 +388,22 @@ export function AppHeader(props: AppHeaderProps) {
           <Download size={16} />
           {activeExportJob ? '导出中...' : '导出片段'}
         </button>
+        {activeExportJob ? (
+          <button
+            data-testid="export-cancel"
+            onClick={onCancelExport}
+            disabled={activeExportJob.progress?.stage === 'cancel_requested'}
+            title={
+              activeExportJob.progress?.stage === 'cancel_requested'
+                ? '正在取消导出...'
+                : '取消当前导出任务'
+            }
+            className="h-10 px-3 py-1.5 text-sm rounded-lg border border-red-300 bg-white hover:bg-red-50 text-red-600 font-medium flex items-center justify-center gap-1.5 whitespace-nowrap shadow-sm transition-colors disabled:opacity-50"
+          >
+            <XCircle size={16} />
+            {activeExportJob.progress?.stage === 'cancel_requested' ? '取消中...' : '取消导出'}
+          </button>
+        ) : null}
       </div>
     </header>
   );
