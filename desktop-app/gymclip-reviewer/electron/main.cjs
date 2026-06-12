@@ -1,9 +1,10 @@
-const { app, BrowserWindow, Notification, dialog, ipcMain, safeStorage } = require('electron');
+const { app, BrowserWindow, Notification, dialog, ipcMain, safeStorage, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { pathToFileURL } = require('node:url');
 const { autoUpdater } = require('electron-updater');
 
 // Ensure hardware-accelerated video decode for smooth scrubbing
@@ -176,6 +177,14 @@ const BACKEND_HOST = '127.0.0.1';
 const BACKEND_PORT = process.env.GYMCLIP_BACKEND_PORT || '8000';
 const RENDERER_URL = process.env.ELECTRON_RENDERER_URL || null;
 const BACKEND_START_TIMEOUT_MS = Number(process.env.GYMCLIP_BACKEND_START_TIMEOUT_MS || 60000);
+
+// === Local API token (security hardening) ===
+// Fresh random token per app launch. Injected into the spawned backend via
+// GYMCLIP_API_TOKEN; the renderer fetches it over IPC (auth:get-api-token)
+// before mounting React, and attaches it to every /api request as the
+// X-Gymclip-Token header (or `?token=` for <video>/<img> media URLs).
+const API_TOKEN = crypto.randomBytes(32).toString('hex');
+const API_TOKEN_HEADER = 'X-Gymclip-Token';
 
 let backendProcess = null;
 
@@ -565,7 +574,9 @@ function waitForHealth(url, timeoutMs = BACKEND_START_TIMEOUT_MS) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const request = http.get(url, (response) => {
+      // /api/health requires the token once the backend runs with
+      // GYMCLIP_API_TOKEN set (which we always inject on spawn).
+      const request = http.get(url, { headers: { [API_TOKEN_HEADER]: API_TOKEN } }, (response) => {
         response.resume();
         if (response.statusCode === 200) {
           resolve();
@@ -594,7 +605,10 @@ function waitForHealth(url, timeoutMs = BACKEND_START_TIMEOUT_MS) {
 
 function requestJson(url, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
-    const request = http.get(url, (response) => {
+    // Sent for all main-process probes. /openapi.json sits outside the /api
+    // prefix so it is exempt from the token check anyway — the header is
+    // harmless there and future-proofs any /api probe added later.
+    const request = http.get(url, { headers: { [API_TOKEN_HEADER]: API_TOKEN } }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => {
         chunks.push(chunk);
@@ -665,6 +679,7 @@ async function startBackend() {
       GYMCLIP_OSSUTIL_PATH: resolveOssToolPath(),
       GYMCLIP_USER_ID: tcfg.userId,
       GYMCLIP_TELEMETRY_ENABLED: tcfg.telemetryEnabled ? '1' : '0',
+      GYMCLIP_API_TOKEN: API_TOKEN,
     },
   });
 
@@ -678,6 +693,48 @@ async function startBackend() {
   await waitForHealth(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/health`);
   await ensureBackendCompatibility();
 }
+
+// === Navigation guards (security hardening) ===
+// The renderer must never navigate away from the app's own entry point, and
+// window.open must never spawn an in-app browser. External http(s) links are
+// handed to the OS default browser instead.
+function isAllowedAppNavigation(url) {
+  if (RENDERER_URL) {
+    // dev: compare full origins, not a string prefix. `startsWith(RENDERER_URL)`
+    // would let `http://localhost:3000.evil.com/...` through; origin equality
+    // does not. Malformed URLs throw in the URL ctor -> treated as disallowed.
+    try {
+      if (new URL(url).origin === new URL(RENDERER_URL).origin) {
+        return true; // vite renderer (incl. HMR reloads)
+      }
+    } catch (_) {
+      return false;
+    }
+  }
+  // Packaged: only the bundled dist/index.html file URL (allow ?query/#hash).
+  const entryUrl = pathToFileURL(resolveRendererEntry()).href;
+  return url === entryUrl || url.startsWith(`${entryUrl}?`) || url.startsWith(`${entryUrl}#`);
+}
+
+app.on('web-contents-created', (_event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  contents.on('will-navigate', (event, url) => {
+    if (isAllowedAppNavigation(url)) {
+      return;
+    }
+    event.preventDefault();
+    if (/^https?:\/\//i.test(url)) {
+      void shell.openExternal(url);
+    }
+  });
+});
+// === end Navigation guards ===
 
 async function createMainWindow() {
   await startBackend();
@@ -831,6 +888,7 @@ ipcMain.handle('autoUpdater:quit-and-install', () => {
 });
 // === end Auto-updater ===
 
+ipcMain.handle('auth:get-api-token', () => API_TOKEN);
 ipcMain.handle('telemetry:get-config', () => getTelemetryConfig());
 ipcMain.handle('telemetry:set-consent', (_event, enabled) => setTelemetryConsent(enabled));
 ipcMain.handle('settings:load-api-key', () => loadSavedApiKey());

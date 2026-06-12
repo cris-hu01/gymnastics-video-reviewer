@@ -3,10 +3,11 @@ import type {
   ProjectResponse,
   ThumbnailResponse,
 } from '../types';
-import {API_BASE_URL, request} from './http';
+import {buildMediaUrl, request} from './http';
 
 export function getVideoStreamUrl(videoId: string): string {
-  return `${API_BASE_URL}/api/videos/${videoId}/stream`;
+  // <video> src cannot carry headers — buildMediaUrl appends ?token=.
+  return buildMediaUrl(`/api/videos/${videoId}/stream`);
 }
 
 export async function cancelDetectVideo(videoId: string): Promise<CancelDetectResponse> {

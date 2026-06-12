@@ -12,7 +12,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "npm run dev:web",
-    "dev:web": "vite --port=3000 --host=0.0.0.0",
+    "dev:web": "vite --port=3000 --strictPort --host=0.0.0.0",
     "build": "npm run build:web",
     "build:web": "vite build",
     "build:backend": "node electron/scripts/build-backend.cjs",

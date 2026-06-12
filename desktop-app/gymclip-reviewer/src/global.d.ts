@@ -4,6 +4,10 @@ declare global {
   interface Window {
     gymclipDesktop?: {
       isDesktop: boolean;
+      // Local API auth: per-launch token from the Electron main process.
+      // Optional so an older preload paired with a newer renderer degrades
+      // to no-auth instead of crashing.
+      getApiToken?: () => Promise<string>;
       loadApiKey: () => Promise<{ supported: boolean; apiKey: string | null }>;
       saveApiKey: (apiKey: string) => Promise<{ supported: boolean }>;
       clearApiKey: () => Promise<{ supported: boolean }>;
