@@ -75,6 +75,7 @@ export function PlayerSurface({
 
   const pendingSeek = useStore((s) => s.pendingSeek);
   const isPlaying = useStore((s) => s.isPlaying);
+  const playbackRate = useStore((s) => s.playbackRate);
   const setCurrentTimeMs = useStore((s) => s.setCurrentTimeMs);
   const setDuration = useStore((s) => s.setDuration);
   const setIsPlaying = useStore((s) => s.setIsPlaying);
@@ -177,6 +178,18 @@ export function PlayerSurface({
       }
     }
   }, [isPlaying, setIsPlaying]);
+
+  // Command: mirror playbackRate onto the <video> element. Re-runs on
+  // streamUrl change too because loading a fresh src resets the element's
+  // playbackRate to 1, and the store may still carry a non-1 rate the user set
+  // before the swap (though setVideoId resets it to 1 in the normal flow).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.playbackRate !== playbackRate) {
+      video.playbackRate = playbackRate;
+    }
+  }, [playbackRate, streamUrl]);
 
   // Reset our nonce tracker whenever the src changes — the <video> at
   // streamUrl B has no relationship to seek commands meant for A.

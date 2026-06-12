@@ -54,6 +54,14 @@ export interface PlatformMatchPanelProps {
   videoScopedPlatformRecords: PlatformRecord[];
   filteredPlatformRecords: PlatformRecord[];
   groupedPlatformRecords: PlatformMatchGroup[];
+  /**
+   * id → 1-9 number-key badge, computed in App from the same render-order
+   * bindable list the global digit handler uses. Passing it in (rather than
+   * recomputing here from filteredPlatformRecords) is what guarantees
+   * "badge N" == "the card digit N binds" even when several matches/venues
+   * interleave and grouping reorders the visual list.
+   */
+  numberKeyIndexById: Map<string, number>;
   scoreApparatusOptions: ScoreFilterOption[];
   scoreSexOptions: ScoreFilterOption[];
   scoreCountryOptions: ScoreFilterOption[];
@@ -73,6 +81,7 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
     videoScopedPlatformRecords,
     filteredPlatformRecords,
     groupedPlatformRecords,
+    numberKeyIndexById,
     scoreApparatusOptions,
     scoreSexOptions,
     scoreCountryOptions,
@@ -94,6 +103,10 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
     openScoreFilter,
     setOpenScoreFilter,
   } = local;
+
+  // numberKeyIndexById (from App) maps card id → 1-9 badge. It is built from
+  // the render-order bindable list the global digit handler also uses, so the
+  // badge shown here is always the digit that binds that exact card.
 
   return (
     <aside className={`${activeClip ? 'w-[19rem] border-l border-gray-200' : 'w-0'} bg-white flex flex-col shrink-0 overflow-hidden transition-all duration-300`}>
@@ -126,8 +139,9 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
               <input
+                id="score-search-input"
                 type="text"
-                placeholder="搜索姓名或国家..."
+                placeholder="搜索姓名或国家... ( / )"
                 value={scoreSearchQuery}
                 onChange={(event) => setScoreSearchQuery(event.target.value)}
                 className="w-full bg-gray-100 border-transparent rounded-lg py-2 pl-9 pr-3 text-sm focus:outline-none focus:bg-white focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
@@ -203,6 +217,7 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
                       const isActive = activeClip.linked_platform_record_id === entry.id;
                       const isBound = entry.linked_clip_ids.length > 0;
                       const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
+                      const hotkeyNumber = numberKeyIndexById.get(entry.id);
                       const theme = bindingTheme(entry.id);
                       const linkedClipLabels = entry.linked_clip_ids
                         .map((clipId) => clipOrdinalById.get(clipId))
@@ -242,6 +257,14 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
                               <p className="text-[15px] font-semibold leading-5 text-gray-900 truncate">
+                                {hotkeyNumber != null && !isBoundElsewhere && !activeClipLockedByExport && (
+                                  <kbd
+                                    className="mr-1.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-gray-200 bg-gray-100 px-1 align-middle text-[10px] font-semibold leading-none text-gray-400"
+                                    title={`按 ${hotkeyNumber} 绑定此卡片`}
+                                  >
+                                    {hotkeyNumber}
+                                  </kbd>
+                                )}
                                 {entry.english_name || entry.user_name || '未命名'}
                               </p>
                               {entry.user_name && (

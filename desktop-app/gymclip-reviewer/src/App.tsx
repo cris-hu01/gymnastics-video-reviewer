@@ -131,6 +131,14 @@ const SEX_LABELS: Record<number, string> = {
 
 const CLIP_STEP = 0.2;
 const MIN_SEGMENT_DURATION = 0.5;
+// Single-frame step for Shift+←/→. The frontend has no per-video fps (the
+// backend reads CAP_PROP_FPS during detection but does not surface it in the
+// video metadata), so we fall back to a 30fps frame duration as specified.
+const FALLBACK_FPS = 30;
+const FRAME_DURATION = 1 / FALLBACK_FPS;
+// Playback-speed ladder cycled by [ and ]. 1× is the default; [ steps slower,
+// ] steps faster, clamped at the ends (no wrap-around).
+const PLAYBACK_RATE_PRESETS = [0.5, 1, 1.5, 2] as const;
 const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出完成前不可编辑';
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
 
@@ -294,6 +302,11 @@ export default function App() {
   const isPlaying = useStore((s) => s.isPlaying);
   const setIsPlayingStore = useStore((s) => s.setIsPlaying);
   const enqueueSeekStore = useStore((s) => s.enqueueSeek);
+  // No App-level `playbackRate` subscription on purpose: App reads the live
+  // value via getState() inside stepPlaybackRate, and the on-screen indicator
+  // lives in ReviewPanel. Subscribing here would re-render App on every [ / ]
+  // press, against the PR4 render-storm budget.
+  const setPlaybackRateStore = useStore((s) => s.setPlaybackRate);
   const [isSavingTrim, setIsSavingTrim] = useState(false);
   const [trimJustSaved, setTrimJustSaved] = useState(false);
   const [videoPlaybackError, setVideoPlaybackError] = useState<string | null>(null);
@@ -894,6 +907,38 @@ export default function App() {
     });
     return groups;
   }, [filteredPlatformRecords]);
+  // Single source of truth for the 1-9 number-key binding. The panel renders
+  // platform cards in groupedPlatformRecords order (regrouped by match→venue),
+  // which differs from the flat filteredPlatformRecords order when several
+  // matches/venues interleave. Flatten the groups in render order, keep only
+  // cards bindable to the active clip (no link, or already linked to it), and
+  // take the first nine. "角标 N" == "面板自上而下第 N 张可绑定卡" ==
+  // "按数字 N 绑定的卡" — all three read from THIS list. Both the digit handler
+  // and the panel's badge map derive from it; no second algorithm to drift.
+  const numberKeyBindableRecords = useMemo(() => {
+    const flat: PlatformRecord[] = [];
+    for (const matchGroup of groupedPlatformRecords) {
+      for (const venueGroup of matchGroup.venues) {
+        for (const record of venueGroup.records) {
+          const isBindable =
+            record.linked_clip_ids.length === 0 ||
+            (activeClipId != null && record.linked_clip_ids.includes(activeClipId));
+          if (isBindable) flat.push(record);
+          if (flat.length === 9) return flat;
+        }
+      }
+    }
+    return flat;
+  }, [groupedPlatformRecords, activeClipId]);
+  // id → 1-based hotkey number, handed to the panel so its badges match the
+  // handler exactly (same list, same order).
+  const numberKeyIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    numberKeyBindableRecords.forEach((record, index) => {
+      map.set(record.id, index + 1);
+    });
+    return map;
+  }, [numberKeyBindableRecords]);
   const activeScopeSummary = useMemo(() => {
     if (!activePlatformScope) {
       return {
@@ -1451,6 +1496,68 @@ export default function App() {
         return;
       }
 
+      // Frame-step: Shift+←/→ nudges the playhead by a single frame. Handled
+      // before the plain-arrow block below so the Shift variant wins over the
+      // ±1s seek bound to bare ArrowLeft/ArrowRight.
+      if (event.shiftKey && (event.code === 'ArrowLeft' || event.code === 'ArrowRight')) {
+        event.preventDefault();
+        seekRelative(event.code === 'ArrowLeft' ? -FRAME_DURATION : FRAME_DURATION);
+        return;
+      }
+
+      // The keys below (/, [, ], 1-9) must not hijack OS/app chords like
+      // Cmd+[ (back) or Cmd+1 (tab switch). Skip them when a command/control/
+      // alt modifier is held; plain presses fall through to their handlers.
+      const hasCommandModifier = event.metaKey || event.ctrlKey || event.altKey;
+
+      // Focus the score-search box for fuzzy lookup (剪辑软件 "/" 习惯). After
+      // focus the input's own typing is protected by the activeElement early
+      // return at the top of this handler, so subsequent keystrokes type
+      // normally instead of triggering shortcuts.
+      if (event.key === '/' && !hasCommandModifier && !event.shiftKey) {
+        event.preventDefault();
+        const searchInput = document.getElementById('score-search-input');
+        if (searchInput instanceof HTMLInputElement) {
+          searchInput.focus();
+          searchInput.select();
+        }
+        return;
+      }
+
+      // Playback speed ladder: [ slower, ] faster (no wrap, clamped at ends).
+      if ((event.key === '[' || event.key === ']') && !hasCommandModifier) {
+        event.preventDefault();
+        stepPlaybackRate(event.key === '[' ? -1 : 1);
+        return;
+      }
+
+      // Number keys 1-9 bind the Nth visible bindable platform card to the
+      // active clip. Source is numberKeyBindableRecords — the cards flattened
+      // in the panel's actual render order (groupedPlatformRecords, regrouped
+      // by match→venue), filtered to bindable, capped at 9. Using render order
+      // (not flat filteredPlatformRecords) keeps badge N == "面板第 N 张" ==
+      // the card this binds, even when several matches/venues interleave. This
+      // is also what makes vault same-name pairs selectable as 1/2 after a
+      // name search.
+      if (/^[1-9]$/.test(event.key) && !hasCommandModifier && !event.shiftKey) {
+        event.preventDefault();
+        if (activeClipLockedByExport) {
+          setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
+          return;
+        }
+        const index = Number(event.key) - 1;
+        const target = numberKeyBindableRecords[index];
+        if (!target) {
+          // Fewer than N bindable cards visible — ignore silently.
+          return;
+        }
+        // Toggle: pressing the number of the already-bound card unbinds it,
+        // matching the click behaviour on the card itself.
+        const alreadyBound = activeClip.linked_platform_record_id === target.id;
+        void handleBindScoreCard(alreadyBound ? null : target.id);
+        return;
+      }
+
       if (['Space', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.code) || event.key.toLowerCase() === 'enter') {
         event.preventDefault();
         if (event.key.toLowerCase() === 'enter') {
@@ -1520,6 +1627,30 @@ export default function App() {
           }
           updateTrimRange(trimStart, trimEnd + CLIP_STEP, 'end');
           break;
+        case 'i': {
+          // In point: set selection START to the current playhead (剪辑 In).
+          // updateTrimRange clamps start to end - CLIP_STEP, so an in-point at
+          // or past the end is absorbed instead of producing an invalid window.
+          if (activeClipLockedByExport) {
+            setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
+            break;
+          }
+          const playheadS = useStore.getState().currentTimeMs / 1000;
+          updateTrimRange(playheadS, trimEnd, 'start');
+          break;
+        }
+        case 'o': {
+          // Out point: set selection END to the current playhead (剪辑 Out).
+          // updateTrimRange clamps end to start + CLIP_STEP, absorbing an
+          // out-point at or before the start.
+          if (activeClipLockedByExport) {
+            setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
+            break;
+          }
+          const playheadS = useStore.getState().currentTimeMs / 1000;
+          updateTrimRange(trimStart, playheadS, 'end');
+          break;
+        }
         case 'b':
           if (activeClipLockedByExport) {
             setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
@@ -1546,7 +1677,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
+  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob, numberKeyBindableRecords]);
 
   function setProjectState(nextProject: ProjectState) {
     // PR4: every direct (user-initiated PATCH) write bumps the same write-seq
@@ -1883,6 +2014,25 @@ export default function App() {
     const currentS = useStore.getState().currentTimeMs / 1000;
     const nextTime = Math.max(trimStart, Math.min(trimEnd, currentS + offset));
     syncVideoTime(nextTime, {force: true});
+  }
+
+  // Step the playback-speed ladder by one notch. `direction` -1 = slower
+  // ([), +1 = faster (]). Clamps at the ends (no wrap). Reads the live store
+  // rate so rapid key repeats compose correctly even before React commits.
+  function stepPlaybackRate(direction: -1 | 1) {
+    if (!activeClip) return;
+    const current = useStore.getState().playbackRate;
+    // Find the nearest ladder index to the current rate, then move from there.
+    let idx = PLAYBACK_RATE_PRESETS.indexOf(current as (typeof PLAYBACK_RATE_PRESETS)[number]);
+    if (idx === -1) {
+      idx = PLAYBACK_RATE_PRESETS.reduce(
+        (best, rate, i) =>
+          Math.abs(rate - current) < Math.abs(PLAYBACK_RATE_PRESETS[best] - current) ? i : best,
+        0,
+      );
+    }
+    const nextIdx = Math.min(PLAYBACK_RATE_PRESETS.length - 1, Math.max(0, idx + direction));
+    setPlaybackRateStore(PLAYBACK_RATE_PRESETS[nextIdx]);
   }
 
   async function selectClipByOffset(offset: -1 | 1) {
@@ -2806,6 +2956,7 @@ export default function App() {
           videoScopedPlatformRecords={videoScopedPlatformRecords}
           filteredPlatformRecords={filteredPlatformRecords}
           groupedPlatformRecords={groupedPlatformRecords}
+          numberKeyIndexById={numberKeyIndexById}
           scoreApparatusOptions={scoreApparatusOptions}
           scoreSexOptions={scoreSexOptions}
           scoreCountryOptions={scoreCountryOptions}
