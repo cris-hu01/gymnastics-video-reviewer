@@ -20,10 +20,12 @@ from ..deps.validators import (_coerce_int, _coerce_str,
                                build_scope_query_signature, parse_contexts_json,
                                parse_json_body, parse_scope_queries_payload,
                                validate_platform_context)
+from ..jobs import JobCancelledError
 from ..models import CandidateClip, PlatformScope, PlatformScopeQuery, new_id
 from ..platform_client import PlatformApiError
 from ..video_import import (import_direct_clips_into_project,
-                            import_videos_into_project, summarize_scope_queries)
+                            import_videos_into_project,
+                            probe_import_video_inputs, summarize_scope_queries)
 
 
 logger = logging.getLogger(__name__)
@@ -95,25 +97,49 @@ async def import_project_files(request: Request):
         raise HTTPException(status_code=400, detail="No files or paths provided")
 
     logger.info("import_project_files count=%d", len(import_inputs))
+
+    # 1) ffprobe metadata probing happens OUTSIDE the project-state lock so the
+    #    per-file subprocess work doesn't block GET /api/project polling.
+    metadata_by_path = probe_import_video_inputs(import_inputs)
+
+    # 2) Briefly hold the lock to merge the imported videos into the *latest*
+    #    state (re-read inside the lock — never overwrite with a stale snapshot).
+    #    No ffprobe / network runs here; only the metadata we already probed.
+    with project_state_lock():
+        state = load_state()
+        reconcile_runtime_state(state)
+        imported_videos = import_videos_into_project(
+            state, import_inputs, metadata_by_path=metadata_by_path
+        )
+        if state.name == "Untitled Project":
+            first_match_name = next(
+                (video.match_name for video in imported_videos if video.match_name),
+                None,
+            )
+            if first_match_name:
+                state.name = first_match_name
+        persist_state(state)
+        imported_video_ids = [video.id for video in imported_videos]
+
+    # 3) Platform record fetching (network I/O) happens OUTSIDE the lock.
+    records_by_video_id: dict[str, Any] = {}
     try:
-        with project_state_lock():
-            state = load_state()
-            reconcile_runtime_state(state)
-            imported_videos = import_videos_into_project(state, import_inputs)
-            for video in imported_videos:
-                records = get_platform_client().fetch_platform_records(video)
-                state.replace_video_platform_records(video.id, records)
-            if state.name == "Untitled Project":
-                first_match_name = next(
-                    (video.match_name for video in imported_videos if video.match_name),
-                    None,
-                )
-                if first_match_name:
-                    state.name = first_match_name
-            persist_state(state)
+        for video in imported_videos:
+            records_by_video_id[video.id] = get_platform_client().fetch_platform_records(video)
     except PlatformApiError as error:
         logger.warning("import_project_files PlatformApiError: %s", error)
         raise HTTPException(status_code=502, detail=str(error))
+
+    # 4) Re-acquire the lock briefly to attach the fetched records to videos that
+    #    still exist in the latest state (a concurrent request may have removed one).
+    with project_state_lock():
+        state = load_state()
+        reconcile_runtime_state(state)
+        existing_video_ids = {video.id for video in state.videos}
+        for video_id in imported_video_ids:
+            if video_id in existing_video_ids and video_id in records_by_video_id:
+                state.replace_video_platform_records(video_id, records_by_video_id[video_id])
+        persist_state(state)
 
     logger.info(
         "import_project_files imported=%d names=%s",
@@ -326,21 +352,31 @@ async def export_project(request: Request):
             reconcile_runtime_state(latest_state)
             persist_state(merge_export_state(latest_state, current_state, touched))
 
-    def runner(progress_callback, _is_cancel_requested):
+    def runner(progress_callback, is_cancel_requested):
         current_state = load_state()
         reconcile_runtime_state(current_state)
 
-        result = get_export_service().export_kept_clips(
-            current_state,
-            output_dir=output_dir, export_mode=export_mode, operation=operation,
-            video_id=video_id, clip_ids=clip_ids,
-            oss_access_key_id=oss_access_key_id,
-            oss_access_key_secret=oss_access_key_secret,
-            progress_callback=progress_callback,
-            state_change_callback=lambda ids: _merge_and_persist(ids, current_state),
-            upload_parallel_files=upload_parallel_files,
-            upload_part_threads=upload_part_threads,
-        )
+        from ..export_service import ExportCancelledError
+
+        try:
+            result = get_export_service().export_kept_clips(
+                current_state,
+                output_dir=output_dir, export_mode=export_mode, operation=operation,
+                video_id=video_id, clip_ids=clip_ids,
+                oss_access_key_id=oss_access_key_id,
+                oss_access_key_secret=oss_access_key_secret,
+                progress_callback=progress_callback,
+                state_change_callback=lambda ids: _merge_and_persist(ids, current_state),
+                upload_parallel_files=upload_parallel_files,
+                upload_part_threads=upload_part_threads,
+                is_cancel_requested=is_cancel_requested,
+            )
+        except ExportCancelledError as error:
+            # Persist ONLY the clips this run actually touched before the cancel
+            # boundary. Merging the full clip set would clobber the status/export
+            # fields of clips a concurrent request changed mid-export.
+            _merge_and_persist(error.touched_clip_ids, current_state)
+            raise JobCancelledError(str(error))
         _merge_and_persist({item.clip_id for item in result.clips}, current_state)
         logger.info(
             "export_project completed attempted=%d exported=%d uploaded=%d synced=%d failed=%d",

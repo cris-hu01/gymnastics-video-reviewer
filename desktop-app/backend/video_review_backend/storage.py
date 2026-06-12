@@ -43,7 +43,19 @@ def save_project_state(project_file: str | os.PathLike[str], state: ProjectState
     state.touch()
 
     with tempfile.NamedTemporaryFile("w", delete=False, dir=path.parent, encoding="utf-8") as tmp:
-        json.dump(state.to_dict(), tmp, ensure_ascii=False, indent=2)
         tmp_path = Path(tmp.name)
+        try:
+            json.dump(state.to_dict(), tmp, ensure_ascii=False, indent=2)
+            # Flush + fsync before the atomic replace so a power loss can't leave
+            # a truncated/zero-byte project file behind the rename.
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
-    tmp_path.replace(path)
+    try:
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise

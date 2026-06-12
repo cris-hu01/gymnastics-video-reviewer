@@ -46,9 +46,39 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
+def probe_import_video_inputs(
+    video_inputs: list[str] | list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Probe ffprobe metadata for importable inputs without touching project state.
+
+    Returns a mapping ``{resolved_path -> metadata}`` for paths that exist, are a
+    supported video, and probe successfully. Intended to be called *outside* the
+    project-state lock so the (subprocess) ffprobe work doesn't block GET /api/project
+    polling. Paths that fail to probe are simply omitted; the lock-held import pass
+    re-validates against the latest state.
+    """
+    metadata_by_path: dict[str, dict[str, object]] = {}
+    for item in video_inputs:
+        raw_path = str(item.get("path") or "") if isinstance(item, dict) else str(item)
+        path = Path(raw_path).resolve()
+        resolved = str(path)
+        if resolved in metadata_by_path:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        if not is_supported_video(path):
+            continue
+        try:
+            metadata_by_path[resolved] = probe_video_metadata(resolved)
+        except Exception:
+            continue
+    return metadata_by_path
+
+
 def import_videos_into_project(
     state: ProjectState,
     video_inputs: list[str] | list[dict[str, object]],
+    metadata_by_path: dict[str, dict[str, object]] | None = None,
 ) -> list[VideoTask]:
     imported: list[VideoTask] = []
     existing_paths = {video.file_path for video in state.videos}
@@ -102,10 +132,13 @@ def import_videos_into_project(
         if str(path) in existing_paths:
             continue
 
-        try:
-            metadata = probe_video_metadata(str(path))
-        except Exception:
-            continue
+        if metadata_by_path is not None and str(path) in metadata_by_path:
+            metadata = metadata_by_path[str(path)]
+        else:
+            try:
+                metadata = probe_video_metadata(str(path))
+            except Exception:
+                continue
         now = utc_now_iso()
         video = VideoTask(
             id=new_id("video"),
