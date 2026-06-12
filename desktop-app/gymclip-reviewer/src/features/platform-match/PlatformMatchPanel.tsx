@@ -95,6 +95,23 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
     setOpenScoreFilter,
   } = local;
 
+  // Map each bindable visible card to its 1-9 hotkey number. Must mirror the
+  // global handler exactly: same filteredPlatformRecords order, and cards bound
+  // to a *different* clip are skipped (not numbered) so the badge a user sees
+  // matches the digit that binds it. Only the first nine bindable cards get a
+  // number; the rest are bindable by click only.
+  const hotkeyIndexById = new Map<string, number>();
+  filteredPlatformRecords
+    .filter(
+      (record) =>
+        record.linked_clip_ids.length === 0 ||
+        (activeClip != null && record.linked_clip_ids.includes(activeClip.id)),
+    )
+    .slice(0, 9)
+    .forEach((record, index) => {
+      hotkeyIndexById.set(record.id, index + 1);
+    });
+
   return (
     <aside className={`${activeClip ? 'w-[19rem] border-l border-gray-200' : 'w-0'} bg-white flex flex-col shrink-0 overflow-hidden transition-all duration-300`}>
       {activeClip && (
@@ -126,8 +143,9 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
               <input
+                id="score-search-input"
                 type="text"
-                placeholder="搜索姓名或国家..."
+                placeholder="搜索姓名或国家... ( / )"
                 value={scoreSearchQuery}
                 onChange={(event) => setScoreSearchQuery(event.target.value)}
                 className="w-full bg-gray-100 border-transparent rounded-lg py-2 pl-9 pr-3 text-sm focus:outline-none focus:bg-white focus:border-red-500 focus:ring-1 focus:ring-red-500 transition-all"
@@ -203,6 +221,7 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
                       const isActive = activeClip.linked_platform_record_id === entry.id;
                       const isBound = entry.linked_clip_ids.length > 0;
                       const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
+                      const hotkeyNumber = hotkeyIndexById.get(entry.id);
                       const theme = bindingTheme(entry.id);
                       const linkedClipLabels = entry.linked_clip_ids
                         .map((clipId) => clipOrdinalById.get(clipId))
@@ -242,6 +261,14 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
                               <p className="text-[15px] font-semibold leading-5 text-gray-900 truncate">
+                                {hotkeyNumber != null && !isBoundElsewhere && !activeClipLockedByExport && (
+                                  <kbd
+                                    className="mr-1.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded border border-gray-200 bg-gray-100 px-1 align-middle text-[10px] font-semibold leading-none text-gray-400"
+                                    title={`按 ${hotkeyNumber} 绑定此卡片`}
+                                  >
+                                    {hotkeyNumber}
+                                  </kbd>
+                                )}
                                 {entry.english_name || entry.user_name || '未命名'}
                               </p>
                               {entry.user_name && (
