@@ -23,6 +23,7 @@ from .deps.paths import (BACKEND_ROOT, EXPORTS_DIR, PROJECT_FILE,  # noqa: F401
                          ensure_workspace_dirs)
 from .deps.state import load_state, persist_state, project_state_lock
 from .deps.state_helpers import reconcile_runtime_state
+from .parent_watchdog import start_parent_watchdog
 from .routers import (clips as clips_router, jobs as jobs_router,
                       local_cards as local_cards_router,
                       platform as platform_router, project as project_router,
@@ -208,6 +209,16 @@ def warn_if_api_token_disabled():
         _security_logger.error(
             "GYMCLIP_API_TOKEN is set but too short — all /api requests will 503."
         )
+
+
+@app.on_event("startup")
+def launch_parent_watchdog():
+    # Self-terminate if the Electron main process (which spawned us and passed
+    # its pid via GYMCLIP_PARENT_PID) dies abnormally without running its
+    # before-quit cleanup. No-op when the env var is unset (bare run / pytest),
+    # so this is invisible to the test suite. Runs on its own daemon thread and
+    # does not block the event loop.
+    start_parent_watchdog()
 
 
 @app.on_event("startup")
