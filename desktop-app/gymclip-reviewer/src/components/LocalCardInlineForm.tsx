@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useState} from 'react';
 
 import {computeLocalCardAutoTotal} from '../lib/clip-math';
 import {stopFormShortcutPropagation} from '../lib/utils';
@@ -42,6 +42,11 @@ function LocalCardInlineFormComponent({
   onDelete,
   nameSuggestions,
 }: LocalCardInlineFormProps) {
+  // Inline two-step delete confirm (discovery 3-1): first click flips the
+  // button to "确认删除？"; a second click within this same inline form runs the
+  // delete. No native window.confirm — nothing covers the video. Any other
+  // interaction (cancel, save) leaves this local state to reset on unmount.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const autoTotal = computeLocalCardAutoTotal(form);
   const totalDisplay =
     form.total_overridden && form.total_score.trim() !== '' ? form.total_score : autoTotal;
@@ -172,14 +177,37 @@ function LocalCardInlineFormComponent({
       </label>
       <div className="flex items-center justify-end gap-2 pt-1">
         {onDelete && (
-          <button
-            type="button"
-            onClick={onDelete}
-            disabled={saving}
-            className="mr-auto inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 py-1 text-[12px] text-red-600 hover:bg-red-50 disabled:opacity-50"
-          >
-            删除
-          </button>
+          <div className="mr-auto inline-flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                if (confirmingDelete) {
+                  onDelete();
+                  setConfirmingDelete(false);
+                } else {
+                  setConfirmingDelete(true);
+                }
+              }}
+              disabled={saving}
+              className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-[12px] disabled:opacity-50 ${
+                confirmingDelete
+                  ? 'border-red-500 bg-red-600 font-semibold text-white hover:bg-red-700'
+                  : 'border-red-200 bg-white text-red-600 hover:bg-red-50'
+              }`}
+            >
+              {confirmingDelete ? '确认删除？' : '删除'}
+            </button>
+            {confirmingDelete && (
+              <button
+                type="button"
+                onClick={() => setConfirmingDelete(false)}
+                disabled={saving}
+                className="text-[11px] text-gray-500 underline hover:text-gray-700 disabled:opacity-50"
+              >
+                取消
+              </button>
+            )}
+          </div>
         )}
         <button
           type="button"
