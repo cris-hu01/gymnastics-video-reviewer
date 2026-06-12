@@ -259,14 +259,17 @@ export default function App() {
   // in a single commit — no subscriber will ever see a (segmentId from
   // clip A, bounds from clip B) mismatch.
   const activeSegmentId = useStore((s) => s.segmentId);
-  // A4-2: `playhead` (seconds) is now derived from the playback slice's
-  // `currentTimeMs` publish channel. `isPlaying` likewise mirrors the
-  // slice. The renderer (PlayerSurface) owns the <video> element and
-  // pushes these snapshots; UI here reads them but never writes back
-  // through `setCurrentTimeMs` (that would re-enter the loop the slice
-  // is designed to break — see store/playback.ts header).
-  const playheadMs = useStore((s) => s.currentTimeMs);
-  const playhead = playheadMs / 1000;
+  // PR4 (render-storm): App.tsx deliberately does NOT subscribe to
+  // `currentTimeMs`. The renderer publishes that snapshot at ~30Hz during
+  // playback; an App-level `useStore(s => s.currentTimeMs)` selector turned
+  // every timeupdate into a full App re-render (and re-ran every useMemo).
+  // The only live consumers of the playhead are leaf components that own
+  // their own subscription (ReviewPanel's overlay clock/progress bar,
+  // TimelineSurface's playhead bar) plus three imperative read sites
+  // (the auto-pause subscriber, updateTrimRange's nextPlayhead, seekRelative)
+  // which read `useStore.getState().currentTimeMs` on demand. `isPlaying`
+  // *is* subscribed below — it flips at most a couple of times per playback
+  // session, so it does not contribute to the storm.
   const isPlaying = useStore((s) => s.isPlaying);
   const setIsPlayingStore = useStore((s) => s.setIsPlaying);
   const enqueueSeekStore = useStore((s) => s.enqueueSeek);
@@ -653,10 +656,11 @@ export default function App() {
   const clipWindowStart = (clipWindowOverride ?? initialClipWindow).start;
   const clipWindowEnd = (clipWindowOverride ?? initialClipWindow).end;
   const clipWindowDuration = Math.max(CLIP_STEP, clipWindowEnd - clipWindowStart);
-  // A4-3: trim* / playhead-local-to-window calculations now live inside
-  // TimelineSurface. Only the in-player overlay needs the playhead
-  // percent (kept below near the JSX that uses it).
-  const playheadLocal = Math.max(0, Math.min(clipWindowDuration, playhead - clipWindowStart));
+  // A4-3: trim* / playhead-local-to-window calculations live inside
+  // TimelineSurface. The in-player overlay's playhead percent/clock now
+  // live inside ReviewPanel (PR4) — App no longer computes any
+  // playhead-derived value, which is what lets it drop the currentTimeMs
+  // subscription above.
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === 'queued' || job.status === 'running'),
     [jobs],
@@ -1300,15 +1304,36 @@ export default function App() {
   // pause) now live in PlayerSurface. The auto-pause-at-trim-end behavior
   // formerly inlined in the timeupdate handler is reimplemented here as a
   // store subscriber so it survives the renderer extraction.
+  //
+  // PR4 (render-storm): previously this effect listed `playhead` (a
+  // currentTimeMs-derived value) in its deps, which forced App to subscribe
+  // to currentTimeMs and re-render the whole tree ~30Hz. We now subscribe to
+  // the store *imperatively* — the listener fires on every store commit but
+  // only acts when currentTimeMs actually advanced past trimEnd, and it never
+  // triggers a React re-render of App. The effect re-subscribes only when
+  // activeClip / isPlaying / trimEnd change (all low-frequency), so the
+  // `trimEnd` captured in the closure is always the live value (no ref
+  // staleness). Behavior is identical to the old version: we pause exactly
+  // when the published currentTime crosses trimEnd, within one publish tick.
   useEffect(() => {
     if (!activeClip || !isPlaying) return;
-    // playhead is in seconds; trimEnd is in seconds. We only pause when
-    // we cross trimEnd; the renderer publishes ~30Hz so this catches
-    // the boundary within ~33ms.
-    if (playhead >= trimEnd) {
+    // Edge case: we may already be at/past trimEnd at subscribe time (e.g.
+    // user hit Space with the playhead parked on the end boundary and the
+    // toggle's "rewind to trimStart" guard didn't fire). Catch it eagerly so
+    // we don't depend on a future timeupdate that might never come.
+    if (useStore.getState().currentTimeMs / 1000 >= trimEnd) {
       setIsPlayingStore(false);
+      return;
     }
-  }, [activeClip, isPlaying, playhead, trimEnd, setIsPlayingStore]);
+    const unsubscribe = useStore.subscribe((state, prev) => {
+      // Only react to playhead advances; ignore unrelated store commits.
+      if (state.currentTimeMs === prev.currentTimeMs) return;
+      if (state.currentTimeMs / 1000 >= trimEnd) {
+        setIsPlayingStore(false);
+      }
+    });
+    return unsubscribe;
+  }, [activeClip, isPlaying, trimEnd, setIsPlayingStore]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1729,7 +1754,14 @@ export default function App() {
       const boundaryTime = syncTarget === 'start' ? nextTrimStart : nextTrimEnd;
       syncVideoTime(boundaryTime, {force: false});
     } else {
-      const nextPlayhead = Math.min(Math.max(playhead, nextTrimStart), nextTrimEnd);
+      // PR4: read the live playhead from the publish channel instead of a
+      // render-time `playhead` closure. updateTrimRange runs synchronously
+      // from user gestures, so getState() returns the exact current position
+      // (more accurate than a possibly-stale React closure, and it lets App
+      // drop its currentTimeMs subscription). We clamp it into the new trim
+      // window exactly as before.
+      const currentPlayhead = useStore.getState().currentTimeMs / 1000;
+      const nextPlayhead = Math.min(Math.max(currentPlayhead, nextTrimStart), nextTrimEnd);
       syncVideoTime(nextPlayhead, {force: !isScrubbingRef.current});
     }
   }
@@ -2509,8 +2541,6 @@ export default function App() {
     setIsDragging(false);
     await handleImportFiles(event.dataTransfer.files);
   };
-
-  const playheadPercent = clipWindowDuration > 0 ? (playheadLocal / clipWindowDuration) * 100 : 0;
 
   // A4-6: render helpers extracted to lib/progress.ts (pure functions).
   const renderVideoProgress = (video: ProjectState['videos'][number]) =>
