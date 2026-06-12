@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useEffect} from 'react';
 import {Upload, XCircle} from 'lucide-react';
 
 import {categoryLabel} from '../../lib/format';
@@ -48,6 +48,31 @@ export const VideoImportPanel = React.memo(function VideoImportPanel({api}: Vide
     toggleDirectClipApparatus,
     setDirectClipApparatusGroup,
   } = api;
+
+  // Escape closes the import modal (discovery 3-2), but NOT while an import is
+  // in flight — closing mid-import would orphan the operation, so isImporting
+  // disables it (matching the close button's own disabled state). Hook runs
+  // unconditionally; the listener attaches only while the modal is open and not
+  // importing. Skip when a text input/select is focused, and stop propagation
+  // so the event doesn't also reach other global Escape handlers.
+  useEffect(() => {
+    if (!showImportModal || isImporting) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLSelectElement ||
+        active instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
+      event.stopPropagation();
+      closeImportModal();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showImportModal, isImporting, closeImportModal]);
 
   if (!showImportModal) return null;
 

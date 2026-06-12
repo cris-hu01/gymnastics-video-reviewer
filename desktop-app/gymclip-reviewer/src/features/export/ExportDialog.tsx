@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useEffect} from 'react';
 import {CheckCircle2, ChevronDown, ChevronUp, FolderOpen, XCircle} from 'lucide-react';
 
 import type {AppJob, CandidateClip} from '../../types';
@@ -77,6 +77,32 @@ export const ExportDialog = React.memo(function ExportDialog(props: ExportDialog
     persistDefaultOutputDirectory,
     clearOssCredentialsViaBridge,
   } = api;
+
+  // Escape closes the dialog, matching the right-click menu / filter dropdowns
+  // (discovery 3-2). Hook runs unconditionally (Rules of Hooks); the listener
+  // is only attached while the dialog is open. Closing doesn't cancel a running
+  // export — the job keeps progressing in the background — so it's safe to allow
+  // even mid-export. Skip when a text input/select is focused so Escape there
+  // behaves normally (e.g. clearing a native autocomplete), and stop the event
+  // from also bubbling to other global Escape handlers.
+  useEffect(() => {
+    if (!showExport) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLInputElement ||
+        active instanceof HTMLSelectElement ||
+        active instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
+      event.stopPropagation();
+      setShowExport(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showExport, setShowExport]);
 
   if (!showExport) return null;
 
