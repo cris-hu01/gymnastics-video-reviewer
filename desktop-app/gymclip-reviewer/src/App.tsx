@@ -907,6 +907,38 @@ export default function App() {
     });
     return groups;
   }, [filteredPlatformRecords]);
+  // Single source of truth for the 1-9 number-key binding. The panel renders
+  // platform cards in groupedPlatformRecords order (regrouped by match→venue),
+  // which differs from the flat filteredPlatformRecords order when several
+  // matches/venues interleave. Flatten the groups in render order, keep only
+  // cards bindable to the active clip (no link, or already linked to it), and
+  // take the first nine. "角标 N" == "面板自上而下第 N 张可绑定卡" ==
+  // "按数字 N 绑定的卡" — all three read from THIS list. Both the digit handler
+  // and the panel's badge map derive from it; no second algorithm to drift.
+  const numberKeyBindableRecords = useMemo(() => {
+    const flat: PlatformRecord[] = [];
+    for (const matchGroup of groupedPlatformRecords) {
+      for (const venueGroup of matchGroup.venues) {
+        for (const record of venueGroup.records) {
+          const isBindable =
+            record.linked_clip_ids.length === 0 ||
+            (activeClipId != null && record.linked_clip_ids.includes(activeClipId));
+          if (isBindable) flat.push(record);
+          if (flat.length === 9) return flat;
+        }
+      }
+    }
+    return flat;
+  }, [groupedPlatformRecords, activeClipId]);
+  // id → 1-based hotkey number, handed to the panel so its badges match the
+  // handler exactly (same list, same order).
+  const numberKeyIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    numberKeyBindableRecords.forEach((record, index) => {
+      map.set(record.id, index + 1);
+    });
+    return map;
+  }, [numberKeyBindableRecords]);
   const activeScopeSummary = useMemo(() => {
     if (!activePlatformScope) {
       return {
@@ -1499,25 +1531,22 @@ export default function App() {
         return;
       }
 
-      // Number keys 1-9 bind the Nth currently-visible AND bindable platform
-      // score card to the active clip. The list is filteredPlatformRecords
-      // (search/filter-applied order = what the user sees), minus cards already
-      // bound to a *different* clip — those are skipped and don't occupy a
-      // number, mirroring the card button's `disabled` rule and the panel's
-      // hotkey badge. This is what makes vault same-name pairs selectable as
-      // 1/2 after a name search.
+      // Number keys 1-9 bind the Nth visible bindable platform card to the
+      // active clip. Source is numberKeyBindableRecords — the cards flattened
+      // in the panel's actual render order (groupedPlatformRecords, regrouped
+      // by match→venue), filtered to bindable, capped at 9. Using render order
+      // (not flat filteredPlatformRecords) keeps badge N == "面板第 N 张" ==
+      // the card this binds, even when several matches/venues interleave. This
+      // is also what makes vault same-name pairs selectable as 1/2 after a
+      // name search.
       if (/^[1-9]$/.test(event.key) && !hasCommandModifier && !event.shiftKey) {
         event.preventDefault();
         if (activeClipLockedByExport) {
           setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
           return;
         }
-        const bindableRecords = filteredPlatformRecords.filter(
-          (record) =>
-            record.linked_clip_ids.length === 0 || record.linked_clip_ids.includes(activeClip.id),
-        );
         const index = Number(event.key) - 1;
-        const target = bindableRecords[index];
+        const target = numberKeyBindableRecords[index];
         if (!target) {
           // Fewer than N bindable cards visible — ignore silently.
           return;
@@ -1648,7 +1677,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob, filteredPlatformRecords]);
+  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob, numberKeyBindableRecords]);
 
   function setProjectState(nextProject: ProjectState) {
     // PR4: every direct (user-initiated PATCH) write bumps the same write-seq
@@ -2927,6 +2956,7 @@ export default function App() {
           videoScopedPlatformRecords={videoScopedPlatformRecords}
           filteredPlatformRecords={filteredPlatformRecords}
           groupedPlatformRecords={groupedPlatformRecords}
+          numberKeyIndexById={numberKeyIndexById}
           scoreApparatusOptions={scoreApparatusOptions}
           scoreSexOptions={scoreSexOptions}
           scoreCountryOptions={scoreCountryOptions}

@@ -54,6 +54,14 @@ export interface PlatformMatchPanelProps {
   videoScopedPlatformRecords: PlatformRecord[];
   filteredPlatformRecords: PlatformRecord[];
   groupedPlatformRecords: PlatformMatchGroup[];
+  /**
+   * id → 1-9 number-key badge, computed in App from the same render-order
+   * bindable list the global digit handler uses. Passing it in (rather than
+   * recomputing here from filteredPlatformRecords) is what guarantees
+   * "badge N" == "the card digit N binds" even when several matches/venues
+   * interleave and grouping reorders the visual list.
+   */
+  numberKeyIndexById: Map<string, number>;
   scoreApparatusOptions: ScoreFilterOption[];
   scoreSexOptions: ScoreFilterOption[];
   scoreCountryOptions: ScoreFilterOption[];
@@ -73,6 +81,7 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
     videoScopedPlatformRecords,
     filteredPlatformRecords,
     groupedPlatformRecords,
+    numberKeyIndexById,
     scoreApparatusOptions,
     scoreSexOptions,
     scoreCountryOptions,
@@ -95,22 +104,9 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
     setOpenScoreFilter,
   } = local;
 
-  // Map each bindable visible card to its 1-9 hotkey number. Must mirror the
-  // global handler exactly: same filteredPlatformRecords order, and cards bound
-  // to a *different* clip are skipped (not numbered) so the badge a user sees
-  // matches the digit that binds it. Only the first nine bindable cards get a
-  // number; the rest are bindable by click only.
-  const hotkeyIndexById = new Map<string, number>();
-  filteredPlatformRecords
-    .filter(
-      (record) =>
-        record.linked_clip_ids.length === 0 ||
-        (activeClip != null && record.linked_clip_ids.includes(activeClip.id)),
-    )
-    .slice(0, 9)
-    .forEach((record, index) => {
-      hotkeyIndexById.set(record.id, index + 1);
-    });
+  // numberKeyIndexById (from App) maps card id → 1-9 badge. It is built from
+  // the render-order bindable list the global digit handler also uses, so the
+  // badge shown here is always the digit that binds that exact card.
 
   return (
     <aside className={`${activeClip ? 'w-[19rem] border-l border-gray-200' : 'w-0'} bg-white flex flex-col shrink-0 overflow-hidden transition-all duration-300`}>
@@ -221,7 +217,7 @@ export function PlatformMatchPanel(props: PlatformMatchPanelProps) {
                       const isActive = activeClip.linked_platform_record_id === entry.id;
                       const isBound = entry.linked_clip_ids.length > 0;
                       const isBoundElsewhere = isBound && !entry.linked_clip_ids.includes(activeClip.id);
-                      const hotkeyNumber = hotkeyIndexById.get(entry.id);
+                      const hotkeyNumber = numberKeyIndexById.get(entry.id);
                       const theme = bindingTheme(entry.id);
                       const linkedClipLabels = entry.linked_clip_ids
                         .map((clipId) => clipOrdinalById.get(clipId))
