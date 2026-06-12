@@ -6,3 +6,5 @@ export {TrimHandles} from './TrimHandles';
 export type {TrimHandlesProps} from './TrimHandles';
 export {ReviewPanel} from './ReviewPanel';
 export type {ReviewPanelProps} from './ReviewPanel';
+export {PlayerOverlayReadout, PlayheadClock} from './PlayheadReadouts';
+export type {PlayerOverlayReadoutProps} from './PlayheadReadouts';

@@ -133,6 +133,27 @@ const CLIP_STEP = 0.2;
 const MIN_SEGMENT_DURATION = 0.5;
 const EXPORT_LOCKED_CLIP_MESSAGE = '该片段在当前导出批次中，导出完成前不可编辑';
 const EXPORT_LOCKED_RESTORE_MESSAGE = '当前有导出任务进行中，暂不支持撤销结构编辑';
+
+/**
+ * Content digest for the silent jobs poll's short-circuit (PR4 render-storm).
+ *
+ * Returns a stable string capturing everything the UI derives from a job:
+ * its id, status, and the full `progress` payload (jobPercent /
+ * describeJobProgress read many fields out of progress — completed, total,
+ * stage, completed_steps, total_steps, operation, …). If two consecutive
+ * polls produce the same digest, nothing the UI cares about changed and we
+ * can skip setJobs (and the full-App re-render it triggers).
+ *
+ * progress is included verbatim via JSON.stringify because that is precisely
+ * where live detection/export progress is published — leaving it out would
+ * make the short-circuit swallow real progress updates. The jobs list is
+ * small (a handful of active pipelines), so stringifying per tick is cheap.
+ */
+function jobsSignature(jobs: AppJob[]): string {
+  return jobs
+    .map((job) => `${job.id}:${job.status}:${JSON.stringify(job.progress)}`)
+    .join('|');
+}
 export default function App() {
   const desktopBridge = window.gymclipDesktop;
   // A3: project state migrated to zustand (see store/project.ts). The hook form
@@ -259,14 +280,17 @@ export default function App() {
   // in a single commit — no subscriber will ever see a (segmentId from
   // clip A, bounds from clip B) mismatch.
   const activeSegmentId = useStore((s) => s.segmentId);
-  // A4-2: `playhead` (seconds) is now derived from the playback slice's
-  // `currentTimeMs` publish channel. `isPlaying` likewise mirrors the
-  // slice. The renderer (PlayerSurface) owns the <video> element and
-  // pushes these snapshots; UI here reads them but never writes back
-  // through `setCurrentTimeMs` (that would re-enter the loop the slice
-  // is designed to break — see store/playback.ts header).
-  const playheadMs = useStore((s) => s.currentTimeMs);
-  const playhead = playheadMs / 1000;
+  // PR4 (render-storm): App.tsx deliberately does NOT subscribe to
+  // `currentTimeMs`. The renderer publishes that snapshot at ~30Hz during
+  // playback; an App-level `useStore(s => s.currentTimeMs)` selector turned
+  // every timeupdate into a full App re-render (and re-ran every useMemo).
+  // The only live consumers of the playhead are leaf components that own
+  // their own subscription (ReviewPanel's overlay clock/progress bar,
+  // TimelineSurface's playhead bar) plus three imperative read sites
+  // (the auto-pause subscriber, updateTrimRange's nextPlayhead, seekRelative)
+  // which read `useStore.getState().currentTimeMs` on demand. `isPlaying`
+  // *is* subscribed below — it flips at most a couple of times per playback
+  // session, so it does not contribute to the storm.
   const isPlaying = useStore((s) => s.isPlaying);
   const setIsPlayingStore = useStore((s) => s.setIsPlaying);
   const enqueueSeekStore = useStore((s) => s.enqueueSeek);
@@ -301,6 +325,30 @@ export default function App() {
   const isSwitchingRef = useRef(false);
   const toastIdRef = useRef(0);
   const clipUndoStackRef = useRef<ClipUndoSnapshot[]>([]);
+  // PR4 (render-storm): polling guards.
+  //
+  // The silent workspace poll (250ms while exporting / 1s otherwise) used to
+  // call setProject/setJobs unconditionally every tick. Even when the backend
+  // data was byte-for-byte unchanged, that produced a fresh object reference →
+  // a full App re-render + every useMemo recomputed, several times a second.
+  //
+  // - projectWriteSeqRef: monotonic counter bumped on EVERY project write,
+  //   whether from a poll or a user-initiated PATCH (via setProjectState). A
+  //   poll captures the seq before its await; if anything wrote during the
+  //   await, the poll's (now potentially stale) response is discarded. This is
+  //   the TimelineSurface fetchSeqRef pattern, widened to cover direct writes
+  //   so a slow poll can't clobber a fresh PATCH.
+  // - projectPollInFlightRef / jobsPollInFlightRef: skip starting a new poll
+  //   fetch while one is still outstanding (prevents pile-up under a slow
+  //   backend).
+  // - lastProjectSignatureRef / lastJobsSignatureRef: content short-circuit.
+  //   We only set state when the meaningful content changed (project.updated_at
+  //   for the project; an (id,status,progress) digest for jobs).
+  const projectWriteSeqRef = useRef(0);
+  const projectPollInFlightRef = useRef(false);
+  const jobsPollInFlightRef = useRef(false);
+  const lastProjectSignatureRef = useRef<string | null>(null);
+  const lastJobsSignatureRef = useRef<string | null>(null);
 
   /**
    * A4-5 helper: every site that used to call `setActiveSegmentId(id)`
@@ -653,10 +701,11 @@ export default function App() {
   const clipWindowStart = (clipWindowOverride ?? initialClipWindow).start;
   const clipWindowEnd = (clipWindowOverride ?? initialClipWindow).end;
   const clipWindowDuration = Math.max(CLIP_STEP, clipWindowEnd - clipWindowStart);
-  // A4-3: trim* / playhead-local-to-window calculations now live inside
-  // TimelineSurface. Only the in-player overlay needs the playhead
-  // percent (kept below near the JSX that uses it).
-  const playheadLocal = Math.max(0, Math.min(clipWindowDuration, playhead - clipWindowStart));
+  // A4-3: trim* / playhead-local-to-window calculations live inside
+  // TimelineSurface. The in-player overlay's playhead percent/clock now
+  // live inside ReviewPanel (PR4) — App no longer computes any
+  // playhead-derived value, which is what lets it drop the currentTimeMs
+  // subscription above.
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.status === 'queued' || job.status === 'running'),
     [jobs],
@@ -899,11 +948,38 @@ export default function App() {
   );
 
   async function refreshProject(options?: {silent?: boolean}) {
+    // Silent polls coalesce: if a fetch is already outstanding, skip this tick
+    // rather than stacking another round-trip on a slow backend.
+    if (options?.silent && projectPollInFlightRef.current) return;
     if (!options?.silent) {
       setIsLoading(true);
     }
+    if (options?.silent) projectPollInFlightRef.current = true;
+    // Snapshot the write-seq before awaiting. If any project write (poll or
+    // a user-initiated PATCH via setProjectState) lands while we're in flight,
+    // this captured value will be stale and we discard our response.
+    const seqAtStart = projectWriteSeqRef.current;
     try {
       const nextProject = await fetchProject();
+      // Drop the response if a fresher write happened during the await — a
+      // slow silent poll must never clobber a fresh PATCH. (Non-silent loads
+      // are explicit user intent and always apply.)
+      if (options?.silent && projectWriteSeqRef.current !== seqAtStart) {
+        return;
+      }
+      // Content short-circuit: only commit when the project actually changed.
+      // project.updated_at is bumped by every backend mutation (state.touch(),
+      // including the detection/export checkpoints that flip video.status and
+      // video.detection_progress), so an unchanged timestamp means an
+      // unchanged tree — skipping setProject here avoids a needless full-App
+      // re-render + useMemo storm on each idle poll tick.
+      if (options?.silent && lastProjectSignatureRef.current === nextProject.updated_at) {
+        setErrorMessage(null);
+        return;
+      }
+      lastProjectSignatureRef.current = nextProject.updated_at;
+      // Bump the write-seq so a concurrently-awaiting poll discards itself.
+      projectWriteSeqRef.current += 1;
       setProject(nextProject);
       setErrorMessage(null);
     } catch (error) {
@@ -911,6 +987,7 @@ export default function App() {
         setErrorMessage(error instanceof Error ? error.message : '无法读取项目状态');
       }
     } finally {
+      if (options?.silent) projectPollInFlightRef.current = false;
       if (!options?.silent) {
         setIsLoading(false);
       }
@@ -918,13 +995,28 @@ export default function App() {
   }
 
   async function refreshJobs(options?: {silent?: boolean}) {
+    if (options?.silent && jobsPollInFlightRef.current) return;
+    if (options?.silent) jobsPollInFlightRef.current = true;
     try {
       const response = await fetchJobs();
+      // Content short-circuit: jobs are the authoritative backend list, so we
+      // always replace from a successful fetch — but only if the meaningful
+      // content (per-job id/status/progress) changed. Live detection/export
+      // progress lives in job.progress (the per-frame ticks flow through the
+      // jobs resource, NOT project.updated_at), so progress MUST be part of
+      // the signature or real progress updates would be swallowed.
+      const signature = jobsSignature(response.jobs);
+      if (options?.silent && lastJobsSignatureRef.current === signature) {
+        return;
+      }
+      lastJobsSignatureRef.current = signature;
       setJobs(response.jobs);
     } catch (error) {
       if (!options?.silent) {
         setErrorMessage(error instanceof Error ? error.message : '无法读取任务状态');
       }
+    } finally {
+      if (options?.silent) jobsPollInFlightRef.current = false;
     }
   }
 
@@ -1300,15 +1392,36 @@ export default function App() {
   // pause) now live in PlayerSurface. The auto-pause-at-trim-end behavior
   // formerly inlined in the timeupdate handler is reimplemented here as a
   // store subscriber so it survives the renderer extraction.
+  //
+  // PR4 (render-storm): previously this effect listed `playhead` (a
+  // currentTimeMs-derived value) in its deps, which forced App to subscribe
+  // to currentTimeMs and re-render the whole tree ~30Hz. We now subscribe to
+  // the store *imperatively* — the listener fires on every store commit but
+  // only acts when currentTimeMs actually advanced past trimEnd, and it never
+  // triggers a React re-render of App. The effect re-subscribes only when
+  // activeClip / isPlaying / trimEnd change (all low-frequency), so the
+  // `trimEnd` captured in the closure is always the live value (no ref
+  // staleness). Behavior is identical to the old version: we pause exactly
+  // when the published currentTime crosses trimEnd, within one publish tick.
   useEffect(() => {
     if (!activeClip || !isPlaying) return;
-    // playhead is in seconds; trimEnd is in seconds. We only pause when
-    // we cross trimEnd; the renderer publishes ~30Hz so this catches
-    // the boundary within ~33ms.
-    if (playhead >= trimEnd) {
+    // Edge case: we may already be at/past trimEnd at subscribe time (e.g.
+    // user hit Space with the playhead parked on the end boundary and the
+    // toggle's "rewind to trimStart" guard didn't fire). Catch it eagerly so
+    // we don't depend on a future timeupdate that might never come.
+    if (useStore.getState().currentTimeMs / 1000 >= trimEnd) {
       setIsPlayingStore(false);
+      return;
     }
-  }, [activeClip, isPlaying, playhead, trimEnd, setIsPlayingStore]);
+    const unsubscribe = useStore.subscribe((state, prev) => {
+      // Only react to playhead advances; ignore unrelated store commits.
+      if (state.currentTimeMs === prev.currentTimeMs) return;
+      if (state.currentTimeMs / 1000 >= trimEnd) {
+        setIsPlayingStore(false);
+      }
+    });
+    return unsubscribe;
+  }, [activeClip, isPlaying, trimEnd, setIsPlayingStore]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1436,6 +1549,16 @@ export default function App() {
   }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob]);
 
   function setProjectState(nextProject: ProjectState) {
+    // PR4: every direct (user-initiated PATCH) write bumps the same write-seq
+    // the silent poll snapshots, so a slow poll that resolves *after* this
+    // write will see a changed seq and discard its now-stale response instead
+    // of clobbering it. We also refresh the project signature to this write's
+    // updated_at: this keeps the poll's content short-circuit honest — a later
+    // poll carrying an OLDER updated_at (already superseded) is skipped, while
+    // any genuinely newer backend change still has a different timestamp and
+    // gets applied.
+    projectWriteSeqRef.current += 1;
+    lastProjectSignatureRef.current = nextProject.updated_at;
     setProject(nextProject);
   }
 
@@ -1729,7 +1852,14 @@ export default function App() {
       const boundaryTime = syncTarget === 'start' ? nextTrimStart : nextTrimEnd;
       syncVideoTime(boundaryTime, {force: false});
     } else {
-      const nextPlayhead = Math.min(Math.max(playhead, nextTrimStart), nextTrimEnd);
+      // PR4: read the live playhead from the publish channel instead of a
+      // render-time `playhead` closure. updateTrimRange runs synchronously
+      // from user gestures, so getState() returns the exact current position
+      // (more accurate than a possibly-stale React closure, and it lets App
+      // drop its currentTimeMs subscription). We clamp it into the new trim
+      // window exactly as before.
+      const currentPlayhead = useStore.getState().currentTimeMs / 1000;
+      const nextPlayhead = Math.min(Math.max(currentPlayhead, nextTrimStart), nextTrimEnd);
       syncVideoTime(nextPlayhead, {force: !isScrubbingRef.current});
     }
   }
@@ -2509,8 +2639,6 @@ export default function App() {
     setIsDragging(false);
     await handleImportFiles(event.dataTransfer.files);
   };
-
-  const playheadPercent = clipWindowDuration > 0 ? (playheadLocal / clipWindowDuration) * 100 : 0;
 
   // A4-6: render helpers extracted to lib/progress.ts (pure functions).
   const renderVideoProgress = (video: ProjectState['videos'][number]) =>

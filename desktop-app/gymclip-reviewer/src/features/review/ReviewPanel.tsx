@@ -31,10 +31,11 @@ import {AlertCircle, Check, CheckCircle2, Pause, Play, Trash2} from 'lucide-reac
 import type {PointerEvent as ReactPointerEvent, ReactNode} from 'react';
 
 import {StatusBadge} from '../../components/StatusBadge';
-import {formatClock, formatDuration, pipelineToneClass} from '../../lib/format';
+import {formatClock, pipelineToneClass} from '../../lib/format';
 import {useStore} from '../../store';
 import type {CandidateClip, ClipSegment, ClipStatus, ProjectState} from '../../types';
 
+import {PlayerOverlayReadout, PlayheadClock} from './PlayheadReadouts';
 import {PlayerSurface} from './PlayerSurface';
 import {TimelineSurface} from './TimelineSurface';
 import {TrimHandles} from './TrimHandles';
@@ -127,15 +128,28 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
     handleStatusChange,
   } = props;
 
-  // Subscribe to the live playback snapshot here so the player overlay's
-  // progress bar (and the trim row's clock readout) re-render without
-  // App.tsx having to thread them through as props.
+  // PR4 (render-storm): ReviewPanel subscribes to `isPlaying` ONLY — it flips
+  // a couple of times per session, so the panel body re-rendering on it is
+  // cheap. The live playhead (currentTimeMs, ~30Hz during playback) is NOT
+  // subscribed here; it is owned by the two leaf readouts (PlayerOverlayReadout
+  // / PlayheadClock) below. That keeps the heavy panel chrome (player box,
+  // segment switcher, action buttons, cheat-sheet) static during playback —
+  // only the tiny clock/progress DOM nodes update each frame.
   const isPlaying = useStore((s) => s.isPlaying);
-  const currentTimeMs = useStore((s) => s.currentTimeMs);
-  const playhead = currentTimeMs / 1000;
-  const clipWindowDuration = Math.max(0.0001, clipWindowEnd - clipWindowStart);
-  const playheadLocal = Math.max(0, Math.min(clipWindowDuration, playhead - clipWindowStart));
-  const playheadPercent = (playheadLocal / clipWindowDuration) * 100;
+
+  // PR4: the render props below (onScrubMove / renderActiveSegmentHandles) are
+  // deliberately inline. Memoizing them would be inert: TimelineSurface is not
+  // wrapped in React.memo, so it re-renders whenever ReviewPanel does
+  // regardless of prop identity — and even if it were memo'd, the props' App
+  // sources (syncVideoTime, handleTrimDragStart) are plain function
+  // declarations re-created every App render, so a useCallback keyed on them
+  // would change identity every render anyway. TimelineSurface also owns its
+  // own currentTimeMs subscription, so it already re-renders ~30Hz during
+  // playback on its own; a stable parent prop wouldn't change that. Stabilizing
+  // these for real would require useCallback-ing the entire transitive
+  // trim-drag closure in App (updateTrimRange → startTrimScroll → … over
+  // activeClip/activeSegment/clipWindow*), a missed-dependency stale-closure
+  // risk that isn't worth the ~couple-renders-per-session it would save.
 
   if (!activeClip || !activeVideo) {
     return (
@@ -182,15 +196,10 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
                 >
                   {isPlaying ? <Pause size={24} /> : <Play size={24} className="ml-1" />}
                 </button>
-                <div className="flex-1 h-1.5 bg-white/30 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-white rounded-full transition-all duration-75"
-                    style={{width: `${playheadPercent}%`}}
-                  />
-                </div>
-                <span className="text-sm font-mono text-white drop-shadow-md">
-                  {formatClock(playheadLocal)} / {formatDuration(clipWindowDuration)}
-                </span>
+                <PlayerOverlayReadout
+                  clipWindowStart={clipWindowStart}
+                  clipWindowEnd={clipWindowEnd}
+                />
               </div>
             </div>
 
@@ -289,7 +298,7 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
                 起点 <span className="text-gray-800 font-semibold">{formatClock(trimStart)}</span>
               </span>
               <span>
-                播放 <span className="text-red-600 font-semibold">{formatClock(playhead)}</span>
+                播放 <span className="text-red-600 font-semibold"><PlayheadClock /></span>
               </span>
               <span>
                 终点 <span className="text-gray-800 font-semibold">{formatClock(trimEnd)}</span>
