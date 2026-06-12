@@ -28,7 +28,6 @@
  *     than a context whose membership grows silently.
  */
 import {AlertCircle, Check, CheckCircle2, Pause, Play, Trash2} from 'lucide-react';
-import {useCallback} from 'react';
 import type {PointerEvent as ReactPointerEvent, ReactNode} from 'react';
 
 import {StatusBadge} from '../../components/StatusBadge';
@@ -138,19 +137,19 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
   // only the tiny clock/progress DOM nodes update each frame.
   const isPlaying = useStore((s) => s.isPlaying);
 
-  // PR4: stabilize the inline render props handed to TimelineSurface. Without
-  // these, a fresh closure was minted on every ReviewPanel render, defeating
-  // any memo on the timeline and forcing it to re-run its render even when its
-  // own inputs were unchanged. Identity now only changes when the underlying
-  // App handler does.
-  const handleScrubMove = useCallback(
-    (t: number) => syncVideoTime(t, {force: false}),
-    [syncVideoTime],
-  );
-  const renderActiveSegmentHandles = useCallback(
-    () => <TrimHandles onDragStart={handleTrimDragStart} />,
-    [handleTrimDragStart],
-  );
+  // PR4: the render props below (onScrubMove / renderActiveSegmentHandles) are
+  // deliberately inline. Memoizing them would be inert: TimelineSurface is not
+  // wrapped in React.memo, so it re-renders whenever ReviewPanel does
+  // regardless of prop identity — and even if it were memo'd, the props' App
+  // sources (syncVideoTime, handleTrimDragStart) are plain function
+  // declarations re-created every App render, so a useCallback keyed on them
+  // would change identity every render anyway. TimelineSurface also owns its
+  // own currentTimeMs subscription, so it already re-renders ~30Hz during
+  // playback on its own; a stable parent prop wouldn't change that. Stabilizing
+  // these for real would require useCallback-ing the entire transitive
+  // trim-drag closure in App (updateTrimRange → startTrimScroll → … over
+  // activeClip/activeSegment/clipWindow*), a missed-dependency stale-closure
+  // risk that isn't worth the ~couple-renders-per-session it would save.
 
   if (!activeClip || !activeVideo) {
     return (
@@ -258,9 +257,11 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
           trimEnd={trimEnd}
           activeClipLockedByExport={activeClipLockedByExport}
           onScrubStart={beginScrub}
-          onScrubMove={handleScrubMove}
+          onScrubMove={(t) => syncVideoTime(t, {force: false})}
           onScrubEnd={endScrub}
-          renderActiveSegmentHandles={renderActiveSegmentHandles}
+          renderActiveSegmentHandles={() => (
+            <TrimHandles onDragStart={handleTrimDragStart} />
+          )}
         />
 
         {activeClipSegments.length > 1 && (
