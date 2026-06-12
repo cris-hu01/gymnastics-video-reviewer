@@ -66,12 +66,26 @@ export interface PlaybackState {
   currentTimeMs: number;
   /** Pending seek command, or null if the renderer is caught up. */
   pendingSeek: PlaybackPendingSeek | null;
+  /**
+   * Desired playback speed multiplier (1 = normal). UI dispatches changes via
+   * `setPlaybackRate`; PlayerSurface mirrors it onto `video.playbackRate` the
+   * same way it mirrors `isPlaying`. This is a command-channel field: UI writes
+   * it, the renderer applies it — UI never touches `video.playbackRate` directly.
+   */
+  playbackRate: number;
 }
 
 export interface PlaybackActions {
   setVideoId: (id: string | null) => void;
   setDuration: (ms: number) => void;
   setIsPlaying: (playing: boolean) => void;
+  /**
+   * Set the desired playback speed. Clamps to a sane range and ignores
+   * non-finite input. PlayerSurface watches `playbackRate` and applies it to
+   * the <video> element; it is preserved across pause/play but reset on src
+   * swap (see `setVideoId`).
+   */
+  setPlaybackRate: (rate: number) => void;
   /**
    * Renderer-only publisher. UI components MUST treat this as read-only
    * (subscribe via selector) — never call it from a click handler.
@@ -101,21 +115,32 @@ export const createPlaybackSlice: StateCreator<PlaybackSlice, [], [], PlaybackSl
   isPlaying: false,
   currentTimeMs: 0,
   pendingSeek: null,
+  playbackRate: 1,
   setVideoId: (id) =>
     set((state) => {
       if (state.videoId === id) return state;
       // Switching video — reset transient signals so the next renderer
-      // mount does not act on stale pendingSeek / currentTime.
+      // mount does not act on stale pendingSeek / currentTime. Playback speed
+      // resets to 1 so a new clip never inherits a surprise fast/slow rate.
       return {
         videoId: id,
         currentTimeMs: 0,
         duration: 0,
         isPlaying: false,
         pendingSeek: null,
+        playbackRate: 1,
       };
     }),
   setDuration: (ms) => set({ duration: Math.max(0, ms) }),
   setIsPlaying: (playing) => set({ isPlaying: playing }),
+  setPlaybackRate: (rate) => {
+    if (!Number.isFinite(rate)) return;
+    // Clamp to the range the UI exposes; defends against a bad caller without
+    // coupling the store to the exact preset ladder (which lives in App).
+    const clamped = Math.min(4, Math.max(0.25, rate));
+    if (get().playbackRate === clamped) return;
+    set({ playbackRate: clamped });
+  },
   setCurrentTimeMs: (ms) => {
     // Guard against the renderer pushing NaN during src swap.
     if (!Number.isFinite(ms)) return;
