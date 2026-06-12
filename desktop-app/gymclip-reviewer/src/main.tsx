@@ -2,7 +2,7 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
-import {setApiToken} from './api/http';
+import {setApiToken, setApiBaseUrl} from './api/http';
 import {initSentry, SentryErrorBoundary} from './lib/sentry';
 import {UpdateToast} from './features/update';
 
@@ -14,6 +14,17 @@ async function loadApiTokenBeforeMount(): Promise<void> {
   // render already fires project fetches and synchronously builds media
   // URLs (stream/thumbnails). In pure-browser dev there is no desktop
   // bridge and the bare backend does not enforce auth — skip silently.
+  try {
+    // Resolve the dynamically-selected backend base URL FIRST: the port is
+    // chosen at spawn time (free port in 8000-8099), so a hardcoded 8000 would
+    // miss it. Must land before React mounts, same rationale as the token.
+    const baseUrl = await window.gymclipDesktop?.getBackendBaseUrl?.();
+    if (baseUrl) {
+      setApiBaseUrl(baseUrl);
+    }
+  } catch (error) {
+    console.error('Failed to load backend base URL from desktop bridge', error);
+  }
   try {
     const token = await window.gymclipDesktop?.getApiToken?.();
     if (token) {
