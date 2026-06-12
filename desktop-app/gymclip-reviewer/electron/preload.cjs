@@ -6,6 +6,10 @@ contextBridge.exposeInMainWorld('gymclipDesktop', {
   // Fetched by src/main.tsx before React mounts so every /api request
   // (headers) and media URL (?token=) carries it from the first paint.
   getApiToken: () => ipcRenderer.invoke('auth:get-api-token'),
+  // Dynamically-selected backend base URL (host + free port picked at spawn).
+  // Fetched by src/main.tsx before React mounts so requests target the real
+  // backend port instead of a hardcoded 8000.
+  getBackendBaseUrl: () => ipcRenderer.invoke('app:get-backend-base-url'),
   loadApiKey: () => ipcRenderer.invoke('settings:load-api-key'),
   saveApiKey: (apiKey) => ipcRenderer.invoke('settings:save-api-key', apiKey),
   clearApiKey: () => ipcRenderer.invoke('settings:clear-api-key'),

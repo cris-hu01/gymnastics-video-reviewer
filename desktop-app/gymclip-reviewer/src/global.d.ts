@@ -8,6 +8,9 @@ declare global {
       // Optional so an older preload paired with a newer renderer degrades
       // to no-auth instead of crashing.
       getApiToken?: () => Promise<string>;
+      // Dynamically-selected backend base URL (host + free port). Optional so an
+      // older preload paired with a newer renderer falls back to the default.
+      getBackendBaseUrl?: () => Promise<string>;
       loadApiKey: () => Promise<{ supported: boolean; apiKey: string | null }>;
       saveApiKey: (apiKey: string) => Promise<{ supported: boolean }>;
       clearApiKey: () => Promise<{ supported: boolean }>;

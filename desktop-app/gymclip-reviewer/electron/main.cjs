@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Notification, dialog, ipcMain, safeStorage, shell } = require('electron');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -174,7 +175,60 @@ app.on('child-process-gone', (event, details) => {
 // === end Sentry hooks ===
 
 const BACKEND_HOST = '127.0.0.1';
-const BACKEND_PORT = process.env.GYMCLIP_BACKEND_PORT || '8000';
+// Preferred port + scan range. The backend used to be pinned to a fixed 8000,
+// which collided with a stale backend (or anything else on 8000) and forced the
+// fragile ensureBackendCompatibility() heuristic to disambiguate. We now probe
+// for a free port in [8000, 8099] before spawning and thread the chosen port
+// through the spawn env, every main-process probe, and the renderer (via the
+// app:get-backend-port IPC channel). GYMCLIP_BACKEND_PORT still pins a fixed
+// port when explicitly set (dev / tests), in which case we use it verbatim.
+const BACKEND_PREFERRED_PORT = Number(process.env.GYMCLIP_BACKEND_PORT || '8000');
+const BACKEND_PORT_SCAN_LIMIT = 8099;
+const BACKEND_PORT_PINNED = Boolean(process.env.GYMCLIP_BACKEND_PORT);
+// Resolved once startBackend() picks a free port; defaults to the preferred port
+// so any early reference is still well-defined. All URL builders read this.
+let selectedBackendPort = BACKEND_PREFERRED_PORT;
+
+function backendBaseUrl() {
+  return `http://${BACKEND_HOST}:${selectedBackendPort}`;
+}
+
+// Probe whether a TCP port on BACKEND_HOST is free by attempting to bind it.
+// Resolves true when the bind succeeds (port free), false on EADDRINUSE / any
+// bind error (port unavailable). Used only on the loopback interface.
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once('error', () => {
+      resolve(false);
+    });
+    tester.once('listening', () => {
+      tester.close(() => resolve(true));
+    });
+    tester.listen(port, BACKEND_HOST);
+  });
+}
+
+// Pick a free port. When GYMCLIP_BACKEND_PORT is explicitly pinned we honor it
+// verbatim (dev/test reproducibility) without scanning. Otherwise scan upward
+// from the preferred port to BACKEND_PORT_SCAN_LIMIT and return the first free
+// one; throws if the whole range is occupied.
+async function chooseBackendPort() {
+  if (BACKEND_PORT_PINNED) {
+    return BACKEND_PREFERRED_PORT;
+  }
+  for (let port = BACKEND_PREFERRED_PORT; port <= BACKEND_PORT_SCAN_LIMIT; port += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await isPortFree(port)) {
+      return port;
+    }
+  }
+  throw new Error(
+    `未能在 ${BACKEND_PREFERRED_PORT}-${BACKEND_PORT_SCAN_LIMIT} 范围内找到可用端口，` +
+      `请关闭占用这些端口的程序后重试。`,
+  );
+}
+
 const RENDERER_URL = process.env.ELECTRON_RENDERER_URL || null;
 const BACKEND_START_TIMEOUT_MS = Number(process.env.GYMCLIP_BACKEND_START_TIMEOUT_MS || 60000);
 
@@ -634,12 +688,11 @@ function requestJson(url, timeoutMs = 3000) {
 }
 
 async function ensureBackendCompatibility() {
-  const baseUrl = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
-  const response = await requestJson(`${baseUrl}/openapi.json`);
+  const response = await requestJson(`${backendBaseUrl()}/openapi.json`);
   const paths = response.body?.paths ?? {};
   if (!Object.prototype.hasOwnProperty.call(paths, '/api/platform/matches')) {
     throw new Error(
-      `检测到旧版 backend 正在占用 ${BACKEND_PORT} 端口。` +
+      `检测到旧版 backend 正在占用 ${selectedBackendPort} 端口。` +
         `请先完全退出残留的 gymclip-backend / Electron 进程后重试。`,
     );
   }
@@ -647,10 +700,17 @@ async function ensureBackendCompatibility() {
 
 async function startBackend() {
   if (backendProcess && backendProcess.exitCode === null) {
-    await waitForHealth(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/health`);
+    // Already running on the previously-selected port; reuse it.
+    await waitForHealth(`${backendBaseUrl()}/api/health`);
     await ensureBackendCompatibility();
     return;
   }
+
+  // Pick a free port before spawning. This eliminates the 8000-collision class
+  // of startup failures (stale backend / unrelated listener). The chosen port
+  // is recorded in selectedBackendPort and consumed by every URL builder below
+  // plus the renderer (app:get-backend-port IPC).
+  selectedBackendPort = await chooseBackendPort();
 
   const backendRoot = resolveBackendRoot();
   const backendWorkspace = path.join(app.getPath('userData'), 'workspace');
@@ -671,8 +731,12 @@ async function startBackend() {
       PYTHONUNBUFFERED: '1',
       GYMCLIP_BACKEND_ROOT: backendRoot,
       GYMCLIP_BACKEND_HOST: BACKEND_HOST,
-      GYMCLIP_BACKEND_PORT: BACKEND_PORT,
+      GYMCLIP_BACKEND_PORT: String(selectedBackendPort),
       GYMCLIP_BACKEND_RELOAD: '0',
+      // Parent-process pid for the backend watchdog: if this Electron main
+      // process dies abnormally (SIGKILL / crash) and never runs before-quit,
+      // the backend self-terminates instead of orphaning. See parent_watchdog.py.
+      GYMCLIP_PARENT_PID: String(process.pid),
       GYMCLIP_WORKSPACE_ROOT: backendWorkspace,
       GYMCLIP_FFMPEG_PATH: resolveMediaToolPath('ffmpeg'),
       GYMCLIP_FFPROBE_PATH: resolveMediaToolPath('ffprobe'),
@@ -690,7 +754,7 @@ async function startBackend() {
     }
   });
 
-  await waitForHealth(`http://${BACKEND_HOST}:${BACKEND_PORT}/api/health`);
+  await waitForHealth(`${backendBaseUrl()}/api/health`);
   await ensureBackendCompatibility();
 }
 
@@ -889,6 +953,11 @@ ipcMain.handle('autoUpdater:quit-and-install', () => {
 // === end Auto-updater ===
 
 ipcMain.handle('auth:get-api-token', () => API_TOKEN);
+// Dynamically-selected backend port (free port found in [8000, 8099] at spawn).
+// The renderer fetches this BEFORE mounting React (alongside the API token) so
+// every /api request and media URL targets the actual backend, not a hardcoded
+// 8000. Returns the resolved base URL so the renderer never re-derives host/port.
+ipcMain.handle('app:get-backend-base-url', () => backendBaseUrl());
 ipcMain.handle('telemetry:get-config', () => getTelemetryConfig());
 ipcMain.handle('telemetry:set-consent', (_event, enabled) => setTelemetryConsent(enabled));
 ipcMain.handle('settings:load-api-key', () => loadSavedApiKey());
@@ -906,6 +975,24 @@ ipcMain.handle('dialog:select-directory', (_event, initialPath) => selectDirecto
 ipcMain.handle('dialog:select-import-sources', (_event, initialPath) => selectImportSources(initialPath));
 ipcMain.handle('notification:show', (_event, payload) => showSystemNotification(payload));
 
+// === Single-instance lock ===
+// A second launch would spawn a second backend that fights for the same port
+// AND a second main process that mutates the same userData/workspace state
+// files with no cross-process lock — corrupting project state. Acquire the
+// OS-level single-instance lock up front: if another instance already holds it
+// we quit immediately, and the running instance gets a `second-instance` event
+// to surface its window. Must run before app.whenReady() resolves.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // Another launch was attempted; focus/restore the existing window instead.
+    focusPrimaryWindow();
+  });
+}
+
+if (gotSingleInstanceLock) {
 app.whenReady().then(async () => {
   // 1) 首次启动弹 consent dialog；非首次直接读 telemetry.json。
   // 2) Sentry main init —— 必须放在 whenReady 内部（依赖 userData 路径）且在 consent 之后。
@@ -931,12 +1018,84 @@ app.whenReady().then(async () => {
     }
   });
 });
+} // end if (gotSingleInstanceLock)
+
+// === Reliable backend teardown on quit ===
+// SIGTERM asks the backend to exit; if it ignores the request (wedged in a
+// blocking syscall, stuck ffmpeg child, etc.) we escalate to SIGKILL after a
+// grace period. On Windows SIGTERM does NOT terminate a child *process tree*
+// (the spawned uvicorn plus any ffmpeg/ossutil grandchildren), so we use
+// `taskkill /T /F` to kill the whole tree. The 3s timer is cleared if the
+// process exits cleanly first, so the grace SIGKILL never lands on a dead pid.
+const BACKEND_KILL_GRACE_MS = 3000;
+let backendKillTimer = null;
+
+function terminateBackendProcess() {
+  const child = backendProcess;
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return; // nothing running
+  }
+  const pid = child.pid;
+
+  // Clear the grace timer the moment the child is gone, so we never SIGKILL a
+  // pid that may have been recycled.
+  child.once('exit', () => {
+    if (backendKillTimer) {
+      clearTimeout(backendKillTimer);
+      backendKillTimer = null;
+    }
+  });
+
+  if (process.platform === 'win32') {
+    // /T = kill the process tree (ffmpeg/ossutil grandchildren too), /F = force.
+    // Fire immediately: there is no graceful-then-force on Windows because
+    // SIGTERM is a no-op for the tree. taskkill /F is the reliable teardown.
+    //
+    // Run it SYNCHRONOUSLY: before-quit returns synchronously and the app then
+    // exits, so an async execFile could be torn down mid-flight, leaving the
+    // child tree alive. taskkill returns in milliseconds, so blocking here is
+    // acceptable and guarantees the tree is reaped before before-quit returns.
+    try {
+      execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+    } catch (error) {
+      // Non-zero exit (e.g. pid already gone -> "process not found") throws.
+      // Swallow it: a missing pid means teardown already happened. Never let
+      // this bubble out and crash the before-quit handler.
+      console.error('[shutdown] taskkill failed:', error?.message || error);
+    }
+    return;
+  }
+
+  // POSIX: polite SIGTERM first, then SIGKILL after the grace period if the
+  // process is still alive.
+  try {
+    child.kill('SIGTERM');
+  } catch (error) {
+    console.error('[shutdown] SIGTERM failed:', error?.message || error);
+  }
+  backendKillTimer = setTimeout(() => {
+    backendKillTimer = null;
+    const stillRunning = backendProcess && backendProcess.exitCode === null && backendProcess.signalCode === null;
+    if (stillRunning) {
+      try {
+        backendProcess.kill('SIGKILL');
+      } catch (error) {
+        console.error('[shutdown] SIGKILL failed:', error?.message || error);
+      }
+    }
+  }, BACKEND_KILL_GRACE_MS);
+  // Don't let the grace timer keep the event loop alive past quit.
+  if (typeof backendKillTimer.unref === 'function') {
+    backendKillTimer.unref();
+  }
+}
 
 app.on('before-quit', () => {
   app.isQuiting = true;
-  if (backendProcess) {
-    backendProcess.kill('SIGTERM');
-  }
+  terminateBackendProcess();
 });
 
 app.on('window-all-closed', () => {
