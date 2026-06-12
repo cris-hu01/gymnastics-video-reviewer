@@ -293,6 +293,12 @@ export default function App() {
   const trimRectRef = useRef<DOMRect | null>(null);
   const trimDraggingRef = useRef(false);
   const trimSavePromiseRef = useRef<Promise<ActiveSegmentEditSnapshot | null> | null>(null);
+  // Serializes the "flush pending trim → switch active clip" sequence. While a
+  // switch is in flight (flush awaiting + setActiveClipId not yet committed),
+  // re-entrant switch requests (rapid ↑/↑, click during flush) are ignored so
+  // they can't compute a stale nextClip off an un-updated activeClipId or reuse
+  // an in-flight flush promise and silently drop a fresh edit.
+  const isSwitchingRef = useRef(false);
   const toastIdRef = useRef(0);
   const clipUndoStackRef = useRef<ClipUndoSnapshot[]>([]);
 
@@ -1484,6 +1490,11 @@ export default function App() {
       setErrorMessage('没有可撤销的结构编辑');
       return;
     }
+    // Undo restores a different clip structure (a switch-away). Flush any
+    // pending trim edit through the same serializer first, so an in-flight
+    // 800ms debounce isn't dropped by the upcoming activeClip change. Bail only
+    // on re-entrancy; a flush failure still lets undo proceed (must-fix 2).
+    if (!(await flushTrimBeforeSwitch())) return;
 
     try {
       const response = await restoreCandidateClips(snapshot.candidateClips);
@@ -1563,6 +1574,33 @@ export default function App() {
     setClipSelectionBatch(clipIds, selectionState !== 'checked');
   }
 
+  /**
+   * Gate every "switch the active clip" entry point (Enter/Delete mark, ↑/↓
+   * step, click another card) through this serializer.
+   *
+   * Returns `false` when a switch is already in flight — the caller must abort
+   * its switch (re-entrancy guard, must-fix 1). Returns `true` when the caller
+   * may proceed; by then any pending trim edit has been flushed to the backend.
+   *
+   * Switching is prioritized over trim saving (must-fix 2): if the flush throws
+   * (network blip, backend validation), we DON'T block the switch — we surface
+   * a non-blocking notice and still return `true`, so the user is never locked
+   * onto one clip. A dropped trim the user is told about beats a frozen queue.
+   */
+  async function flushTrimBeforeSwitch(): Promise<boolean> {
+    if (isSwitchingRef.current) return false;
+    isSwitchingRef.current = true;
+    try {
+      await flushActiveSegmentEdits();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : '未知错误';
+      setErrorMessage(`裁剪范围未保存（${reason}），已切换片段`);
+    } finally {
+      isSwitchingRef.current = false;
+    }
+    return true;
+  }
+
   async function handleClipCardClick(clip: CandidateClip, event: React.MouseEvent<HTMLButtonElement>) {
     if ((event.metaKey || event.ctrlKey) && isClipExportSelectable(clip.status)) {
       event.preventDefault();
@@ -1574,12 +1612,7 @@ export default function App() {
     // trim edit first so the 800ms debounce isn't cancelled by the auto-save
     // effect cleanup. Skip when clicking the already-active clip (no switch).
     if (activeClip && clip.id !== activeClip.id) {
-      try {
-        await flushActiveSegmentEdits();
-      } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
-        return;
-      }
+      if (!(await flushTrimBeforeSwitch())) return;
     }
     setActiveVideoId(clip.video_id);
     setActiveClipId(clip.id);
@@ -1690,6 +1723,11 @@ export default function App() {
   }
 
   async function selectClipByOffset(offset: -1 | 1) {
+    // Re-entrancy guard FIRST: a rapid second ↑/↓ arriving while the previous
+    // switch's flush is still in flight must be ignored here, before we read
+    // activeClipId (still un-updated) and compute a stale nextClip that would
+    // only jump one grid. flushTrimBeforeSwitch returns false in that case.
+    if (isSwitchingRef.current) return;
     const idx = filteredClips.findIndex((clip) => clip.id === activeClipId);
     if (idx < 0) {
       if (filteredClips[0]) {
@@ -1701,12 +1739,7 @@ export default function App() {
     if (!nextClip) return;
     // Flush the pending trim edit before ↑/↓ moves the active clip away, so the
     // 800ms debounce isn't cancelled mid-flight by the auto-save effect cleanup.
-    try {
-      await flushActiveSegmentEdits();
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
-      return;
-    }
+    if (!(await flushTrimBeforeSwitch())) return;
     setActiveClipId(nextClip.id);
   }
 
@@ -2144,17 +2177,19 @@ export default function App() {
 
   async function handleStatusChange(clipId: string, status: ClipStatus) {
     if (guardClipMutation(clipId)) return;
-    // Flush any pending trim edit before switching away (Enter/Delete on the
-    // active clip would otherwise trigger the auto-save effect cleanup and
-    // silently drop the in-flight 800ms debounce). No-op when there is nothing
-    // pending or when this status change targets a non-active clip.
+    // Flush any pending trim edit before marking+switching away (Enter/Delete
+    // on the active clip would otherwise trigger the auto-save effect cleanup
+    // and silently drop the in-flight 800ms debounce). Only when this targets
+    // the active clip; no-op when nothing is pending.
+    //
+    // flushTrimBeforeSwitch returns false ONLY for re-entrancy (a switch is
+    // already in flight) — in that case bail so we don't double-mark/double-
+    // switch racing the first press (must-fix 1). It NEVER returns false for a
+    // flush failure: on failure it surfaces a notice and returns true, so the
+    // mark — the primary action the user pressed Enter for — still proceeds and
+    // is never swallowed by a trim-save error (must-fix 2).
     if (activeClip?.id === clipId) {
-      try {
-        await flushActiveSegmentEdits();
-      } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : '保存裁剪范围失败');
-        return;
-      }
+      if (!(await flushTrimBeforeSwitch())) return;
     }
     const currentIndex = filteredClips.findIndex((clip) => clip.id === clipId);
     const nextClipId = filteredClips[currentIndex + 1]?.id ?? filteredClips[currentIndex - 1]?.id ?? null;
