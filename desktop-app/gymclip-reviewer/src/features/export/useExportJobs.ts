@@ -232,9 +232,7 @@ export function useExportJobs(options: UseExportJobsOptions): ExportJobsApi {
       }
 
       if (job.status === 'cancelled') {
-        if (job.kind === 'detect') {
-          setSuccessMessage('检测已取消');
-        }
+        setSuccessMessage(job.kind === 'detect' ? '检测已取消' : '导出已取消');
         continue;
       }
 

@@ -5,6 +5,7 @@ import {
   addVideoAsCandidate,
   bindClipPlatformRecord,
   cancelDetectVideo,
+  cancelExport,
   deleteProjectVideo,
   deleteClipSegment,
   detectProjectVideo,
@@ -2470,6 +2471,23 @@ export default function App() {
     }
   }
 
+  async function handleCancelExport() {
+    if (!activeExportJob) return;
+    if (!window.confirm('确认取消当前导出任务吗？已完成导出的片段会保留。')) {
+      return;
+    }
+
+    try {
+      const response = await cancelExport();
+      setErrorMessage(null);
+      setSuccessMessage(response.message);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '取消导出失败');
+    } finally {
+      void refreshJobs({silent: true});
+    }
+  }
+
   function handleClearSavedApiKey() {
     setApiKey('');
     setRememberApiKey(false);
@@ -2946,6 +2964,7 @@ export default function App() {
         exportApi={exportApi}
         hasOssCredentials={hasOssCredentials}
         activeExportJob={activeExportJob}
+        onCancelExport={handleCancelExport}
       />
 
       {activeJobs.length > 0 && (

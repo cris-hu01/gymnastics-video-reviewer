@@ -1,4 +1,5 @@
 import type {
+  AppJob,
   DetectProjectResponse,
   ExportProjectResponse,
   ProjectResponse,
@@ -75,5 +76,11 @@ export async function exportProject(payload: {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload),
+  });
+}
+
+export async function cancelExport(): Promise<{job: AppJob; message: string}> {
+  return request<{job: AppJob; message: string}>('/api/project/cancel-export', {
+    method: 'POST',
   });
 }
