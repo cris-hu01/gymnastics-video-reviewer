@@ -4,7 +4,8 @@
  * Stage 1 (this commit): launch Electron, wait for the first BrowserWindow,
  * assert the window title, and poll the backend's /api/health until it
  * responds 200 OK (this confirms the backend Python subprocess has booted
- * and bound to 127.0.0.1:8000).
+ * and bound to 127.0.0.1; the port is pinned to 8000 for the run via
+ * GYMCLIP_BACKEND_PORT and resolved through the desktop bridge).
  *
  * Stage 2 (follow-up): drive the actual import → review → export flow via
  * the testid selectors in ./testids. Step skeletons are sketched below
@@ -67,6 +68,13 @@ test.describe('main flow', () => {
         GYMCLIP_TELEMETRY_ENABLED: '0',
         // Sandbox workspace so e2e runs don't touch the dev workspace.
         GYMCLIP_WORKSPACE: process.env.GYMCLIP_WORKSPACE ?? '/tmp/gymclip-e2e',
+        // Pin the backend port. main.cjs now scans 8000-8099 for a free port,
+        // so without pinning, a runner with 8000 occupied (parallel job / stale
+        // dev backend) would bind 8001+ while the health assertion below polls
+        // a fixed URL -> 30s timeout + misleading failure. An explicit
+        // GYMCLIP_BACKEND_PORT is honored verbatim (chooseBackendPort skips the
+        // scan), so the port is deterministic across runners.
+        GYMCLIP_BACKEND_PORT: '8000',
       },
       timeout: 60_000,
     });
@@ -88,11 +96,24 @@ test.describe('main flow', () => {
 
   test('backend /api/health responds 200 within 30s of launch', async () => {
     // Poll from the renderer process so we exercise the same fetch path
-    // production code uses (Electron's net stack + CORS).
+    // production code uses (Electron's net stack + CORS). Resolve the backend
+    // base URL and API token from the desktop bridge instead of hardcoding the
+    // port/omitting the token: the port is dynamically selected (pinned to 8000
+    // for this run via GYMCLIP_BACKEND_PORT) and PR2's middleware enforces the
+    // X-Gymclip-Token header on every /api request, so a tokenless fixed-URL
+    // probe would 401.
     await window.waitForFunction(
       async () => {
         try {
-          const response = await fetch('http://127.0.0.1:8000/api/health');
+          const bridge = (window as unknown as {gymclipDesktop?: {
+            getBackendBaseUrl?: () => Promise<string>;
+            getApiToken?: () => Promise<string>;
+          }}).gymclipDesktop;
+          const baseUrl = (await bridge?.getBackendBaseUrl?.()) ?? 'http://127.0.0.1:8000';
+          const token = (await bridge?.getApiToken?.()) ?? '';
+          const response = await fetch(`${baseUrl}/api/health`, {
+            headers: token ? {'X-Gymclip-Token': token} : undefined,
+          });
           return response.ok;
         } catch {
           return false;

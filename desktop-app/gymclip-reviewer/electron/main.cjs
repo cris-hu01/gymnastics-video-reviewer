@@ -1,5 +1,5 @@
 const { app, BrowserWindow, Notification, dialog, ipcMain, safeStorage, shell } = require('electron');
-const { spawn, execFile } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const http = require('node:http');
 const net = require('node:net');
 const fs = require('node:fs');
@@ -1050,9 +1050,20 @@ function terminateBackendProcess() {
     // /T = kill the process tree (ffmpeg/ossutil grandchildren too), /F = force.
     // Fire immediately: there is no graceful-then-force on Windows because
     // SIGTERM is a no-op for the tree. taskkill /F is the reliable teardown.
+    //
+    // Run it SYNCHRONOUSLY: before-quit returns synchronously and the app then
+    // exits, so an async execFile could be torn down mid-flight, leaving the
+    // child tree alive. taskkill returns in milliseconds, so blocking here is
+    // acceptable and guarantees the tree is reaped before before-quit returns.
     try {
-      execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
+      execFileSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
     } catch (error) {
+      // Non-zero exit (e.g. pid already gone -> "process not found") throws.
+      // Swallow it: a missing pid means teardown already happened. Never let
+      // this bubble out and crash the before-quit handler.
       console.error('[shutdown] taskkill failed:', error?.message || error);
     }
     return;

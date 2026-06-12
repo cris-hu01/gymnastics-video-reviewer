@@ -5,6 +5,7 @@ pytest and bare runs never spawn the thread) and the liveness logic, without
 ever calling os._exit (which would kill the test process).
 """
 import os
+import sys
 
 import pytest
 
@@ -46,11 +47,22 @@ def test_parent_dead_for_nonexistent_pid():
     assert parent_watchdog._parent_is_alive(2**31 - 1) is False
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Exercises the reparenting (getppid mismatch) branch, which is the "
+        "Unix-only detection path. On Windows there is no reparenting: "
+        "os.getppid() keeps returning the original parent pid after it dies, so "
+        "this branch never fires in production and the test would only pass via "
+        "the kill(0) fallback — i.e. it would NOT be testing the real Windows "
+        "behavior. See parent_watchdog module docstring (Windows-gap section)."
+    ),
+)
 def test_parent_dead_when_ppid_changed():
     # If the recorded parent pid differs from the live getppid(), the original
-    # parent has exited (reparenting) -> treated as gone. Pick a pid that is
-    # neither our pid nor our ppid; os.getpid() of self works (we are not our
-    # own parent), and getppid() != getpid() so the reparenting branch fires.
+    # parent has exited (reparenting) -> treated as gone. os.getpid() (self) is
+    # a live pid that is NOT our parent, so getppid() != getpid() and the
+    # reparenting branch fires, returning False without reaching kill(0).
     assert parent_watchdog._parent_is_alive(os.getpid()) is False
 
 

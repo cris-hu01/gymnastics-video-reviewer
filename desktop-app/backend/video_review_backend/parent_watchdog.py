@@ -11,17 +11,32 @@ env var. This module starts a background daemon thread that periodically checks
 whether that parent is still alive; when it disappears, the backend shuts itself
 down.
 
-Two independent liveness signals are used so the watchdog is robust across
-platforms and reparenting quirks:
+Two liveness signals are used; either one firing is treated as "parent gone":
 
-1. ``os.getppid()`` — when the original parent dies, the OS reparents this
-   process (to init/pid 1 on Unix, or the ppid simply stops matching). If the
-   live ppid no longer equals the recorded parent pid, the parent is gone.
+1. ``os.getppid()`` — on Unix, when the original parent dies the OS reparents
+   this process (to init/pid 1 or a subreaper), so the live ppid stops matching
+   the recorded parent pid. This is the strong, pid-reuse-immune signal.
 2. ``os.kill(pid, 0)`` — signal 0 performs error-checking without sending a
-   signal; ``ProcessLookupError`` means the pid no longer exists. (On Windows
-   ``os.kill(pid, 0)`` raises ``OSError`` for a dead pid as well.)
+   signal; ``ProcessLookupError`` (or a generic ``OSError`` on Windows) means
+   the pid no longer exists.
 
-Both are best-effort; either one firing is treated as "parent gone".
+Platform coverage is NOT equal — be honest about the Windows gap:
+
+* macOS / Linux: BOTH signals work. Reparenting (signal 1) is immune to pid
+  reuse, so coverage is solid.
+* Windows: there is NO reparenting — ``os.getppid()`` keeps returning the
+  ORIGINAL parent pid even after that parent dies, so signal 1 is effectively
+  dead weight on win32. That leaves ``os.kill(pid, 0)`` (signal 2) as the sole
+  guard, and it is vulnerable to **pid reuse**: if the parent dies and the OS
+  recycles its pid into an unrelated new process before the next poll, the
+  probe sees a live pid and the backend wrongly believes its parent is alive →
+  it can still orphan. Windows recycles pids aggressively, so this is a real
+  (if low-probability, ~3s window) residual risk, not a theoretical one.
+
+  Closing the Windows gap properly needs the Win32 API: ``OpenProcess`` on the
+  recorded pid plus a creation-time comparison (``GetProcessTimes``) to detect
+  reuse, via ctypes. Deferred as a follow-up; the common abnormal-exit case
+  (parent SIGKILL/crash, pid NOT immediately reused) is still caught here.
 
 Safety contract:
 * No-op (returns ``False``) when ``GYMCLIP_PARENT_PID`` is unset or unparsable —
@@ -54,9 +69,11 @@ def _parent_is_alive(parent_pid: int) -> bool:
     Returns False as soon as either liveness signal indicates the parent is gone.
     """
     # Signal 1: reparenting. On Unix the orphaned child is reparented (ppid -> 1
-    # or another subreaper); on any platform a changed ppid means the original
-    # parent exited. getppid() is unavailable on some exotic platforms but is
-    # present on macOS/Linux/Windows (where Python emulates it).
+    # or another subreaper), so a changed ppid means the original parent exited
+    # — pid-reuse-immune. NOTE: on Windows there is no reparenting; getppid()
+    # keeps returning the original parent pid even after it dies, so this branch
+    # never fires on win32 and the kill(0) probe below is the sole (pid-reuse-
+    # vulnerable) guard there. See the module docstring's Windows-gap section.
     try:
         if os.getppid() != parent_pid:
             return False
