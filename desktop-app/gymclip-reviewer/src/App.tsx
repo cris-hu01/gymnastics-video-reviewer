@@ -106,11 +106,23 @@ type ActiveSegmentEditSnapshot = {
   playheadValue: number;
 };
 
-type ToastKind = 'success' | 'error';
+type ToastKind = 'success' | 'error' | 'info';
 type AppToast = {
   id: number;
   kind: ToastKind;
   message: string;
+};
+
+// How many toasts may stack at once. Older toasts beyond this cap are evicted
+// (oldest first) when a new one arrives, so a burst of batch-operation messages
+// can sit side by side instead of silently overwriting each other (discovery
+// 4-2). Errors live longer than success/info; hover pauses auto-dismiss so long
+// failure lists stay readable (discovery 4-1).
+const MAX_VISIBLE_TOASTS = 3;
+const TOAST_DURATION_MS: Record<ToastKind, number> = {
+  error: 6000,
+  success: 3500,
+  info: 3500,
 };
 
 const SPORT_ITEM_LABELS: Record<number, string> = {
@@ -173,8 +185,11 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [toast, setToast] = useState<AppToast | null>(null);
-  const [isToastVisible, setIsToastVisible] = useState(false);
+  // Toast queue (discovery 4-1/4-2): a small stack instead of a single slot.
+  // Each toast owns an independent dismiss timer (managed by the per-toast
+  // ToastBubble component in AppHeader) so consecutive batch messages no longer
+  // clobber one another. enqueueToast appends and trims to MAX_VISIBLE_TOASTS.
+  const [toasts, setToasts] = useState<AppToast[]>([]);
   // A3: jobs migrated to zustand (see store/jobs.ts). Subscribed once here so
   // the existing useExportJobs hook (which receives the array as a prop) keeps
   // working unchanged; setters come straight from the store.
@@ -804,7 +819,18 @@ export default function App() {
   );
   const selectedStartableVideos = useMemo(
     () =>
-      selectedVideos.filter((video) => video.status === 'queued' && !detectJobsByVideoId.has(video.id)),
+      // 'queued' is the fresh-import state; 'error' is a video whose previous
+      // detection failed. The backend /detect endpoint accepts any non-direct
+      // video that still has its source file and no active detect job (it just
+      // resets video.status='queued' and re-queues), so an errored video can be
+      // re-detected — markVideosQueued + detectProjectVideo below reset its
+      // status before the round trip. Widening startable to include 'error'
+      // re-enables the detect button for failed videos (discovery 6-1).
+      selectedVideos.filter(
+        (video) =>
+          (video.status === 'queued' || video.status === 'error') &&
+          !detectJobsByVideoId.has(video.id),
+      ),
     [selectedVideos, detectJobsByVideoId],
   );
   const selectedCancellableVideos = useMemo(
@@ -1147,30 +1173,13 @@ export default function App() {
     setSuccessMessage(null);
   }, [errorMessage]);
 
-  useEffect(() => {
-    if (!toast) {
-      setIsToastVisible(false);
-      return;
-    }
-
-    setIsToastVisible(false);
-    const showFrame = window.requestAnimationFrame(() => {
-      setIsToastVisible(true);
-    });
-    const displayDuration = toast.kind === 'error' ? 6000 : 3500;
-    const hideTimer = window.setTimeout(() => {
-      setIsToastVisible(false);
-    }, displayDuration);
-    const clearTimer = window.setTimeout(() => {
-      setToast((current) => (current?.id === toast.id ? null : current));
-    }, displayDuration + 180);
-
-    return () => {
-      window.cancelAnimationFrame(showFrame);
-      window.clearTimeout(hideTimer);
-      window.clearTimeout(clearTimer);
-    };
-  }, [toast]);
+  // Each ToastBubble (in AppHeader) owns its own enter-animation + auto-dismiss
+  // timer and calls this to remove itself once it has faded out. Hovering a
+  // bubble pauses its timer so a long batch-failure list stays readable
+  // (discovery 4-1).
+  function dismissToast(id: number) {
+    setToasts((current) => current.filter((entry) => entry.id !== id));
+  }
 
   useEffect(() => {
     if (!videoContextMenu) return;
@@ -1570,17 +1579,30 @@ export default function App() {
           togglePlayPause();
           break;
         case 'enter':
+          if (activeElement instanceof HTMLButtonElement) {
+            activeElement.blur();
+          }
+          // Batch path (discovery 5-1): with a multi-selection, Enter marks the
+          // whole selected set kept. The per-clip export lock is enforced inside
+          // handleBatchStatusChange (locked clips skipped + reported), so no
+          // activeClipLockedByExport short-circuit here. Falls back to the
+          // single active clip when nothing is selected.
+          if (selectedClipIdSet.size > 0) {
+            void handleBatchStatusChange([...selectedClipIdSet], 'kept');
+            break;
+          }
           if (activeClipLockedByExport) {
             setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
             break;
-          }
-          if (activeElement instanceof HTMLButtonElement) {
-            activeElement.blur();
           }
           void handleStatusChange(activeClip.id, 'kept');
           break;
         case 'delete':
         case 'backspace':
+          if (selectedClipIdSet.size > 0) {
+            void handleBatchStatusChange([...selectedClipIdSet], 'deleted');
+            break;
+          }
           if (activeClipLockedByExport) {
             setErrorMessage(EXPORT_LOCKED_CLIP_MESSAGE);
             break;
@@ -1677,7 +1699,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob, numberKeyBindableRecords]);
+  }, [activeClip, activeVideo, showExport, showImportModal, videoContextMenu, trimStart, trimEnd, activeSegment, project, activeClipId, activeSegmentId, activeClipLockedByExport, activeExportJob, numberKeyBindableRecords, selectedClipIdSet]);
 
   function setProjectState(nextProject: ProjectState) {
     // PR4: every direct (user-initiated PATCH) write bumps the same write-seq
@@ -1741,7 +1763,9 @@ export default function App() {
     if (guardRestoreClipStructure()) return;
     const snapshot = clipUndoStackRef.current.pop();
     if (!snapshot) {
-      setErrorMessage('没有可撤销的结构编辑');
+      // Nothing to undo is a normal boundary, not a failure — surface it as a
+      // neutral info toast rather than the red error styling (discovery 7-2).
+      enqueueToast('info', '没有可撤销的结构编辑');
       return;
     }
     // Undo restores a different clip structure (a switch-away). Flush any
@@ -2518,6 +2542,12 @@ export default function App() {
     const currentIndex = filteredClips.findIndex((clip) => clip.id === clipId);
     const nextClipId = filteredClips[currentIndex + 1]?.id ?? filteredClips[currentIndex - 1]?.id ?? null;
 
+    // Status changes (kept/deleted) now join the structure undo stack so an
+    // accidental Enter/Delete is recoverable with Cmd+Z (discovery 7-1). The
+    // snapshot is the same full candidate_clips clone the structure edits use,
+    // captured BEFORE the mutation; discarded if the update throws so we don't
+    // leave a no-op undo entry.
+    const undoSnapshot = pushClipUndoSnapshot();
     try {
       const response = await updateClip(clipId, {status});
       setProjectState(response.project);
@@ -2530,9 +2560,84 @@ export default function App() {
         setErrorMessage(null);
       }
     } catch (error) {
+      discardClipUndoSnapshot(undoSnapshot);
       setErrorMessage(error instanceof Error ? error.message : '更新片段状态失败');
     } finally {
       if (acquiredGuard) releaseSwitchGuard();
+    }
+  }
+
+  /**
+   * Batch status change (discovery 5-1): apply kept/deleted to the entire
+   * Cmd/Ctrl-click selection at once, not just the active clip. Engaged from
+   * the Enter/Delete keydown when `selectedClipIds` is non-empty.
+   *
+   * Selection only ever holds export-selectable clips (kept/exported) — the
+   * card click toggle and the selection-cleanup effect both gate on
+   * `isClipExportSelectable` — so this never marks a `pending`/`deleted` clip
+   * by surprise. Locked (in-export) clips are skipped and reported.
+   *
+   * Reuses existing machinery:
+   *   - ONE undo snapshot for the whole batch (so a single Cmd+Z reverts it).
+   *   - flushTrimBeforeSwitch first (PR3) so a pending trim edit on the active
+   *     clip isn't dropped, and the switch guard covers the whole operation.
+   *   - updateClip looped per clip (no bulk endpoint exists); failures are
+   *     collected and surfaced without aborting the rest.
+   */
+  async function handleBatchStatusChange(clipIds: string[], status: ClipStatus) {
+    const targetIds = clipIds.filter((id) => !isClipLockedByExport(id));
+    const lockedCount = clipIds.length - targetIds.length;
+    if (targetIds.length === 0) {
+      setErrorMessage(
+        lockedCount > 0
+          ? '所选片段都在当前导出批次中，导出完成前不可标记'
+          : '没有可标记的片段',
+      );
+      return;
+    }
+
+    // Flush the active clip's pending trim before mutating (only relevant when
+    // the active clip is part of the selection); acquire the switch guard for
+    // the whole batch. proceed===false means a switch is already in flight —
+    // bail (don't double-apply), don't release a guard we didn't take.
+    let flushFailed = false;
+    const guard = await flushTrimBeforeSwitch();
+    if (!guard.proceed) return;
+    flushFailed = guard.flushFailed;
+
+    const undoSnapshot = pushClipUndoSnapshot();
+    const failed: string[] = [];
+    let lastProject: ProjectState | null = null;
+    try {
+      for (const clipId of targetIds) {
+        try {
+          const response = await updateClip(clipId, {status});
+          lastProject = response.project;
+        } catch (error) {
+          failed.push(error instanceof Error && error.message ? error.message : clipId);
+        }
+      }
+      if (lastProject) {
+        setProjectState(lastProject);
+      }
+      const succeeded = targetIds.length - failed.length;
+      if (succeeded === 0) {
+        discardClipUndoSnapshot(undoSnapshot);
+      }
+      const actionLabel = status === 'kept' ? '保留' : status === 'deleted' ? '删除' : status;
+      if (failed.length > 0) {
+        const prefix = succeeded > 0 ? `已${actionLabel} ${succeeded} 个片段；` : '';
+        setErrorMessage(`${prefix}${failed.length} 个片段标记失败：${failed.join('、')}`);
+      } else if (!flushFailed) {
+        setErrorMessage(null);
+        const lockedNote = lockedCount > 0 ? `（跳过 ${lockedCount} 个导出中片段）` : '';
+        setSuccessMessage(`已${actionLabel} ${succeeded} 个所选片段${lockedNote}`);
+      }
+    } catch (error) {
+      discardClipUndoSnapshot(undoSnapshot);
+      setErrorMessage(error instanceof Error ? error.message : '批量标记片段失败');
+    } finally {
+      releaseSwitchGuard();
     }
   }
 
@@ -2800,11 +2905,12 @@ export default function App() {
     const trimmedMessage = message.trim();
     if (!trimmedMessage) return;
     toastIdRef.current += 1;
-    setToast({
-      id: toastIdRef.current,
-      kind,
-      message: trimmedMessage,
-    });
+    const next: AppToast = {id: toastIdRef.current, kind, message: trimmedMessage};
+    // Append and keep only the newest MAX_VISIBLE_TOASTS — a burst (e.g. a
+    // success line plus a long batch-failure line) coexists instead of
+    // overwriting (discovery 4-2). Older toasts beyond the cap drop off the
+    // front so the stack can't grow unbounded.
+    setToasts((current) => [...current, next].slice(-MAX_VISIBLE_TOASTS));
   }
 
   return (
@@ -2816,8 +2922,8 @@ export default function App() {
     >
       <AppHeader
         desktopBridge={desktopBridge}
-        toast={toast}
-        isToastVisible={isToastVisible}
+        toasts={toasts}
+        onDismissToast={dismissToast}
         showApiKey={showApiKey}
         setShowApiKey={setShowApiKey}
         apiKey={apiKey}

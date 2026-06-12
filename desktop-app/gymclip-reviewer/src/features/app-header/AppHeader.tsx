@@ -19,22 +19,142 @@
  *   `import-file-input`, `import-file-input-direct-clip`,
  *   `import-trigger`, `import-trigger-direct-clip`, `export-trigger`.
  */
-import {AlertCircle, CheckCircle2, Download, FileVideo, Key, Upload, XCircle} from 'lucide-react';
+import type {FC} from 'react';
+import {useEffect, useRef, useState} from 'react';
+import {AlertCircle, CheckCircle2, Download, FileVideo, Info, Key, Upload, XCircle} from 'lucide-react';
 
 import type {AppJob, ProjectState} from '../../types';
 import type {ExportJobsApi} from '../export';
 import type {VideoImportApi} from '../import';
 
+type ToastKind = 'success' | 'error' | 'info';
+
 type AppToast = {
   id: number;
-  kind: 'success' | 'error';
+  kind: ToastKind;
   message: string;
+};
+
+const TOAST_DURATION_MS: Record<ToastKind, number> = {
+  error: 6000,
+  success: 3500,
+  info: 3500,
+};
+
+/**
+ * A single toast bubble that owns its own enter-animation + auto-dismiss timer.
+ *
+ * - Multi-line: the message wraps (no `truncate`) so long batch-failure lists
+ *   are fully readable (discovery 4-1).
+ * - Hover pauses dismissal: while the pointer is over the bubble the timer is
+ *   cleared and restarted on leave, so the user can read at their own pace.
+ * - On fade-out it calls `onDismiss(id)` so the parent removes it from the
+ *   queue.
+ */
+interface ToastBubbleProps {
+  toast: AppToast;
+  onDismiss: (id: number) => void;
+}
+
+const ToastBubble: FC<ToastBubbleProps> = ({toast, onDismiss}) => {
+  const [visible, setVisible] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const dismissTimerRef = useRef<number | null>(null);
+  const removeTimerRef = useRef<number | null>(null);
+
+  // Enter animation: mount hidden, flip visible on the next frame.
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setVisible(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  // Auto-dismiss timer, paused while hovered. Re-armed whenever hover ends.
+  useEffect(() => {
+    if (hovered) {
+      if (dismissTimerRef.current != null) {
+        window.clearTimeout(dismissTimerRef.current);
+        dismissTimerRef.current = null;
+      }
+      return;
+    }
+    dismissTimerRef.current = window.setTimeout(() => {
+      setVisible(false);
+      removeTimerRef.current = window.setTimeout(() => onDismiss(toast.id), 200);
+    }, TOAST_DURATION_MS[toast.kind]);
+    return () => {
+      if (dismissTimerRef.current != null) {
+        window.clearTimeout(dismissTimerRef.current);
+        dismissTimerRef.current = null;
+      }
+    };
+  }, [hovered, toast.id, toast.kind, onDismiss]);
+
+  useEffect(
+    () => () => {
+      if (removeTimerRef.current != null) window.clearTimeout(removeTimerRef.current);
+    },
+    [],
+  );
+
+  const tone =
+    toast.kind === 'error'
+      ? {
+          shell: 'border-red-200/90 bg-gradient-to-r from-red-50/95 via-white to-red-50/65 text-red-700',
+          badge: 'border-red-200 bg-red-100/90 text-red-600',
+          text: 'text-red-700',
+        }
+      : toast.kind === 'info'
+        ? {
+            shell: 'border-gray-200/90 bg-gradient-to-r from-gray-50/95 via-white to-gray-50/65 text-gray-700',
+            badge: 'border-gray-200 bg-gray-100/90 text-gray-500',
+            text: 'text-gray-700',
+          }
+        : {
+            shell: 'border-green-200/90 bg-gradient-to-r from-green-50/95 via-white to-green-50/65 text-green-700',
+            badge: 'border-green-200 bg-green-100/90 text-green-600',
+            text: 'text-green-700',
+          };
+
+  return (
+    <div
+      className="pointer-events-auto flex items-center"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div
+        className={`max-w-[26rem] rounded-[1.05rem] border px-3 py-1.5 shadow-[0_8px_22px_rgba(15,23,42,0.09)] ring-1 ring-white/70 backdrop-blur-xl transition-all duration-200 ease-out ${tone.shell} ${
+          visible ? 'translate-y-0 opacity-100' : '-translate-y-1 opacity-0'
+        }`}
+      >
+        <div className="flex items-start gap-2">
+          <div
+            className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${tone.badge}`}
+          >
+            {toast.kind === 'error' ? (
+              <AlertCircle size={14} strokeWidth={2.25} />
+            ) : toast.kind === 'info' ? (
+              <Info size={14} strokeWidth={2.25} />
+            ) : (
+              <CheckCircle2 size={14} strokeWidth={2.25} />
+            )}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div
+              className={`whitespace-pre-wrap break-words text-[13px] font-medium leading-snug tracking-[0.01em] ${tone.text}`}
+            >
+              {toast.message}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 };
 
 export interface AppHeaderProps {
   desktopBridge: typeof window.gymclipDesktop;
-  toast: AppToast | null;
-  isToastVisible: boolean;
+  toasts: AppToast[];
+  onDismissToast: (id: number) => void;
   showApiKey: boolean;
   setShowApiKey: (value: boolean | ((prev: boolean) => boolean)) => void;
   apiKey: string;
@@ -65,8 +185,8 @@ export interface AppHeaderProps {
 export function AppHeader(props: AppHeaderProps) {
   const {
     desktopBridge,
-    toast,
-    isToastVisible,
+    toasts,
+    onDismissToast,
     showApiKey,
     setShowApiKey,
     apiKey,
@@ -107,40 +227,11 @@ export function AppHeader(props: AppHeaderProps) {
           G
         </div>
         <h1 className="text-gray-900 font-semibold tracking-tight">GymClip Reviewer</h1>
-        {toast && (
-          <div className="pointer-events-none ml-1 flex items-center self-stretch">
-            <div
-              className={`max-w-[22rem] rounded-[1.05rem] border px-3 py-1.5 shadow-[0_8px_22px_rgba(15,23,42,0.09)] ring-1 ring-white/70 backdrop-blur-xl transition-all duration-200 ease-out ${
-                toast.kind === 'error'
-                  ? 'border-red-200/90 bg-gradient-to-r from-red-50/95 via-white to-red-50/65 text-red-700'
-                  : 'border-green-200/90 bg-gradient-to-r from-green-50/95 via-white to-green-50/65 text-green-700'
-              } ${isToastVisible ? 'translate-y-0 opacity-100' : '-translate-y-1 opacity-0'}`}
-            >
-              <div className="flex items-center gap-2">
-                <div
-                  className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${
-                    toast.kind === 'error'
-                      ? 'border-red-200 bg-red-100/90 text-red-600'
-                      : 'border-green-200 bg-green-100/90 text-green-600'
-                  }`}
-                >
-                  {toast.kind === 'error' ? (
-                    <AlertCircle size={14} strokeWidth={2.25} />
-                  ) : (
-                    <CheckCircle2 size={14} strokeWidth={2.25} />
-                  )}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div
-                    className={`truncate text-[13px] font-medium tracking-[0.01em] ${
-                      toast.kind === 'error' ? 'text-red-700' : 'text-green-700'
-                    }`}
-                  >
-                    {toast.message}
-                  </div>
-                </div>
-              </div>
-            </div>
+        {toasts.length > 0 && (
+          <div className="pointer-events-none ml-1 flex flex-col items-start gap-1.5 self-center">
+            {toasts.map((toast) => (
+              <ToastBubble key={toast.id} toast={toast} onDismiss={onDismissToast} />
+            ))}
           </div>
         )}
       </div>
