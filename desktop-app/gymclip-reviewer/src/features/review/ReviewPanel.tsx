@@ -87,12 +87,20 @@ export interface ReviewPanelProps {
 const KEYBOARD_HINTS: Array<{keys: string[]; label: string}> = [
   {keys: ['Space'], label: '播放'},
   {keys: ['←', '→'], label: '快进退'},
+  {keys: ['⇧←', '⇧→'], label: '逐帧'},
   {keys: ['↑', '↓'], label: '切换'},
+  {keys: ['[', ']'], label: '变速'},
   {keys: ['A', 'D'], label: '左边界'},
   {keys: ['J', 'L'], label: '右边界'},
+  {keys: ['I', 'O'], label: '入/出点'},
   {keys: ['B'], label: '拆分'},
-  {keys: ['C'], label: '删除'},
+  {keys: ['C'], label: '删除选区'},
   {keys: ['N'], label: '独立'},
+  {keys: ['/'], label: '搜卡片'},
+  {keys: ['1-9'], label: '绑卡片'},
+  {keys: ['Enter'], label: '保留'},
+  {keys: ['Del'], label: '丢弃'},
+  {keys: ['⌘Z'], label: '撤销'},
 ];
 
 export function ReviewPanel(props: ReviewPanelProps): ReactNode {
@@ -136,6 +144,9 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
   // segment switcher, action buttons, cheat-sheet) static during playback —
   // only the tiny clock/progress DOM nodes update each frame.
   const isPlaying = useStore((s) => s.isPlaying);
+  // Playback speed changes only a handful of times per session ([ / ] keys),
+  // so subscribing it on the panel body is as cheap as `isPlaying` above.
+  const playbackRate = useStore((s) => s.playbackRate);
 
   // PR4: the render props below (onScrubMove / renderActiveSegmentHandles) are
   // deliberately inline. Memoizing them would be inert: TimelineSurface is not
@@ -305,8 +316,14 @@ export function ReviewPanel(props: ReviewPanelProps): ReactNode {
               </span>
             </div>
           </div>
-          <div className="text-xs text-gray-400">
-            时长 {formatClock(Math.max(0, trimEnd - trimStart))}
+          <div className="flex items-center gap-3 text-xs text-gray-400">
+            <span
+              className={`font-mono font-semibold ${playbackRate !== 1 ? 'text-red-600' : 'text-gray-400'}`}
+              title="播放倍速（[ 减速 / ] 加速）"
+            >
+              {playbackRate}×
+            </span>
+            <span>时长 {formatClock(Math.max(0, trimEnd - trimStart))}</span>
           </div>
         </div>
 
