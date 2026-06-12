@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from video_review_backend import storage as storage_module
 from video_review_backend import video_metadata as video_metadata_module
+from video_review_backend.deps.state_helpers import merge_export_state
 from video_review_backend.export_service import (
     ExportCancelledError,
     ExportService,
@@ -389,6 +390,78 @@ class TestExportCancellation:
         # Both local exports completed, but no upload ran: cancelled at the upload
         # boundary (inside _process_upload, before _upload_clip_output).
         assert upload_calls == []
+
+    def test_cancel_in_upload_mode_persists_locally_exported_clips(self, tmp_path: Path):
+        """Regression: in export_and_upload, clips whose LOCAL export finished but
+        whose upload hasn't run yet are queued in upload_work and NOT yet in
+        results_by_clip_id. They must still be in touched_clip_ids on cancel — they
+        have status=exported + a real file on disk; dropping them would orphan the
+        files and lose progress. (export_only happened to be correct because every
+        processed clip lands in results_by_clip_id; this mode exposes the gap.)
+        """
+        service = _make_service()
+        out_dir = tmp_path / "out"
+
+        state = ProjectState()
+        state.videos.append(_make_video())
+        state.platform_records.append(_make_record(record_id="rec_a"))
+        state.platform_records.append(_make_record(record_id="rec_b"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_a", platform_record_id="rec_a"))
+        state.candidate_clips.append(_make_clip(clip_id="clip_b", platform_record_id="rec_b"))
+
+        def fake_export(*, video_path, clip, output_file, export_mode):
+            Path(output_file).write_bytes(b"fake-mp4")
+
+        uploads_phase = {"flag": False}
+
+        def cancel() -> bool:
+            return uploads_phase["flag"]
+
+        with patch.object(service, "_ensure_ffmpeg"), patch.object(
+            service, "_export_clip_media", side_effect=fake_export
+        ), patch.object(
+            service, "_upload_clip_output", side_effect=lambda **k: ("k", "u")
+        ), patch.object(
+            service, "_sync_platform_video_url"
+        ):
+            real_submit = ThreadPoolExecutor.submit
+
+            def flip_then_submit(self, fn, *a, **kw):
+                uploads_phase["flag"] = True
+                return real_submit(self, fn, *a, **kw)
+
+            with patch.object(ThreadPoolExecutor, "submit", flip_then_submit):
+                with pytest.raises(ExportCancelledError) as exc:
+                    service.export_kept_clips(
+                        state,
+                        output_dir=str(out_dir),
+                        operation="export_and_upload",
+                        upload_parallel_files=2,
+                        is_cancel_requested=cancel,
+                    )
+
+        # 1) Both locally-exported clips are in the touched set (the regression).
+        assert exc.value.touched_clip_ids == {"clip_a", "clip_b"}
+
+        # 2) Their progress is real: working state shows status=exported + a path.
+        working_by_id = {c.id: c for c in state.candidate_clips}
+        for cid in ("clip_a", "clip_b"):
+            assert working_by_id[cid].status == "exported"
+            assert working_by_id[cid].exported_path
+            assert Path(working_by_id[cid].exported_path).exists()
+
+        # 3) End-to-end: merging ONLY the touched set into a fresh latest_state
+        #    (as the router cancel path does) preserves status=exported + path,
+        #    instead of leaving them as kept with no exported_path.
+        latest = ProjectState()
+        latest.videos.append(_make_video())
+        latest.candidate_clips.append(_make_clip(clip_id="clip_a", platform_record_id="rec_a"))
+        latest.candidate_clips.append(_make_clip(clip_id="clip_b", platform_record_id="rec_b"))
+        merged = merge_export_state(latest, state, exc.value.touched_clip_ids)
+        merged_by_id = {c.id: c for c in merged.candidate_clips}
+        for cid in ("clip_a", "clip_b"):
+            assert merged_by_id[cid].status == "exported"
+            assert merged_by_id[cid].exported_path == working_by_id[cid].exported_path
 
 
 # ---------------------------------------------------------------------------

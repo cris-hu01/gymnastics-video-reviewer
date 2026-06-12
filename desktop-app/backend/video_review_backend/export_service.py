@@ -218,7 +218,16 @@ class ExportService:
         def _ensure_not_cancelled() -> None:
             if is_cancel_requested is not None and is_cancel_requested():
                 with runtime_lock:
+                    # Every clip with a persistable state change so far:
+                    #  - results_by_clip_id: fully-processed clips (export_only done,
+                    #    skipped-local, upload finished, or failed)
+                    #  - upload_work: clips whose local export already completed
+                    #    (status=exported + exported_path written to disk) and are
+                    #    queued for upload. In export_and_upload these are NOT yet in
+                    #    results_by_clip_id, so without this they'd be dropped on
+                    #    cancel — leaving orphan files + lost progress.
                     touched = set(results_by_clip_id.keys())
+                    touched |= {item["clip"].id for item in upload_work}
                 raise ExportCancelledError("导出已取消", touched_clip_ids=touched)
 
         output_path = Path(output_dir).resolve()
