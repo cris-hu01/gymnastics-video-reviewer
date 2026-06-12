@@ -175,7 +175,11 @@ export function useLocalCard(options: UseLocalCardOptions): LocalCardApi {
 
   async function handleDeleteLocalCardClick(recordId: string) {
     if (!activeVideoId || localCardSaving) return;
-    if (!window.confirm('删除本地补录卡片?已绑定的片段将自动解绑。')) return;
+    // No window.confirm here (discovery 3-1): the native modal freezes the
+    // window and steals focus mid-review, violating the "never block the video"
+    // rule. The caller (LocalCardInlineForm's delete button) performs an inline
+    // two-step confirm instead, so by the time we get here the user has already
+    // confirmed.
     setLocalCardSaving(true);
     try {
       const response = await deleteLocalCard(activeVideoId, recordId);
