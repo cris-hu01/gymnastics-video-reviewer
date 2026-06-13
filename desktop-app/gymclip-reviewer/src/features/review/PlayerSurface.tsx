@@ -181,8 +181,9 @@ export function PlayerSurface({
 
   // Command: mirror playbackRate onto the <video> element. Re-runs on
   // streamUrl change too because loading a fresh src resets the element's
-  // playbackRate to 1, and the store may still carry a non-1 rate the user set
-  // before the swap (though setVideoId resets it to 1 in the normal flow).
+  // playbackRate to 1, while the store deliberately keeps the rate the user
+  // chose — so a video switch re-applies it and the chosen review speed
+  // carries across clips instead of silently snapping back to 1×.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;

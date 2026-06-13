@@ -13,7 +13,7 @@
  *
  * Two distinct channels live here:
  *
- *   1. Publish channel — `currentTimeMs`, `duration`, `videoId`. The
+ *   1. Publish channel — `currentTimeMs`, `duration`. The
  *      renderer pushes onTimeUpdate / onLoadedMetadata into these. UI
  *      subscribes for read-only display (timeline scrubber, segment list,
  *      clock readouts). Writers MUST NOT enqueue a seek in response to
@@ -51,13 +51,6 @@ export interface PlaybackPendingSeek {
 }
 
 export interface PlaybackState {
-  /**
-   * id of the video the renderer currently has loaded. Distinct from
-   * `activeVideoId` in the active slice — there's a brief window during
-   * src swap where they diverge, and the timeline must trust the renderer's
-   * own report rather than the requested id.
-   */
-  videoId: string | null;
   /** Total media duration in ms. 0 until `onLoadedMetadata` fires. */
   duration: number;
   /** True iff the renderer believes the <video> is actively playing. */
@@ -76,14 +69,14 @@ export interface PlaybackState {
 }
 
 export interface PlaybackActions {
-  setVideoId: (id: string | null) => void;
   setDuration: (ms: number) => void;
   setIsPlaying: (playing: boolean) => void;
   /**
    * Set the desired playback speed. Clamps to a sane range and ignores
    * non-finite input. PlayerSurface watches `playbackRate` and applies it to
-   * the <video> element; it is preserved across pause/play but reset on src
-   * swap (see `setVideoId`).
+   * the <video> element. The rate is preserved across pause/play *and* across
+   * video switches: once a review speed is chosen it sticks until changed, so
+   * consecutive clips stay at the same slow-mo without re-setting it.
    */
   setPlaybackRate: (rate: number) => void;
   /**
@@ -110,27 +103,11 @@ export interface PlaybackActions {
 export type PlaybackSlice = PlaybackState & PlaybackActions;
 
 export const createPlaybackSlice: StateCreator<PlaybackSlice, [], [], PlaybackSlice> = (set, get) => ({
-  videoId: null,
   duration: 0,
   isPlaying: false,
   currentTimeMs: 0,
   pendingSeek: null,
   playbackRate: 1,
-  setVideoId: (id) =>
-    set((state) => {
-      if (state.videoId === id) return state;
-      // Switching video — reset transient signals so the next renderer
-      // mount does not act on stale pendingSeek / currentTime. Playback speed
-      // resets to 1 so a new clip never inherits a surprise fast/slow rate.
-      return {
-        videoId: id,
-        currentTimeMs: 0,
-        duration: 0,
-        isPlaying: false,
-        pendingSeek: null,
-        playbackRate: 1,
-      };
-    }),
   setDuration: (ms) => set({ duration: Math.max(0, ms) }),
   setIsPlaying: (playing) => set({ isPlaying: playing }),
   setPlaybackRate: (rate) => {
